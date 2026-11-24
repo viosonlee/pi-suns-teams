@@ -1,10 +1,10 @@
-# pi-teams: 5-Agent Collaborative Workflow for pi & pi-web
+# pi-teams: 5-Agent Collaborative Workflow for pi
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20WSL2-orange.svg)](#)
 [![pi](https://img.shields.io/badge/pi-extension-brightgreen.svg)](#)
 
-**pi-teams** 是专为 [`pi`](https://github.com/earendil-works/pi) 与 [`pi-web`](https://github.com/agegr/pi-web) 打造的生产级**五人多智能体协作工作流插件（Phoenix Suns CP-parent 架构）**。
+**pi-teams** 是专为 [`pi`](https://github.com/earendil-works/pi) 打造的**五人多智能体协作工作流插件（Phoenix Suns CP-parent 架构）**。
 
 它彻底解决单智能体在应对中大型复杂开发任务时的三大痛点：
 1. **上下文膨胀（Context Explosion）**：任务跑久了上下文塞满无用日志与代码堆栈，导致模型变笨或触发截断。
@@ -35,7 +35,13 @@
 - **孤儿会话垃圾回收（GC）**：长期运行产生的庞大历史子任务会自动物理归档至 `sessions-archive/`，保证主扫描器轻量秒开。
 - **双模式自由切换**：支持 `standard`（标准模式）、`economy`（经济成本优先）与 `strict`（严格规范模式）。
 - **零数值硬编码**：移除虚假的并发数与调用次数熔断，模型单价实时从 `~/.pi/agent/models.json` 动态读取。
+- **原生子会话运行器（team-runner）**：子 Agent 以独立 `pi --mode json` 进程并行运行，会话写入 `~/.pi/agent/sessions/`，不依赖 pi-web；任务完成后自动唤醒空闲的主会话继续推进。
 - **内置在线检查与自动更新**：支持一键 `/team check-update` 与 `/team update`。
+
+### 运行要求
+- Node.js >= 22.6（与 pi 一致，测试直接用 node 运行 TypeScript）
+- `pi` CLI 在 `PATH` 中（或设置 `PI_BIN=/path/to/pi`）；子 Agent 通过它启动
+- `~/.pi/agent/team.json` 中 `roles.*.model` 需改为**本机已配置**的模型（默认模板里的模型名只是示例）
 
 ---
 
@@ -46,6 +52,7 @@
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lifeng/pi-teams/main/install.sh | bash
 ```
+> 仓库需为 **public**（raw.githubusercontent.com 不支持私有仓库匿名下载）；私有仓库请用方式 2。fork 后可用 `PI_TEAMS_REPO=<owner>/pi-teams` 指定来源。
 
 ### 方式 2：Git Clone 本地安装（适合开发者）
 ```bash
@@ -61,7 +68,7 @@ cd pi-teams
 
 ---
 
-## 🛠️ 交互命令速查（在 pi / pi-web 对话框中输入）
+## 🛠️ 交互命令速查（在 pi 对话框中输入）
 
 ### 工作流启停与状态
 - `/team on` — 启用团队多 Agent 调度模式
@@ -144,19 +151,20 @@ cd pi-teams
 
 ### 检查与升级
 - **聊天内升级**：在任一已启用插件的会话中输入 `/team update`。
-- **终端升级**：在命令行中直接运行：
+- **终端升级**：在命令行中直接运行（`--check-only` 只检查，`--force` 强制重装）：
   ```bash
-  ~/.pi/agent/update.sh
+  ~/.pi/agent/bin/pi-teams-update
   ```
+- Git 安装会在原仓库 `git pull --ff-only` 后重新安装（保持复制/符号链接模式）；远程安装会下载最新 `install.sh` 执行。升级前自动备份到 `~/.pi/agent/backups/pi-teams-*`。
 
 ### 卸载插件
-运行随附的卸载脚本：
+运行随附的卸载脚本（仓库内为 `./uninstall.sh`，远程安装为 `~/.pi/agent/pi-teams-uninstall.sh`）：
 ```bash
 # 卸载核心代码并保留您的 team.json 配置
-./uninstall.sh
+~/.pi/agent/pi-teams-uninstall.sh
 
 # 彻底清理所有配置与备份
-./uninstall.sh --purge
+~/.pi/agent/pi-teams-uninstall.sh --purge
 ```
 
 ---
@@ -165,11 +173,11 @@ cd pi-teams
 
 仓库内嵌了完善的无依赖纯逻辑测试套件：
 ```bash
-# 运行全部 70+ 项单元测试
+# 运行全部离线测试（不调用真实模型；原生运行器测试使用假 pi 可执行文件）
 npm test
 # 或分项运行
 node tests/test-team.ts
-node tests/test-team-ledger.ts
+node tests/test-team-native-runner.ts
 ```
 
 ---

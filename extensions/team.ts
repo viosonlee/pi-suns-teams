@@ -45,21 +45,48 @@ import {
 	DEFAULT_WORKER_GC_COOLDOWN_MS,
 	type ChildGcResult,
 } from "../team-gc.ts";
+import {
+	launchNativeSubagent,
+	getSubagentResult,
+	onSubagentComplete,
+	type ChildCompletion,
+	type NativeRunnerOptions,
+} from "../team-runner.ts";
+import { fileURLToPath } from "node:url";
+
+/** Absolute path of this extension; force-loaded into children whose profile disables extensions. */
+const TEAM_EXTENSION_PATH = (() => {
+	try { return fileURLToPath(import.meta.url); } catch { return undefined; }
+})();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.0.0";
+export const PI_TEAMS_VERSION = "1.1.0";
+export const PI_TEAMS_REPO_DEFAULT = "lifeng/pi-teams";
 
-export async function checkPiTeamsUpdate(repo: string = "lifeng/pi-teams"): Promise<{ current: string; latest: string; hasUpdate: boolean; error?: string }> {
+/** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
+export function comparePiTeamsVersions(a: string, b: string): number {
+	const parse = (v: string) => v.split("-")[0].split(".").map((part) => Number.parseInt(part.replace(/[^0-9]/g, ""), 10) || 0);
+	const left = parse(a);
+	const right = parse(b);
+	for (let i = 0; i < Math.max(left.length, right.length, 3); i++) {
+		const diff = (left[i] ?? 0) - (right[i] ?? 0);
+		if (diff !== 0) return diff;
+	}
+	return 0;
+}
+
+export async function checkPiTeamsUpdate(repo: string = PI_TEAMS_REPO_DEFAULT): Promise<{ current: string; latest: string; hasUpdate: boolean; error?: string }> {
 	try {
 		const targetRepo = process.env.PI_TEAMS_REPO || repo;
-		const rawUrl = `https://raw.githubusercontent.com/${targetRepo}/main/package.json`;
+		const branch = process.env.PI_TEAMS_BRANCH || "main";
+		const rawUrl = `https://raw.githubusercontent.com/${targetRepo}/${branch}/package.json`;
 		const resp = await fetch(rawUrl, { signal: AbortSignal.timeout(5000) });
 		if (!resp.ok) {
-			return { current: PI_TEAMS_VERSION, latest: PI_TEAMS_VERSION, hasUpdate: false, error: `HTTP ${resp.status} fetching package.json` };
+			return { current: PI_TEAMS_VERSION, latest: PI_TEAMS_VERSION, hasUpdate: false, error: `HTTP ${resp.status} fetching ${rawUrl}` };
 		}
 		const data = (await resp.json()) as { version?: string };
 		const latest = data.version || PI_TEAMS_VERSION;
-		const hasUpdate = latest !== PI_TEAMS_VERSION;
+		const hasUpdate = comparePiTeamsVersions(latest, PI_TEAMS_VERSION) > 0;
 		return { current: PI_TEAMS_VERSION, latest, hasUpdate };
 	} catch (e: any) {
 		return { current: PI_TEAMS_VERSION, latest: PI_TEAMS_VERSION, hasUpdate: false, error: e?.message || String(e) };
@@ -1680,6 +1707,26 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	const ctxStore: { current: ExtensionContext | null } = { current: null };
 	let toolLauncher: ((name: string, args: Record<string, unknown>, options?: any) => Promise<any>) | null = null;
 
+	/**
+	 * Model/thinking for a dispatch: a sticky quota fallback (state.roleModel) always wins because the
+	 * configured model is known to be exhausted; otherwise an explicit per-call value is preserved and
+	 * the role's configured default only fills a missing value.
+	 */
+	function applyRoleModelOverrides(input: Record<string, unknown>, role: Role): void {
+		const explicit = (v: unknown) => typeof v === "string" && v.trim().length > 0;
+		const sticky = state.roleModel?.[role];
+		if (sticky) input.model = sticky;
+		else if (!explicit(input.model) && cfg.roles[role]?.model) input.model = cfg.roles[role].model;
+		const thinking = state.roleThinking?.[role]
+			|| (explicit(input.thinking) ? String(input.thinking) : undefined)
+			|| cfg.roles[role]?.thinking;
+		if (thinking) {
+			input.thinking = thinking;
+			input.thinkingLevel = thinking;
+			input.thinking_level = thinking;
+		}
+	}
+
 	function captureToolLauncher(ctx: any): void {
 		if (!ctx) return;
 		if (typeof ctx.executeTool === "function") {
@@ -2161,6 +2208,202 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		});
 	}
 	let isPumpActive = false;
+
+	async function executeNativeAgent(
+		params: Record<string, unknown>,
+		ctx: any,
+		signal?: AbortSignal,
+	): Promise<any> {
+		const rawRole = params.subagent_type ?? params.role;
+		const role = normalizeRole(rawRole) || "bridges";
+		const prompt = typeof params.prompt === "string" ? params.prompt : "";
+		const description = typeof params.description === "string" && params.description.trim()
+			? params.description.trim()
+			: prompt.split("\n")[0].slice(0, 80);
+		const runInBackground = params.run_in_background !== false;
+
+		const runnerOptions: NativeRunnerOptions = {
+			agentDir: dir,
+			cwd: ctx?.cwd || process.cwd(),
+			parentSessionId: parentSessionId || ctx?.sessionManager?.getSessionId?.() || "",
+			parentSessionFile: ctx?.sessionManager?.getSessionFile?.() || undefined,
+			teamExtensionPath: TEAM_EXTENSION_PATH,
+			getModelOverride: (r) => state.roleModel?.[r as Role] || cfg.roles[r as Role]?.model,
+			getThinkingOverride: (r) => state.roleThinking?.[r as Role] || cfg.roles[r as Role]?.thinking,
+			// Completion is delivered through the process-wide listener (handleNativeChildComplete) so a
+			// reloaded extension instance still receives children launched before the reload.
+		};
+
+		const outcome = await launchNativeSubagent({
+			subagent_type: role,
+			prompt,
+			description,
+			run_in_background: runInBackground,
+			resume: typeof params.resume === "string" ? params.resume : undefined,
+			model: typeof params.model === "string" ? params.model : undefined,
+			thinking: typeof params.thinking === "string" ? params.thinking : undefined,
+			run_id: typeof params.run_id === "string" ? params.run_id : undefined,
+		}, runnerOptions, signal);
+
+		if (outcome.isError) {
+			return {
+				content: [{ type: "text" as const, text: `Subagent error: ${outcome.error}` }],
+				isError: true,
+				details: { sessionId: outcome.sessionId, status: outcome.status === "running" ? "running" : outcome.status, error: outcome.error },
+			};
+		}
+
+		if (runInBackground) {
+			return {
+				content: [{
+					type: "text" as const,
+					text: `Subagent started in background. Session ID: ${outcome.sessionId}. Its report arrives in this conversation on its own when it completes (an idle team session is woken automatically); you do not need to call get_subagent_result for it. Continue with work that does not need it, or end your turn; ending it, /reload, or switching sessions does not stop the subagent.`,
+				}],
+				details: {
+					kind: "pi-native-subagent",
+					sessionId: outcome.sessionId,
+					subagentSessionId: outcome.sessionId,
+					profile: role,
+					description,
+					status: "running",
+					runInBackground: true,
+					createdAt: new Date().toISOString(),
+				},
+				isError: false,
+			};
+		}
+
+		return {
+			content: [{ type: "text" as const, text: outcome.reportText || "(Subagent finished with no output)" }],
+			details: {
+				kind: "pi-native-subagent",
+				sessionId: outcome.sessionId,
+				subagentSessionId: outcome.sessionId,
+				profile: role,
+				description,
+				status: outcome.status,
+				runInBackground: false,
+				completedAt: new Date().toISOString(),
+			},
+			isError: outcome.status !== "completed",
+		};
+	}
+
+	/** Set on session_shutdown: a replaced/reloaded instance must not touch session state any more. */
+	let disposed = false;
+
+	/** Launch an Agent directly through the native runner (no nested tool call), with the same accounting as a programmatic dispatch. */
+	function nativeAgentLauncher(ctx: any) {
+		return async (name: string, args: Record<string, unknown>, opts?: any): Promise<any> => {
+			if (String(name).toLowerCase() !== "agent") {
+				return { isError: true, content: [{ type: "text" as const, text: `Tool ${name} not found` }] };
+			}
+			const role = normalizeRole(args.subagent_type ?? args.role) ?? "bridges";
+			const runIdArg = typeof args.run_id === "string" && args.run_id ? args.run_id : `T-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+			state.calls[role] += 1;
+			state.tasks += 1;
+			const record: RunRecord = { taskId: runIdArg, role, description: typeof args.description === "string" ? args.description : "", status: "running", at: new Date().toISOString() };
+			runs.push(record);
+			pi.appendEntry(RUN_TYPE, record);
+			persist();
+			return executeNativeAgent(args, ctx, opts?.signal);
+		};
+	}
+
+	/**
+	 * Context for dispatches that happen outside a live tool call (daemon tick, child completion,
+	 * event backfill). Prefers the host's nested tool launcher; otherwise launches natively.
+	 */
+	function backgroundDispatchCtx(fallbackCtx?: any): any {
+		const base = (ctxStore.current ?? fallbackCtx ?? {}) as any;
+		return { ...base, executeTool: toolLauncher ?? nativeAgentLauncher(base) };
+	}
+
+	const NOTIFY_REPORT_LIMIT = 8000;
+
+	/** Process-wide completion listener for natively launched children (see team-runner onSubagentComplete). */
+	function handleNativeChildComplete(info: ChildCompletion): void {
+		if (disposed || isSubagentSession || !state.enabled) return;
+		const currentParent = parentSessionId || ctxStore.current?.sessionManager?.getSessionId?.() || "";
+		if (!currentParent || info.parentSessionId !== currentParent) return;
+		const { sessionId } = info;
+		let dirty = false;
+		let failureNote = "";
+
+		if (info.success) {
+			syncLease(undefined, sessionId, "completed");
+			if (observeTask(board(), undefined, sessionId, "completed")) dirty = true;
+		} else {
+			// The child process has verifiably exited: settle the attempt instead of leaving it "uncertain".
+			const task = board().tasks.find(t => t.sessionId === sessionId && (t.status === "running" || t.status === "uncertain"));
+			const role = normalizeRole(info.role);
+			const errorText = info.error ?? `child ${info.status}`;
+			const kind = classifyAgentFailure(errorText);
+			if (kind === "quota" && role) {
+				const applied = applyQuotaFailure(state, role, cfg, `额度/限流不足（${errorText.trim().slice(0, 80)}）`);
+				state = applied.state;
+				dirty = true;
+				const ui = ctxStore.current?.hasUI ? ctxStore.current.ui : undefined;
+				if (applied.nextModel) ui?.notify(`${ROLE_LABEL[role]} 额度不足，后续改用 ${applied.nextModel}`, "warning");
+				else ui?.notify(`${ROLE_LABEL[role]} 所有备用模型也不可用，已暂停该角色。`, "error");
+				if (task && applied.nextModel) {
+					// Release this attempt's lease, then requeue the task for the fallback model.
+					writeLease({ ...task, status: "failed", reason: `Quota failure: ${errorText.slice(0, 200)}` });
+					task.status = "ready";
+					task.reason = `Previous attempt hit a quota/rate limit; requeued for fallback model ${applied.nextModel}.`;
+					task.evidence = [...(task.evidence ?? []), `Child ${sessionId} quota failure: ${errorText.slice(0, 200)}`];
+					delete task.runId;
+					delete task.dispatchedAt;
+					delete task.sessionId;
+					board().revision++;
+					failureNote = `Requeued ${task.id} for fallback model ${applied.nextModel}.`;
+				} else if (task) {
+					task.status = "failed";
+					task.reason = `Quota failure and no fallback model left: ${errorText.slice(0, 300)}`;
+					writeLease(task);
+					board().revision++;
+				}
+			} else if (task) {
+				task.status = "failed";
+				task.reason = `Child exited (${info.status}${info.code !== null ? `, code ${info.code}` : ""}): ${errorText.slice(0, 300)}`;
+				task.evidence = [...(task.evidence ?? []), ...(info.logFile ? [`Child log: ${info.logFile}`] : [])];
+				writeLease(task);
+				board().revision++;
+				dirty = true;
+			}
+		}
+		if (dirty) persist();
+
+		const statusWord = info.success ? "completed" : info.status;
+		let report = info.reportText ?? "";
+		if (report.length > NOTIFY_REPORT_LIMIT) report = `${report.slice(0, NOTIFY_REPORT_LIMIT)}\n…(truncated; call get_subagent_result for the full report)`;
+		const errorLine = info.success ? "" : `\nError: ${(info.error ?? "unknown").slice(0, 500)}${info.logFile ? `\nLog: ${info.logFile}` : ""}`;
+		try {
+			pi.sendMessage(
+				{
+					customType: "pi-web:subagent-notification",
+					content: `Subagent ${info.role} (${sessionId.slice(0, 8)}${info.taskId ? `, ${info.taskId}` : ""}) ${statusWord}.${failureNote ? ` ${failureNote}` : ""}${errorLine}${report ? `\n\n${report}` : ""}`,
+					display: true,
+					details: { sessionId, status: statusWord, role: info.role, taskId: info.taskId, completedAt: new Date().toISOString() },
+				},
+				// Wake an idle CP parent (or queue after the current turn) so it can review/accept and continue.
+				{ triggerTurn: true, deliverAs: "followUp" },
+			);
+		} catch {
+			// best-effort notification
+		}
+
+		if (info.taskId && (info.taskId.startsWith("W-rev-") || board().tasks.find(t => t.id === info.taskId)?.parentTaskId)) {
+			settleReclaimedReviews();
+		}
+
+		queueMicrotask(async () => {
+			if (disposed) return;
+			try { await schedulerPump(backgroundDispatchCtx()); } catch {}
+		});
+	}
+	const unsubscribeNativeCompletion = onSubagentComplete(handleNativeChildComplete);
+
 	async function schedulerPump(ctx: any, maxSlots = 20): Promise<{ launched: string[]; errors: string[]; backfillCount: number }> {
 		if (!state.enabled || isSubagentSession) return { launched: [], errors: [], backfillCount: 0 };
 		if (agentToolUnavailable) return { launched: [], errors: ["Agent tool unavailable for programmatic dispatch (model-only host)"], backfillCount: 0 };
@@ -2179,10 +2422,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			const errors: string[] = [];
 			let mutated = false;
 
-			const executeFn = (typeof ctx?.executeTool === "function") ? ctx.executeTool.bind(ctx) : toolLauncher;
-			if (typeof executeFn !== "function") {
-				return { launched: [], errors: ["executeTool is not available in current execution context"], backfillCount: 0 };
-			}
+			const executeFn = (typeof ctx?.executeTool === "function")
+				? ctx.executeTool.bind(ctx)
+				: (toolLauncher ?? nativeAgentLauncher(ctx));
 
 			for (const task of toLaunch) {
 				const role = task.role as Role;
@@ -2208,6 +2450,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 						prompt,
 						run_in_background: true,
 						description: task.title,
+						run_id: runId,
 					}, { signal: new AbortController().signal });
 					if (callRes && !callRes.isError) {
 						const childSessionId = callRes.details?.sessionId ?? callRes.details?.subagentSessionId;
@@ -2308,13 +2551,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			const hasWork = b.tasks.some(t => t.status === "ready" || t.status === "running" || t.status === "queued");
 			if (!hasWork) return;
 			try {
-				const activeContext = ctxStore.current;
-				const effectiveCtx = activeContext
-					? { ...activeContext, executeTool: (typeof (activeContext as any).executeTool === "function") ? (activeContext as any).executeTool : toolLauncher }
-					: (toolLauncher ? { executeTool: toolLauncher } : null);
-				if (effectiveCtx && typeof effectiveCtx.executeTool === "function") {
-					await schedulerPump(effectiveCtx);
-				}
+				if (disposed || !ctxStore.current) return;
+				await schedulerPump(backgroundDispatchCtx());
 			} catch {
 				// daemon tick error suppressed
 			}
@@ -3016,14 +3254,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		// Programmatic dispatch from schedulerPump: bypass duplicate ready/conflict check and duplicate reservation
 		if (workId && programmaticDispatches.has(workId)) {
 			const programmatic = programmaticDispatches.get(workId)!;
-			const overrideModel = state.roleModel?.[role] || cfg.roles[role]?.model;
-			if (overrideModel) input.model = overrideModel;
-			const overrideThinking = state.roleThinking?.[role] || cfg.roles[role]?.thinking;
-			if (overrideThinking) {
-				input.thinking = overrideThinking;
-				input.thinkingLevel = overrideThinking;
-				input.thinking_level = overrideThinking;
-			}
+			applyRoleModelOverrides(input, role);
+			if (typeof input.run_id !== "string") input.run_id = programmatic.runId;
 
 			state.calls[role] += 1;
 			state.tasks += 1;
@@ -3068,15 +3300,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 		const taskId = `T-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 
-		// 额度不足后自动改用备用模型（同一会话粘住，不再回退到已耗尽的模型）
-		const overrideModel = state.roleModel?.[role] || cfg.roles[role]?.model;
-		if (overrideModel) input.model = overrideModel;
-		const overrideThinking = state.roleThinking?.[role] || cfg.roles[role]?.thinking;
-		if (overrideThinking) {
-			input.thinking = overrideThinking;
-			input.thinkingLevel = overrideThinking;
-			input.thinking_level = overrideThinking;
-		}
+		// 额度不足后自动改用备用模型（同一会话粘住，不再回退到已耗尽的模型）；显式传入的 model 优先于角色默认配置
+		applyRoleModelOverrides(input, role);
+		input.run_id = taskId;
 
 		if (workId) writeLease(markDispatched(board(), workId, role, taskId, resumeId));
 		else writeLease({ id: taskId, title: description, requestIds: [], role, dependsOn: [], readPaths: [], writePaths: [], acceptance: ["Parent verifies the returned report"], status: "running", evidence: [], runId: taskId, sessionId: resumeId, dispatchedAt: new Date().toISOString() });
@@ -3152,9 +3378,11 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		// Immediate event-driven backfill trigger
 		const observedNorm = normalizeNativeStatus(observed);
 		if (!["running", "queued", "unknown"].includes(observedNorm)) {
+			// Natively launched children trigger their own backfill from the completion listener.
 			const launcher = toolLauncher ?? (ctx as any)?.executeTool;
 			if (typeof launcher === "function") {
 				queueMicrotask(async () => {
+					if (disposed) return;
 					try {
 						await schedulerPump({ ...(ctxStore.current ?? ctx), executeTool: launcher });
 					} catch {
@@ -3622,6 +3850,82 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	// ── 原生 Subagent 派发工具（解耦特定 Web 界面，全环境原生运行） ──
+	pi.registerTool({
+		name: "Agent",
+		label: "Agent",
+		description: "Launch an autonomous team subagent (cp, booker, bridges, ayton, cameron) in the background with isolated context.",
+		parameters: {
+			type: "object",
+			properties: {
+				subagent_type: { type: "string", description: "Role: cp, booker, bridges, ayton, cameron" },
+				prompt: { type: "string", description: "Task instructions with TEAM_TASK: W-id" },
+				run_in_background: { type: "boolean", description: "Run in background (default true)" },
+				description: { type: "string", description: "Task title/description" },
+				resume: { type: "string", description: "Optional child session ID to resume" },
+				model: { type: "string", description: "Optional model override" },
+				thinking: { type: "string", description: "Optional thinking level" },
+			},
+			required: ["prompt"],
+		} as never,
+		async execute(_toolCallId, rawParams, signal, _onUpdate, ctx) {
+			captureToolLauncher(ctx);
+			return executeNativeAgent((rawParams && typeof rawParams === "object" ? rawParams : {}) as Record<string, unknown>, ctx, signal);
+		},
+	});
+
+	pi.registerTool({
+		name: "get_subagent_result",
+		label: "Get Subagent Result",
+		description: "Check or retrieve the result of a background subagent by session ID.",
+		parameters: {
+			type: "object",
+			properties: {
+				agent_id: { type: "string", description: "Subagent session ID" },
+				wait: { type: "boolean", description: "Wait for subagent completion (default false)" },
+			},
+			required: ["agent_id"],
+		} as never,
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			captureToolLauncher(ctx);
+			const params = (rawParams && typeof rawParams === "object" ? rawParams : {}) as Record<string, unknown>;
+			const sessionId = String(params.agent_id || "");
+			const wait = params.wait === true;
+			const runnerOptions: NativeRunnerOptions = {
+				agentDir: dir,
+				cwd: (ctx as any)?.cwd || process.cwd(),
+				parentSessionId: parentSessionId || ctx?.sessionManager?.getSessionId?.() || "",
+			};
+			const res = await getSubagentResult(sessionId, wait, runnerOptions);
+			if (res.status === "running") {
+				return {
+					content: [{ type: "text" as const, text: `Subagent ${sessionId} is still running.` }],
+					details: { sessionId, status: "running" },
+				};
+			}
+			if (res.status === "completed") {
+				return {
+					content: [{ type: "text" as const, text: res.reportText || "Task completed." }],
+					details: { sessionId, status: "completed" },
+				};
+			}
+			return {
+				content: [{ type: "text" as const, text: `Subagent ${sessionId} ${res.status}: ${res.error || "unknown"}` }],
+				details: { sessionId, status: res.status, error: res.error },
+				isError: res.status === "failed",
+			};
+		},
+	});
+
+	pi.on("session_shutdown", async () => {
+		// Children are detached on purpose: /reload, session switches and quitting never destroy
+		// in-flight work. Their session files are the durable record; the next instance (or a
+		// later session_start) picks completions up via the listener or recovery probes.
+		disposed = true;
+		stopSchedulerDaemon();
+		unsubscribeNativeCompletion();
+	});
+
 	pi.registerCommand("team", {
 		description: "五人多 Agent 工作流：on/off/model/tasks/status/reconcile/mode/goal/solo",
 		getArgumentCompletions: (prefix: string) => {
@@ -3688,20 +3992,25 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 			if (sub === "update") {
 				ctx.ui.notify("🚀 正在执行 pi-teams 一键更新...", "info");
-				const updateScript = join(agentDir(), "update.sh");
-				const binUpdate = join(agentDir(), "bin", "pi-teams-update");
-				const scriptPath = existsSync(updateScript) ? updateScript : existsSync(binUpdate) ? binUpdate : null;
+				const candidates = [join(agentDir(), "bin", "pi-teams-update"), join(agentDir(), "pi-teams-update.sh"), join(agentDir(), "update.sh")];
+				const scriptPath = candidates.find((candidate) => existsSync(candidate)) ?? null;
 				if (scriptPath) {
 					try {
-						const { execSync } = await import("node:child_process");
-						const out = execSync(`bash "${scriptPath}"`, { encoding: "utf8", timeout: 45000 });
+						const { execFile } = await import("node:child_process");
+						const out = await new Promise<string>((resolveRun, rejectRun) => {
+							// Async so the TUI and running children are not frozen while git/curl work.
+							execFile("bash", [scriptPath], { encoding: "utf8", timeout: 180_000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
+								if (error) rejectRun(new Error(`${error.message}\n${String(stderr || stdout).trim().split("\n").slice(-4).join("\n")}`));
+								else resolveRun(String(stdout));
+							});
+						});
 						const summary = out.trim().split("\n").slice(-2).join("\n");
-						ctx.ui.notify(`🎉 更新成功！\n${summary}\n提示：请在终端或 Web 界面中开启新会话以加载最新代码。`, "info");
+						ctx.ui.notify(`🎉 更新完成\n${summary}\n提示：执行 /reload 或新开会话以加载最新代码。`, "info");
 					} catch (e: any) {
 						ctx.ui.notify(`❌ 更新执行失败: ${e?.message || String(e)}`, "error");
 					}
 				} else {
-					ctx.ui.notify("⚠️ 未在 ~/.pi/agent/ 找到 update.sh，可在系统终端运行以下命令完成更新：\ncurl -fsSL https://raw.githubusercontent.com/lifeng/pi-teams/main/install.sh | bash", "warning");
+					ctx.ui.notify(`⚠️ 未在 ${agentDir()} 找到 pi-teams 更新脚本，可在系统终端运行：\ncurl -fsSL https://raw.githubusercontent.com/${process.env.PI_TEAMS_REPO || PI_TEAMS_REPO_DEFAULT}/main/install.sh | bash`, "warning");
 				}
 				return;
 			}

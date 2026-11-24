@@ -5,6 +5,7 @@ Proves end-to-end durable autonomous dispatch, subagent probing, and auto-backfi
 """
 import json
 import os
+import shutil
 import pathlib
 import select
 import subprocess
@@ -174,7 +175,7 @@ export default function(pi: any) {{
             self.p = subprocess.Popen(
                 command,
                 cwd=root,
-                env=dict(os.environ, PATH=f"/home/lifeng/.local/bin:{os.environ.get('PATH', '')}", PI_CODING_AGENT_DIR=str(root)),
+                env=dict(os.environ, PI_CODING_AGENT_DIR=str(root)),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=self.stderr,
@@ -357,7 +358,7 @@ export default function(pi: any) {{
         print(f"Target Concurrency:          20 Slots")
         print(f"Max Concurrency Reached:     20 Slots (100% Slot Utilization)")
         print(f"CP Main Model Turns Used:    0 (Completely autonomous background dispatch & backfill)")
-        print(f"Verification Mode:           Real Pi 1.5.2 RPC (/home/lifeng/.local/bin/pi --mode rpc)")
+        print(f"Verification Mode:           Real Pi RPC ({shutil.which('pi') or 'pi'} --mode rpc)")
         print("==================================================================================\n")
 
     finally:

@@ -132,7 +132,7 @@ test('reviewSummary mentions the verdict and check counts', () => {
 test('buildReviewerPrompt demands structured output and treats worker report as a claim', () => {
 	const prompt = buildReviewerPrompt({
 		taskId: 'W-46', title: 'integration', acceptance: ACC,
-		workerReport: 'done, all tests pass', deliveryPaths: ['/home/lifeng/.pi/agent/extensions/team.ts'],
+		workerReport: 'done, all tests pass', deliveryPaths: ['extensions/team.ts'],
 		deliveryVersion: 'v1', baseVersion: 'v0',
 	});
 	assert.ok(prompt.includes('VERDICT: PASS | REWORK | ESCALATE | INCOMPLETE'));

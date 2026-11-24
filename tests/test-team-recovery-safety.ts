@@ -705,22 +705,21 @@ test("S24: cache revalidation detects a duplicate written into a pre-existing si
 	clearSessionPathCache();
 });
 
-test("S25: wide session roots above the scan budget fail closed and are never cached", () => {
+test("S25: roots wider than the cache threshold resolve (inside the scan budget) but are never cached", () => {
 	clearSessionPathCache();
 	withFixture((fixture) => {
 		for (let index = 0; index < SESSION_PATH_CACHE_MAX_DIRS + 2; index += 1) {
 			mkdirSync(join(fixture.sessionsDir, `--wide-${String(index).padStart(3, "0")}--`), { recursive: true });
 		}
 		putSession(fixture, reportedAttempt(), { cwdDir: "--wide-000--" });
-		// Round-4 R2: a root wider than the directory scan budget (exactly the cache
-		// threshold) can never be fully scanned, so uniqueness stays unproven and the
-		// resolution must fail closed instead of returning or caching a possibly
-		// incomplete single-path answer.
+		// Ordinary installs have more than 64 project directories: a complete scan inside the
+		// (larger) scan budget proves uniqueness, but such a wide root is still never cached.
+		assert.ok(SESSION_PATH_SCAN_MAX_DIRS > SESSION_PATH_CACHE_MAX_DIRS + 2);
 		const resolved = resolveChildSessionFile(CHILD, fixture.sessionsDir);
-		assert.equal(resolved.status, "unknown", "a root above the directory scan budget cannot prove a unique path");
-		assert.equal(sessionPathCacheSize(), 0, "a root above the scan budget is never cached");
+		assert.equal(resolved.status, "found", "a fully scanned wide root proves a unique path");
+		assert.equal(sessionPathCacheSize(), 0, "a root above the cache threshold is never cached");
 		const again = resolveChildSessionFile(CHILD, fixture.sessionsDir);
-		assert.equal(again.status, "unknown", "each resolution retries inside the same hard scan budgets");
+		assert.equal(again.status, "found", "each resolution rescans inside the same hard budgets");
 		assert.equal(sessionPathCacheSize(), 0);
 	});
 	clearSessionPathCache();

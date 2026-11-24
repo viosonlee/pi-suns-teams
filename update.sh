@@ -1,111 +1,102 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # pi-teams: Check and Apply Updates
+#   update.sh               update when the remote version is newer
+#   update.sh --check-only  only report
+#   update.sh --force       reinstall even when versions match
 # ==============================================================================
 set -euo pipefail
 
 REPO_DEFAULT="lifeng/pi-teams"
 REPO="${PI_TEAMS_REPO:-$REPO_DEFAULT}"
 BRANCH="${PI_TEAMS_BRANCH:-main}"
-AGENT_DIR="${HOME}/.pi/agent"
+AGENT_DIR="${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}"
 VERSION_FILE="${AGENT_DIR}/.pi-teams-version"
-GIT_SOURCE_FILE="${AGENT_DIR}/.pi-teams-source"
+SOURCE_FILE="${AGENT_DIR}/.pi-teams-source"
+MODE_FILE="${AGENT_DIR}/.pi-teams-mode"
+RAW_BASE="${PI_TEAMS_RAW_BASE:-https://raw.githubusercontent.com/${REPO}/${BRANCH}}"
 
-echo "🔍 [pi-teams update] 正在检查更新 (仓库: ${REPO}, 分支: ${BRANCH})..."
+CHECK_ONLY=false
+FORCE=false
+for arg in "$@"; do
+  case "$arg" in
+    --check-only) CHECK_ONLY=true ;;
+    --force) FORCE=true ;;
+  esac
+done
 
-# 获取本地版本
-CURRENT_VERSION="1.0.0"
-if [ -f "${VERSION_FILE}" ]; then
-  CURRENT_VERSION=$(cat "${VERSION_FILE}" | tr -d ' \r\n')
+# Returns 0 when $1 > $2 (numeric dotted versions; pre-release suffixes ignored).
+version_gt() {
+  local a b i
+  IFS=. read -r -a a <<< "${1%%-*}"
+  IFS=. read -r -a b <<< "${2%%-*}"
+  for i in 0 1 2; do
+    local x="${a[$i]:-0}" y="${b[$i]:-0}"
+    x="${x//[^0-9]/}"; y="${y//[^0-9]/}"
+    if (( ${x:-0} > ${y:-0} )); then return 0; fi
+    if (( ${x:-0} < ${y:-0} )); then return 1; fi
+  done
+  return 1
+}
+
+CURRENT_VERSION="0.0.0"
+[ -f "${VERSION_FILE}" ] && CURRENT_VERSION="$(tr -d ' \r\n' < "${VERSION_FILE}")"
+
+SRC_DIR=""
+if [ -f "${SOURCE_FILE}" ]; then
+  SRC_DIR="$(cat "${SOURCE_FILE}")"
+  [ -d "${SRC_DIR}/.git" ] || SRC_DIR=""
 fi
 
-# 获取远程版本
-REMOTE_PKG_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}/package.json"
+echo "🔍 [pi-teams update] 当前版本 v${CURRENT_VERSION}（${SRC_DIR:+本地仓库 ${SRC_DIR}}${SRC_DIR:-远程 ${REPO}@${BRANCH}}）"
+
 REMOTE_VERSION=""
-if command -v curl >/dev/null 2>&1; then
-  REMOTE_VERSION=$(curl -fsSL --connect-timeout 5 "${REMOTE_PKG_URL}" 2>/dev/null | grep -o '"version": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)
+if [ -n "${SRC_DIR}" ]; then
+  if git -C "${SRC_DIR}" fetch --quiet origin "${BRANCH}" 2>/dev/null; then
+    REMOTE_VERSION="$(git -C "${SRC_DIR}" show "origin/${BRANCH}:package.json" 2>/dev/null | grep -o '"version": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)"
+  fi
+  # A checkout without a reachable remote still updates from its working tree.
+  [ -n "${REMOTE_VERSION}" ] || REMOTE_VERSION="$(grep -o '"version": *"[^"]*"' "${SRC_DIR}/package.json" | head -n1 | cut -d'"' -f4 || true)"
+else
+  REMOTE_VERSION="$(curl -fsSL --connect-timeout 5 "${RAW_BASE}/package.json" 2>/dev/null | grep -o '"version": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)"
 fi
 
 if [ -z "${REMOTE_VERSION}" ]; then
-  echo "⚠️  未能从 ${REMOTE_PKG_URL} 获取远程版本号，请检查网络或 GitHub 仓库地址。"
-  # 如果仅检查更新，退出
-  if [ "${1:-}" = "--check-only" ]; then
-    exit 1
-  fi
-  echo "将尝试继续通过常规模式拉取..."
+  echo "⚠️  无法获取远程版本号（网络、私有仓库或 PI_TEAMS_REPO 设置有误）。"
+  exit 1
 fi
+echo "🌐 最新版本 v${REMOTE_VERSION}"
 
-echo "📌 当前本地版本: v${CURRENT_VERSION}"
-if [ -n "${REMOTE_VERSION}" ]; then
-  echo "🌐 远程最新版本: v${REMOTE_VERSION}"
-  if [ "${CURRENT_VERSION}" = "${REMOTE_VERSION}" ] && [ "${1:-}" != "--force" ]; then
-    echo "✅ 当前已是最新版本 (v${CURRENT_VERSION})，无需更新。"
-    exit 0
-  fi
+if ! version_gt "${REMOTE_VERSION}" "${CURRENT_VERSION}" && [ "${FORCE}" != true ]; then
+  echo "✅ 已是最新版本，无需更新。"
+  exit 0
 fi
-
-if [ "${1:-}" = "--check-only" ]; then
-  if [ -n "${REMOTE_VERSION}" ] && [ "${CURRENT_VERSION}" != "${REMOTE_VERSION}" ]; then
-    echo "💡 发现新版本 v${REMOTE_VERSION}！可运行 update.sh 或在对话中输入 /team update 进行升级。"
-    exit 0
-  fi
+if [ "${CHECK_ONLY}" = true ]; then
+  echo "💡 发现新版本 v${REMOTE_VERSION}！运行 update.sh 或在 pi 中输入 /team update 升级。"
   exit 0
 fi
 
-echo "🚀 开始更新 pi-teams..."
-
-# 备份当前配置与核心文件
 BACKUP_DIR="${AGENT_DIR}/backups/pi-teams-$(date +%Y%m%d%H%M%S)"
-mkdir -p "${BACKUP_DIR}"
-echo "📦 正在备份现有版本至: ${BACKUP_DIR}"
-[ -f "${AGENT_DIR}/extensions/team.ts" ] && cp "${AGENT_DIR}/extensions/team.ts" "${BACKUP_DIR}/" || true
-[ -d "${AGENT_DIR}/agents" ] && cp -r "${AGENT_DIR}/agents" "${BACKUP_DIR}/" || true
-cp "${AGENT_DIR}"/team-*.ts "${BACKUP_DIR}/" 2>/dev/null || true
+mkdir -p "${BACKUP_DIR}/agents"
+echo "📦 备份当前版本至 ${BACKUP_DIR}"
+cp -L "${AGENT_DIR}/extensions/team.ts" "${BACKUP_DIR}/" 2>/dev/null || true
+cp -L "${AGENT_DIR}"/team-*.ts "${BACKUP_DIR}/" 2>/dev/null || true
+for r in cp booker bridges ayton cameron; do cp -L "${AGENT_DIR}/agents/${r}.md" "${BACKUP_DIR}/agents/" 2>/dev/null || true; done
 
-# 检查是否为 Git Clone 本地安装模式
-if [ -f "${GIT_SOURCE_FILE}" ] && [ -d "$(cat "${GIT_SOURCE_FILE}")/.git" ]; then
-  SRC_DIR=$(cat "${GIT_SOURCE_FILE}")
-  echo "🔄 检测到本地 Git 开发安装源: ${SRC_DIR}，正在执行 git pull..."
-  git -C "${SRC_DIR}" pull --ff-only
-  bash "${SRC_DIR}/install.sh" --skip-prompt
+INSTALL_ARGS=()
+if [ -f "${MODE_FILE}" ] && [ "$(cat "${MODE_FILE}")" = "symlink" ]; then INSTALL_ARGS+=(--symlink); fi
+if [ -L "${AGENT_DIR}/extensions/team.ts" ]; then INSTALL_ARGS=(--symlink); fi
+
+if [ -n "${SRC_DIR}" ]; then
+  echo "🔄 git pull --ff-only (${SRC_DIR})"
+  git -C "${SRC_DIR}" pull --ff-only --quiet origin "${BRANCH}" || echo "⚠️  git pull 失败，使用当前工作区内容安装。"
+  bash "${SRC_DIR}/install.sh" "${INSTALL_ARGS[@]}"
 else
-  # 远程文件下载模式
-  TMP_DIR=$(mktemp -d)
+  # Run the freshly downloaded installer: one file list, atomic replacement.
+  TMP_DIR="$(mktemp -d)"
   trap 'rm -rf "${TMP_DIR}"' EXIT
-
-  echo "⬇️  正在下载最新核心文件..."
-  CORE_FILES=(
-    "team-ledger.ts"
-    "team-recovery.ts"
-    "team-gc.ts"
-    "team-review.ts"
-    "team-review-evidence.ts"
-    "team-scope.ts"
-  )
-
-  for file in "${CORE_FILES[@]}"; do
-    curl -fsSL "https://raw.githubusercontent.com/${REPO}/${BRANCH}/${file}" -o "${TMP_DIR}/${file}"
-    cp "${TMP_DIR}/${file}" "${AGENT_DIR}/${file}"
-  done
-
-  # 更新 extension
-  mkdir -p "${TMP_DIR}/extensions" "${AGENT_DIR}/extensions"
-  curl -fsSL "https://raw.githubusercontent.com/${REPO}/${BRANCH}/extensions/team.ts" -o "${TMP_DIR}/extensions/team.ts"
-  cp "${TMP_DIR}/extensions/team.ts" "${AGENT_DIR}/extensions/team.ts"
-
-  # 更新 agents 角色
-  mkdir -p "${TMP_DIR}/agents" "${AGENT_DIR}/agents"
-  ROLES=("cp" "booker" "bridges" "ayton" "cameron")
-  for role in "${ROLES[@]}"; do
-    curl -fsSL "https://raw.githubusercontent.com/${REPO}/${BRANCH}/agents/${role}.md" -o "${TMP_DIR}/agents/${role}.md"
-    cp "${TMP_DIR}/agents/${role}.md" "${AGENT_DIR}/agents/${role}.md"
-  done
-
-  # 写入新版本号
-  if [ -n "${REMOTE_VERSION}" ]; then
-    echo "${REMOTE_VERSION}" > "${VERSION_FILE}"
-  fi
+  curl -fsSL "${RAW_BASE}/install.sh" -o "${TMP_DIR}/install.sh"
+  PI_TEAMS_REPO="${REPO}" PI_TEAMS_BRANCH="${BRANCH}" bash "${TMP_DIR}/install.sh"
 fi
 
-echo "🎉 pi-teams 更新成功！当前版本: v${REMOTE_VERSION:-latest}"
-echo "💡 提示：已有 team.json 自定义配置已完整保留。在 pi 或 pi-web 中开启新会话即可生效新代码。"
+echo "🎉 pi-teams 已更新到 v${REMOTE_VERSION}。team.json 未改动；在 pi 中 /reload 或新开会话生效。"

@@ -46,12 +46,13 @@ export const SESSION_PATH_CACHE_TTL_MS = 20_000;
  * Bounded discovery budgets. A resolution never materializes an unbounded
  * directory listing: every child directory, every directory entry and every
  * candidate inspection is charged to hard caps, and the directory cap is
- * exactly the cache-admission threshold so the 64-directory threshold bounds
- * the actual scan work too. A scan that cannot finish inside the budgets
- * proves nothing about uniqueness: it fails closed to "unknown" and is never
- * cached.
+ * independent of the cache-admission threshold: one project directory per
+ * workspace means ordinary installs exceed 64 directories, and a cap that low
+ * made every child lookup fail closed. A scan that cannot finish inside the
+ * budgets proves nothing about uniqueness: it fails closed to "unknown" and is
+ * never cached.
  */
-export const SESSION_PATH_SCAN_MAX_DIRS = SESSION_PATH_CACHE_MAX_DIRS;
+export const SESSION_PATH_SCAN_MAX_DIRS = 512;
 export const SESSION_PATH_SCAN_MAX_ENTRIES = 16_384;
 export const SESSION_PATH_SCAN_MAX_WORK = 20_000;
 
