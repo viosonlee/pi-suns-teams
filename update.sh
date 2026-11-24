@@ -7,7 +7,7 @@
 # ==============================================================================
 set -euo pipefail
 
-REPO_DEFAULT="lifeng/pi-teams"
+REPO_DEFAULT="viosonlee/pi-suns-teams"
 REPO="${PI_TEAMS_REPO:-$REPO_DEFAULT}"
 BRANCH="${PI_TEAMS_BRANCH:-main}"
 AGENT_DIR="${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}"

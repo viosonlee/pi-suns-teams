@@ -50,14 +50,14 @@
 ### 方式 1：远程一键安装（推荐，无需克隆代码）
 在目标机器的终端中运行：
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lifeng/pi-teams/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/viosonlee/pi-suns-teams/main/install.sh | bash
 ```
-> 仓库需为 **public**（raw.githubusercontent.com 不支持私有仓库匿名下载）；私有仓库请用方式 2。fork 后可用 `PI_TEAMS_REPO=<owner>/pi-teams` 指定来源。
+> 仓库需为 **public**（raw.githubusercontent.com 不支持私有仓库匿名下载）；私有仓库请用方式 2。fork 后可用 `PI_TEAMS_REPO=<owner>/pi-suns-teams` 指定来源。
 
 ### 方式 2：Git Clone 本地安装（适合开发者）
 ```bash
-git clone https://github.com/lifeng/pi-teams.git
-cd pi-teams
+git clone https://github.com/viosonlee/pi-suns-teams.git
+cd pi-suns-teams
 ./install.sh
 ```
 > **开发者提示**：支持符号链接模式 `./install.sh --symlink`，修改本地仓库文件即可实时在 `pi` 中生效，无需反复拷贝。

@@ -4,13 +4,13 @@
 # Supports: Linux, macOS, WSL2
 #
 #   Local (git clone):   ./install.sh [--symlink]
-#   Remote (no clone):   curl -fsSL https://raw.githubusercontent.com/<owner>/pi-teams/main/install.sh | bash
+#   Remote (no clone):   curl -fsSL https://raw.githubusercontent.com/<owner>/pi-suns-teams/main/install.sh | bash
 #
 # Env: PI_TEAMS_REPO (owner/name), PI_TEAMS_BRANCH (default main), PI_CODING_AGENT_DIR
 # ==============================================================================
 set -euo pipefail
 
-REPO_DEFAULT="lifeng/pi-teams"
+REPO_DEFAULT="viosonlee/pi-suns-teams"
 REPO="${PI_TEAMS_REPO:-$REPO_DEFAULT}"
 BRANCH="${PI_TEAMS_BRANCH:-main}"
 PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-${HOME}/.pi/agent}"

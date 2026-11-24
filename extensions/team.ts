@@ -61,7 +61,7 @@ const TEAM_EXTENSION_PATH = (() => {
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
 export const PI_TEAMS_VERSION = "1.1.0";
-export const PI_TEAMS_REPO_DEFAULT = "lifeng/pi-teams";
+export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
 export function comparePiTeamsVersions(a: string, b: string): number {
