@@ -49,6 +49,7 @@ import {
 	launchNativeSubagent,
 	getSubagentResult,
 	onSubagentComplete,
+	isSubagentActive,
 	type ChildCompletion,
 	type NativeRunnerOptions,
 } from "../team-runner.ts";
@@ -60,7 +61,7 @@ const TEAM_EXTENSION_PATH = (() => {
 })();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.1.0";
+export const PI_TEAMS_VERSION = "1.1.1";
 export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
@@ -1569,46 +1570,61 @@ export interface AvailableModelItem {
 	thinkingLevels: string[];
 }
 
-export function loadAllAvailableModels(modelsFile: string, ctx?: any): AvailableModelItem[] {
-	const map = new Map<string, AvailableModelItem>();
-	if (ctx?.modelRegistry && typeof ctx.modelRegistry.getAll === "function") {
+/** Mirrors pi-ai getSupportedThinkingLevels(): xhigh/max only when explicitly mapped; null disables a level. */
+export function supportedThinkingLevels(model: { reasoning?: boolean; thinkingLevelMap?: Record<string, unknown> | null }): string[] {
+	if (!model.reasoning) return ["off"];
+	return VALID_THINKING_LEVELS.filter((level) => {
+		const mapped = model.thinkingLevelMap?.[level];
+		if (mapped === null) return false;
+		if (level === "xhigh" || level === "max") return mapped !== undefined;
+		return true;
+	});
+}
+
+type RegistryModel = { provider?: string; id?: string; name?: string; reasoning?: boolean; thinkingLevelMap?: Record<string, unknown> | null };
+
+function toAvailableModelItem(provider: string, m: RegistryModel): AvailableModelItem {
+	const ref = `${provider}/${m.id}`;
+	return {
+		ref,
+		name: m.name || String(m.id),
+		provider,
+		id: String(m.id),
+		reasoning: Boolean(m.reasoning),
+		thinkingLevels: supportedThinkingLevels(m),
+	};
+}
+
+/**
+ * Models selectable in this pi instance — the same set as pi's /model selector: registry models with configured
+ * auth (built-in, OAuth, models.json, extension-registered). models.json is only a fallback when no registry is
+ * reachable (e.g. offline tests); it cannot see built-in/OAuth providers or auth state.
+ */
+export function loadAllAvailableModels(modelsFile: string, ctxOrRegistry?: any): AvailableModelItem[] {
+	const registry = ctxOrRegistry?.modelRegistry ?? (typeof ctxOrRegistry?.getAvailable === "function" ? ctxOrRegistry : undefined);
+	if (registry && (typeof registry.getAvailable === "function" || typeof registry.getAll === "function")) {
 		try {
-			const regModels = ctx.modelRegistry.getAll() as Array<{ provider?: string; id?: string; name?: string; reasoning?: boolean; thinkingLevelMap?: Record<string, unknown> }>;
-			for (const m of regModels) {
+			const regModels = (typeof registry.getAvailable === "function" ? registry.getAvailable() : registry.getAll()) as RegistryModel[];
+			const map = new Map<string, AvailableModelItem>();
+			for (const m of regModels ?? []) {
 				if (!m?.provider || !m?.id) continue;
-				const ref = `${m.provider}/${m.id}`;
-				const thinkLevels = m.thinkingLevelMap ? Object.keys(m.thinkingLevelMap).filter((k) => m.thinkingLevelMap?.[k] !== null) : [];
-				map.set(ref, {
-					ref,
-					name: m.name || m.id,
-					provider: m.provider,
-					id: m.id,
-					reasoning: Boolean(m.reasoning),
-					thinkingLevels: thinkLevels.length > 0 ? thinkLevels : (m.reasoning ? ["high", "max"] : []),
-				});
+				const item = toAvailableModelItem(m.provider, m);
+				map.set(item.ref, item);
 			}
+			return Array.from(map.values());
 		} catch {
 			// fall back to models.json
 		}
 	}
-	if (map.size === 0 && existsSync(modelsFile)) {
+	const map = new Map<string, AvailableModelItem>();
+	if (existsSync(modelsFile)) {
 		try {
-			const parsed = JSON.parse(readFileSync(modelsFile, "utf8")) as {
-				providers?: Record<string, { models?: Array<{ id?: string; name?: string; reasoning?: boolean; thinkingLevelMap?: Record<string, unknown> }> }>;
-			};
+			const parsed = JSON.parse(readFileSync(modelsFile, "utf8")) as { providers?: Record<string, { models?: RegistryModel[] }> };
 			for (const [providerId, provider] of Object.entries(parsed.providers ?? {})) {
 				for (const m of provider.models ?? []) {
 					if (!m?.id) continue;
-					const ref = `${providerId}/${m.id}`;
-					const thinkLevels = m.thinkingLevelMap ? Object.keys(m.thinkingLevelMap).filter((k) => m.thinkingLevelMap?.[k] !== null) : [];
-					map.set(ref, {
-						ref,
-						name: m.name || m.id,
-						provider: providerId,
-						id: m.id,
-						reasoning: Boolean(m.reasoning),
-						thinkingLevels: thinkLevels.length > 0 ? thinkLevels : (m.reasoning ? ["high", "max"] : []),
-					});
+					const item = toAvailableModelItem(providerId, m);
+					map.set(item.ref, item);
 				}
 			}
 		} catch {
@@ -1696,6 +1712,12 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	const cfgFile = join(dir, "team.json");
 	const modelsFile = join(dir, "models.json");
 	const markerFile = join(dir, "team-pending.json");
+	// Argument-completion callbacks receive no ctx; reuse the registry seen by the last session/command.
+	let knownModelRegistry: unknown;
+	const listSelectableModels = (ctx?: { modelRegistry?: unknown }) => {
+		if (ctx?.modelRegistry) knownModelRegistry = ctx.modelRegistry;
+		return loadAllAvailableModels(modelsFile, knownModelRegistry ? { modelRegistry: knownModelRegistry } : undefined);
+	};
 
 	let cfg = loadConfigFrom(cfgFile);
 	let prices = loadPrices(modelsFile);
@@ -2039,6 +2061,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					continue;
 				}
 			}
+			// A child whose process this runner still owns is settled by handleNativeChildComplete on exit
+			// (quota fallback, exit code, log tail); probing its half-written file here would pre-empt that.
+			if (task.status === "running" && isSubagentActive(task.sessionId!)) continue;
 			const probe = probeLiveChildSession(task.sessionId!, {
 				parentSessionId: currentParentId,
 				runId: task.runId,
@@ -2330,12 +2355,15 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		let dirty = false;
 		let failureNote = "";
 
+		// Match by the ledger runId first: a fast child can exit before tool_result binds its sessionId to the task.
+		const runId = info.runId && board().tasks.some(t => t.runId === info.runId) ? info.runId : undefined;
 		if (info.success) {
-			syncLease(undefined, sessionId, "completed");
-			if (observeTask(board(), undefined, sessionId, "completed")) dirty = true;
+			syncLease(runId, sessionId, "completed");
+			if (observeTask(board(), runId, sessionId, "completed")) dirty = true;
 		} else {
 			// The child process has verifiably exited: settle the attempt instead of leaving it "uncertain".
-			const task = board().tasks.find(t => t.sessionId === sessionId && (t.status === "running" || t.status === "uncertain"));
+			const task = board().tasks.find(t => (runId ? t.runId === runId : t.sessionId === sessionId) && (t.status === "running" || t.status === "uncertain"));
+			if (task && !task.sessionId) task.sessionId = sessionId;
 			const role = normalizeRole(info.role);
 			const errorText = info.error ?? `child ${info.status}`;
 			const kind = classifyAgentFailure(errorText);
@@ -2946,6 +2974,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (event, ctx) => {
 		captureToolLauncher(ctx);
+		if (ctx.modelRegistry) knownModelRegistry = ctx.modelRegistry;
 		try {
 			parentSessionId = ctx.sessionManager.getSessionId();
 		} catch {
@@ -3930,35 +3959,33 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		description: "五人多 Agent 工作流：on/off/model/tasks/status/reconcile/mode/goal/solo",
 		getArgumentCompletions: (prefix: string) => {
 			const trimmed = prefix.trimStart();
-			if (trimmed.startsWith("model ") || trimmed === "model" || trimmed.startsWith("models ") || trimmed === "models") {
-				const parts = trimmed.split(/\s+/);
-				if (parts.length === 1 || (parts.length === 2 && !trimmed.endsWith(" "))) {
-					const subArg = (parts[1] ?? "").toLowerCase();
-					const subCommands = ["list", "help", ...ROLES];
-					return subCommands
+			if (trimmed.startsWith("model ") || trimmed.startsWith("models ")) {
+				// words[last] is the word being completed ("" right after a space).
+				const words = trimmed.trim().split(/\s+/);
+				if (/\s$/.test(trimmed)) words.push("");
+				const head = words[0];
+				if (words.length === 2) {
+					const subArg = words[1].toLowerCase();
+					return ["list", "help", ...ROLES]
 						.filter(s => s.startsWith(subArg))
-						.map(s => ({ value: `model ${s}`, label: `model ${s}` }));
+						.map(s => ({ value: `${head} ${s}`, label: `${head} ${s}` }));
 				}
-				if (parts.length === 2 || (parts.length === 3 && !trimmed.endsWith(" "))) {
-					const roleArg = parts[1].toLowerCase();
-					const modelArg = (parts[2] ?? "").toLowerCase();
-					if (ROLES.includes(roleArg as Role)) {
-						const available = loadAllAvailableModels(modelsFile);
-						const matches = available
-							.map(m => m.ref)
-							.filter(ref => ref.toLowerCase().includes(modelArg));
-						const suggestions = ["thinking", ...matches].slice(0, 15);
-						return suggestions.map(s => ({ value: `model ${roleArg} ${s}`, label: `model ${roleArg} ${s}` }));
-					}
+				const roleArg = (words[1] ?? "").toLowerCase();
+				if (ROLES.includes(roleArg as Role) && words.length === 3) {
+					const modelArg = words[2].toLowerCase();
+					const matches = listSelectableModels()
+						.map(m => m.ref)
+						.filter(ref => ref.toLowerCase().includes(modelArg));
+					const suggestions = ["thinking".startsWith(modelArg) ? ["thinking"] : [], matches].flat().slice(0, 30);
+					return suggestions.map(s => ({ value: `${head} ${roleArg} ${s}`, label: `${head} ${roleArg} ${s}` }));
 				}
-				if (parts.length === 3 || (parts.length === 4 && !trimmed.endsWith(" "))) {
-					const roleArg = parts[1].toLowerCase();
-					const modelArg = parts[2];
-					const thinkArg = (parts[3] ?? "").toLowerCase();
+				if (ROLES.includes(roleArg as Role) && words.length === 4) {
+					const thinkArg = words[3].toLowerCase();
 					return VALID_THINKING_LEVELS
 						.filter(t => t.startsWith(thinkArg))
-						.map(t => ({ value: `model ${roleArg} ${modelArg} ${t}`, label: `model ${roleArg} ${modelArg} ${t}` }));
+						.map(t => ({ value: `${head} ${roleArg} ${words[2]} ${t}`, label: `${head} ${roleArg} ${words[2]} ${t}` }));
 				}
+				return null;
 			}
 
 			const items = ["help", "on", "off", "new", "status", "check-update", "update", "model", "model list", "model help", "models", "tasks", "tasks archive", "tasks move", "dispatch", "solo delegated", "solo allow", "reconcile", "log", "reset", "goal", "goal status", "goal edit", "goal clear", "goal resume", "goal stop", "mode economy", "mode strict", "budget", "limits"]
@@ -4461,7 +4488,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			}
 
 			if (sub === "model" || sub === "models") {
-				const availableModels = loadAllAvailableModels(modelsFile, ctx);
+				const availableModels = listSelectableModels(ctx);
 				const actionOrRole = (rest[0] ?? "").toLowerCase();
 
 				// 1. 列出可用模型：/team model list [keyword] 或 /team models [keyword]
@@ -4613,7 +4640,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				setStatusText(ctx);
 
 				const thinkMsg = newThinking ? `，思考程度：${newThinking}` : "";
-				const warningMsg = !matchedModel ? `\n⚠️ 提示：${finalModelRef} 未在当前 models.json 中找到，请确保模型 ID 正确。` : "";
+				const warningMsg = !matchedModel ? `\n⚠️ 提示：${finalModelRef} 不在当前 pi 的可用模型列表中（未配置认证或 ID 有误），子 Agent 可能无法启动。` : "";
 				ctx.ui.notify(`✓ 已将 ${ROLE_LABEL[targetRole]} (${targetRole}) 的模型设置为 ${finalModelRef}${thinkMsg}（已持久化保存）${warningMsg}`, "info");
 				return;
 			}
@@ -4625,7 +4652,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("models", {
 		description: "列出当前可用的所有大模型及思考能力（支持 /models [关键词]）",
 		getArgumentCompletions: (prefix: string) => {
-			const available = loadAllAvailableModels(modelsFile);
+			const available = listSelectableModels();
 			return available
 				.map(m => m.ref)
 				.filter(ref => ref.toLowerCase().includes(prefix.trim().toLowerCase()))
@@ -4634,7 +4661,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		},
 		handler: async (args, ctx) => {
 			const query = args.trim().toLowerCase();
-			const availableModels = loadAllAvailableModels(modelsFile, ctx);
+			const availableModels = listSelectableModels(ctx);
 			const matched = query
 				? availableModels.filter(m => m.ref.toLowerCase().includes(query) || m.name.toLowerCase().includes(query))
 				: availableModels;
