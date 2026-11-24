@@ -1,0 +1,80 @@
+{
+  "defaultEnabled": false,
+  "defaultMode": "standard",
+  "mainModelPolicy": "preserve",
+  "economyModel": "magpie/codex/gpt-6.1-sol",
+  "economyThinking": "high",
+  "strictModel": "magpie/codex/gpt-6.1-sol",
+  "strictThinking": "high",
+  "maxConcurrent": 20,
+  "sessionBudgetUSD": 0,
+  "maxAutoRetries": 0,
+  "escalationMinChars": 0,
+  "goalMaxRounds": 0,
+  "goalMaxStalls": 0,
+  "bashTimeoutSeconds": 180,
+  "bashMaxTimeoutSeconds": 900,
+  "parentSoloWork": "allow",
+  "agentWaitTimeoutSeconds": 600,
+  "autoGcChildSessions": true,
+  "gcReviewerCooldownMinutes": 60,
+  "gcWorkerCooldownMinutes": 1440,
+  "estimate": {
+    "inputTokens": 15000,
+    "outputTokens": 3000
+  },
+  "roles": {
+    "cp": {
+      "label": "Chris Paul",
+      "model": "magpie/codex/gpt-6.1-sol",
+      "maxCalls": 0,
+      "budgetUSD": 0,
+      "costly": false
+    },
+    "booker": {
+      "label": "Devin Booker",
+      "model": "magpie/codex/gpt-6.1-sol",
+      "maxCalls": 0,
+      "budgetUSD": 0,
+      "costly": false
+    },
+    "bridges": {
+      "label": "Mikal Bridges",
+      "model": "magpie/codex/gpt-6.1-sol",
+      "maxCalls": 0,
+      "budgetUSD": 0,
+      "costly": false
+    },
+    "ayton": {
+      "label": "Deandre Ayton",
+      "model": "magpie/codex/gpt-6-luna",
+      "maxCalls": 0,
+      "budgetUSD": 0,
+      "costly": false
+    },
+    "cameron": {
+      "label": "Cameron Johnson",
+      "model": "magpie/codex/gpt-6-luna",
+      "maxCalls": 0,
+      "budgetUSD": 0,
+      "costly": false
+    }
+  },
+  "fallbacks": {
+    "cp": [
+      "magpie/cursor/auto",
+      "magpie/auto/gpt-6.1-sol",
+      "magpie/agentrouter/gpt-6.1-sol",
+      "magpie/anyrouter/gpt-6.1-sol"
+    ],
+    "booker": [
+      "magpie/cursor/auto",
+      "magpie/auto/gpt-6.1-sol",
+      "magpie/agentrouter/gpt-6.1-sol"
+    ],
+    "bridges": [
+      "magpie/cursor/auto",
+      "magpie/auto/gpt-6.1-sol"
+    ]
+  }
+}

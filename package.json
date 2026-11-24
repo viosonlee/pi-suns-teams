@@ -1,0 +1,21 @@
+{
+  "name": "pi-teams",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "5-Agent Collaborative Workflow (CP-parent Architecture) for pi & pi-web",
+  "main": "extensions/team.ts",
+  "scripts": {
+    "test": "node tests/test-team.ts && node tests/test-team-ledger.ts"
+  },
+  "keywords": [
+    "pi",
+    "pi-web",
+    "agent",
+    "multi-agent",
+    "workflow",
+    "subagents",
+    "teams"
+  ],
+  "author": "",
+  "license": "MIT"
+}

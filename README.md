@@ -1,0 +1,179 @@
+# pi-teams: 5-Agent Collaborative Workflow for pi & pi-web
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20WSL2-orange.svg)](#)
+[![pi](https://img.shields.io/badge/pi-extension-brightgreen.svg)](#)
+
+**pi-teams** 是专为 [`pi`](https://github.com/earendil-works/pi) 与 [`pi-web`](https://github.com/agegr/pi-web) 打造的生产级**五人多智能体协作工作流插件（Phoenix Suns CP-parent 架构）**。
+
+它彻底解决单智能体在应对中大型复杂开发任务时的三大痛点：
+1. **上下文膨胀（Context Explosion）**：任务跑久了上下文塞满无用日志与代码堆栈，导致模型变笨或触发截断。
+2. **缺乏独立复核（Lack of Independent Review）**：由编写代码的同一个 Agent 自己检查自己，极易产生盲区与代码幻觉。
+3. **长期任务漂移（Goal Drift）**：多轮会话后忘记原始验收标准或未交付完成即草草汇报完成。
+
+---
+
+## 🏀 核心架构：五人分工与权限矩阵
+
+`pi-teams` 将复杂软件工程任务拆解为具有严格职责边界的五人制团队：
+
+| 角色 | 代号 | 权限约束 | 职责定位 | 默认思考等级 |
+|---|---|---|---|---|
+| **Chris Paul (CP)** | `cp` | **只读** (`read, bash, grep, find, ls`，禁止修改代码) | **主控总指挥 / 最终仲裁官**：统筹需求拆解、调度流水线、独立代码复核（`W-rev-*`）、最终验收签字。主会话即担任 CP 角色。 | `max` |
+| **Devin Booker** | `booker` | **读写** (`read, bash, edit, write, ...`) | **资深攻坚手**：承担高难度复杂实现、多模块大型重构、疑难底层故障排查，必要时可承担局部代码复核。 | `xhigh` |
+| **Mikal Bridges** | `bridges` | **读写** (`read, bash, edit, write, ...`) | **主力开发员**：高效率承接明确的业务功能实现、接口编写与标准 Bug 修复。 | `high` |
+| **Deandre Ayton** | `ayton` | **只读** (`read, bash, grep, find, ls`，**坚决不写代码**) | **质量验证员**：专职运行测试套件、设备脚本、构建验证、巡检设备画面。发现缺陷只负责汇报证据，禁止越权改代码。 | `medium` |
+| **Cameron Johnson** | `cameron` | **读写** (`read, bash, edit, write, ...`) | **资产与矩阵管家**：维护回归测试资产、同步 Qualification 矩阵状态、维护交付证据与说明文档。 | `medium` |
+
+---
+
+## ✨ 关键特性
+
+- **动态账本与 DAG 任务队列（Team Ledger）**：支持将需求分解为 `Q-*` 需求与 `W-*` 有序工单，支持任务插队（`front/tail/before/after`）、读写冲突（Scope Collision）自动排队与依赖拓扑检查。
+- **只读独立复核门禁（Review Protocol）**：任何写代码的任务必须派发只读复核任务（`W-rev-*`），由 CP 或不同角色审查 Diff 与可机检证据（Checkable Evidence），杜绝“自写自审”。
+- **中断恢复对账（Reconcile）**：网络闪断、会话中断或超时后，无需重跑，通过 `/team reconcile` 自动读取底层 JSONL 恢复子会话结果与分支状态。
+- **孤儿会话垃圾回收（GC）**：长期运行产生的庞大历史子任务会自动物理归档至 `sessions-archive/`，保证主扫描器轻量秒开。
+- **双模式自由切换**：支持 `standard`（标准模式）、`economy`（经济成本优先）与 `strict`（严格规范模式）。
+- **零数值硬编码**：移除虚假的并发数与调用次数熔断，模型单价实时从 `~/.pi/agent/models.json` 动态读取。
+- **内置在线检查与自动更新**：支持一键 `/team check-update` 与 `/team update`。
+
+---
+
+## 🚀 跨机器一键安装
+
+### 方式 1：远程一键安装（推荐，无需克隆代码）
+在目标机器的终端中运行：
+```bash
+curl -fsSL https://raw.githubusercontent.com/lifeng/pi-teams/main/install.sh | bash
+```
+
+### 方式 2：Git Clone 本地安装（适合开发者）
+```bash
+git clone https://github.com/lifeng/pi-teams.git
+cd pi-teams
+./install.sh
+```
+> **开发者提示**：支持符号链接模式 `./install.sh --symlink`，修改本地仓库文件即可实时在 `pi` 中生效，无需反复拷贝。
+
+### 配置保护机制
+安装脚本具有**绝对配置保护**：
+- 如果目标机器已有 `~/.pi/agent/team.json`，安装脚本**绝对不会覆盖**你的自定义模型配置，只会创建 `team.default.json` 供对比参考。
+
+---
+
+## 🛠️ 交互命令速查（在 pi / pi-web 对话框中输入）
+
+### 工作流启停与状态
+- `/team on` — 启用团队多 Agent 调度模式
+- `/team off` — 退出团队工作流
+- `/team status` — 查看当前运行状态、调度中子会话与任务账本进度
+- `/team mode [standard|economy|strict]` — 切换工作流模式
+
+### 目标推进与长循环（Goal Loop）
+- `/team goal <总目标描述>` — 登记长期总目标并启动主控自主推进循环
+- `/team goal status` — 查看当前目标完成度与主控审核轮次
+- `/team goal stop` — 暂停推进（保留当前所有未完成工单）
+- `/team goal resume` — 恢复推进
+
+### 任务队列管理（Tasks）
+- `/team tasks` — 查看任务账本（就绪 / 运行中 / 待验收）
+- `/team tasks move <任务ID> front|tail|before <目标ID>|after <目标ID>` — 工单优先级插队
+- `/team tasks archive` — 查看已验收或归档的历史工单与证据
+- `/team dispatch` — 手动触发一次调度派发
+
+### 模型与思考分配（Models）
+- `/team model` — 查看当前 5 个角色的模型与思考深度
+- `/team model list [关键词]` — 模糊搜索本地可用大模型列表（快捷命令：`/models`）
+- `/team model <角色> <模型ID> [思考级别]` — 一键调配指定角色的模型与思考（如 `/team model bridges deepseek-v3.1 high`）
+- `/team model <角色> thinking <级别>` — 仅调整角色的思考深度（`off|low|medium|high|xhigh|max`）
+
+### 维护与在线更新
+- `/team check-update` — 联网检查 GitHub 仓库最新发布版本
+- `/team update` — 在线拉取最新核心文件并完成安全热升级
+- `/team reconcile [子会话ID]` — 对账并恢复中断掉线的子任务结果
+- `/team gc` — 手动触发历史已结束子会话的物理归档
+
+---
+
+## ⚙️ 模型配置与自定义（`~/.pi/agent/team.json`）
+
+`team.json` 掌控各角色的默认底模与备选容灾梯队：
+```json
+{
+  "defaultEnabled": false,
+  "defaultMode": "standard",
+  "mainModelPolicy": "preserve",
+  "roles": {
+    "cp": {
+      "label": "Chris Paul",
+      "model": "your-provider/gpt-4o",
+      "maxCalls": 0
+    },
+    "booker": {
+      "label": "Devin Booker",
+      "model": "your-provider/claude-3-7-sonnet",
+      "maxCalls": 0
+    },
+    "bridges": {
+      "label": "Mikal Bridges",
+      "model": "your-provider/deepseek-v3",
+      "maxCalls": 0
+    },
+    "ayton": {
+      "label": "Deandre Ayton",
+      "model": "your-provider/deepseek-v3",
+      "maxCalls": 0
+    },
+    "cameron": {
+      "label": "Cameron Johnson",
+      "model": "your-provider/deepseek-v3",
+      "maxCalls": 0
+    }
+  },
+  "fallbacks": {
+    "cp": ["backup-provider/gpt-4o", "backup-provider/deepseek-r1"],
+    "booker": ["backup-provider/claude-3-7-sonnet"],
+    "bridges": ["backup-provider/deepseek-v3"]
+  }
+}
+```
+
+---
+
+## 🔄 升级与卸载
+
+### 检查与升级
+- **聊天内升级**：在任一已启用插件的会话中输入 `/team update`。
+- **终端升级**：在命令行中直接运行：
+  ```bash
+  ~/.pi/agent/update.sh
+  ```
+
+### 卸载插件
+运行随附的卸载脚本：
+```bash
+# 卸载核心代码并保留您的 team.json 配置
+./uninstall.sh
+
+# 彻底清理所有配置与备份
+./uninstall.sh --purge
+```
+
+---
+
+## 🧪 自动化测试验证
+
+仓库内嵌了完善的无依赖纯逻辑测试套件：
+```bash
+# 运行全部 70+ 项单元测试
+npm test
+# 或分项运行
+node tests/test-team.ts
+node tests/test-team-ledger.ts
+```
+
+---
+
+## 📄 授权协议
+
+本项目采用 [MIT License](LICENSE) 开源协议。
