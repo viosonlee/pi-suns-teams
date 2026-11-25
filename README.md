@@ -19,18 +19,18 @@
 
 | 角色 | 代号 | 权限约束 | 职责定位 | 默认思考等级 |
 |---|---|---|---|---|
-| **Chris Paul (CP)** | `cp` | **只读** (`read, bash, grep, find, ls`，禁止修改代码) | **主控总指挥 / 最终仲裁官**：统筹需求拆解、调度流水线、独立代码复核（`W-rev-*`）、最终验收签字。主会话即担任 CP 角色。 | `max` |
-| **Devin Booker** | `booker` | **读写** (`read, bash, edit, write, ...`) | **资深攻坚手**：承担高难度复杂实现、多模块大型重构、疑难底层故障排查，必要时可承担局部代码复核。 | `xhigh` |
-| **Mikal Bridges** | `bridges` | **读写** (`read, bash, edit, write, ...`) | **主力开发员**：高效率承接明确的业务功能实现、接口编写与标准 Bug 修复。 | `high` |
-| **Deandre Ayton** | `ayton` | **只读** (`read, bash, grep, find, ls`，**坚决不写代码**) | **质量验证员**：专职运行测试套件、设备脚本、构建验证、巡检设备画面。发现缺陷只负责汇报证据，禁止越权改代码。 | `medium` |
-| **Cameron Johnson** | `cameron` | **读写** (`read, bash, edit, write, ...`) | **资产与矩阵管家**：维护回归测试资产、同步 Qualification 矩阵状态、维护交付证据与说明文档。 | `medium` |
+| **Chris Paul (CP)** | `cp` | **只读** (`read, bash, grep, find, ls`，禁止修改代码) | **复核 / 重大仲裁**：承接必要的 `W-rev-*`、重要/全局架构与重大技术仲裁；主会话担任 CP，保留用户范围决策、最终目标审核与需求关闭。 | `max` |
+| **Devin Booker** | `booker` | **读写** (`read, bash, edit, write, ...`) | **高级执行者**：复杂实现及任务/用户范围内的有界技术决策；默认干净且有证据的交付无需 CP 工单复核，显式要求复核除外。重要/全局架构、用户范围变更、重大仲裁仍归 CP/main。 | `xhigh` |
+| **Mikal Bridges** | `bridges` | **读写** (`read, bash, edit, write, ...`) | **纯执行开发员**：落实明确的功能、接口与 Bug 修复；不自主做技术决策，真实取舍/缺失选择需上报，常规非决策读写不需逐次批准。 | `high` |
+| **Deandre Ayton** | `ayton` | **只读** (`read, bash, grep, find, ls`，**坚决不写代码**) | **纯执行验证员**：运行指定测试、构建、设备检查并汇报证据；不做代码复核或自主技术决策，缺陷交给写入角色，真实取舍/缺失选择交主控。 | `medium` |
+| **Cameron Johnson** | `cameron` | **读写** (`read, bash, edit, write, ...`) | **纯执行资产管家**：按既定要求维护文档、矩阵、资产与证据；不做代码复核或自主技术决策，真实取舍/缺失选择需上报，常规非决策读写不需逐次批准。 | `medium` |
 
 ---
 
 ## ✨ 关键特性
 
 - **动态账本与 DAG 任务队列（Team Ledger）**：支持将需求分解为 `Q-*` 需求与 `W-*` 有序工单，支持任务插队（`front/tail/before/after`）、读写冲突（Scope Collision）自动排队与依赖拓扑检查。
-- **只读独立复核门禁（Review Protocol）**：任何写代码的任务必须派发只读复核任务（`W-rev-*`），由 CP 或不同角色审查 Diff 与可机检证据（Checkable Evidence），杜绝“自写自审”。
+- **按任务选择独立复核（Review Protocol）**：需要复核的任务由不同 Agent 审查 Diff 与证据，杜绝“自写自审”；Booker 默认交付和显式 `reviewTier: "none"` 的小型非决策任务可豁免工单复核，显式复核/确定性门禁与已有复核义务仍保留（见下节）。
 - **中断恢复对账（Reconcile）**：网络闪断、会话中断或超时后，无需重跑，通过 `/team reconcile` 自动读取底层 JSONL 恢复子会话结果与分支状态。
 - **孤儿会话垃圾回收（GC）**：长期运行产生的庞大历史子任务会自动物理归档至 `sessions-archive/`，保证主扫描器轻量秒开。
 - **双模式自由切换**：支持 `standard`（标准模式）、`economy`（经济成本优先）与 `strict`（严格规范模式）。
@@ -38,6 +38,46 @@
 - **双运行器**：在 pi-web 中，新的子 Agent 优先通过宿主的受跟踪子会话运行，侧栏实时收到创建与状态通知；在 CLI 中仍使用独立 `pi --mode json` 进程。已有原生进程子会话保持原方式恢复，不在运行中迁移。宿主启动失败不会偷偷改用另一种方式重复派发。团队任务统一通过 `Agent` 派发，避免绕过台账重复执行。
 - **手动与自动派发协调**：`team_tasks add/update` 的 `autoDispatch:false` 为受影响任务持久保留手动派发权，不影响其他自动任务；用 `Agent` 提供完整任务说明/旧子会话 `resume`，或用 `team_dispatch` 显式释放给自动调度器。同一任务、同一角色的重复派发返回已有运行会话，不新增执行。重新排队的已执行任务默认保留手动恢复权，明确 `autoDispatch:true` 才授权后台重新派发。
 - **内置在线检查与自动更新**：支持一键 `/team check-update` 与 `/team update`。
+
+### v1.1.4：决策权限、工单复核与完成条件
+
+- **Booker 默认豁免**：`reviewTier` 未设置时不生成 CP 复核工单，交付后任务停在 `reported`，由主 CP 检查证据后一句话验收；Booker 可在任务及用户范围内做有界技术决策。重要/全局架构、用户范围变更、重大仲裁仍归 CP/main。
+- **小工单显式豁免**：`reviewTier: "none"` 让小型、细粒度、非决策任务不生成 worker review，适用于 Bridges/Ayton/Cameron 的常规指定读写/检查；不增加工具权限，也不赋予自主决策权。真实取舍或缺失选择需上报，不能把执行豁免变成决策授权。
+- **显式复核优先**：`reviewTier: "llm"`、`autoAccept: false` 或显式 `reviewerRole` 要求独立复核（包括 Booker；`autoAccept: false` 优先于豁免）。显式 `reviewTier: "deterministic"` 保留机器断言门禁：`autoAccept: true` 且全部验收条件都是客观机器断言（`file:` / `artifact:` / `exit code 0`）时才自动结算，否则仍需复核。报告文字里的“N passed / N failed”**不再**参与自动判定——把自由文本当通过/失败信号只会误判。已有 reviewer 义务不会自动取消或被追溯绕过。
+- **豁免只改派发，不自动判定完成**：豁免任务不会根据报告里的措辞自动标 `done`（先后出过“将来时”被当成完成、`Status: pending` 配 `PASS` 被接受等问题）。唯一自动结算路径是 deterministic 客观断言（文件存在、退出码）；豁免交付一律由主 CP 验收，也仍然检查依赖是否完成。
+- **完成不是结束一轮对话**：报告必须包含实际干净交付与证据；待集成/清理、失败、中止、未验证结果不得标记 `done`。主 CP 仍须最终审核整个目标，并在关联任务与验收条件全部核实后关闭需求；工单豁免不是用户目标完成。
+- **沟通语言**：内部任务 brief、验收条件与报告使用 English；面向用户的语言不受限制。
+
+#### 三个简短完整工单示例
+
+假定 `Q-1` 已登记且开放；以下仅使用已有 task-spec 字段，路径与命令按项目替换。
+
+```typescript
+tools.team_tasks({ action: "add", tasks: [
+  { // Booker default: bounded technical decisions; no implicit CP worker review.
+    id: "W-1", title: "Fix the bounded cache race", role: "booker",
+    requestIds: ["Q-1"], dependsOn: [],
+    readPaths: ["src/cache.ts", "tests/cache.test.ts"],
+    writePaths: ["src/cache.ts", "tests/cache.test.ts"],
+    acceptance: ["Concurrent cache access preserves existing behavior; provide diff and passing cache-test evidence."]
+  },
+  { // Simple Bridges task: execute a specified choice, skip the reviewer child (parent still accepts).
+    id: "W-2", title: "Set the token error text to Invalid token", role: "bridges",
+    requestIds: ["Q-1"], dependsOn: [],
+    readPaths: ["src/errors.ts"], writePaths: ["src/errors.ts"],
+    acceptance: ["Only the specified error text changes; provide scoped diff evidence."],
+    reviewTier: "none"
+  },
+  { // Important task: explicitly request independent review, even for Booker.
+    id: "W-3", title: "Implement the approved authentication policy", role: "booker",
+    requestIds: ["Q-1"], dependsOn: [],
+    readPaths: ["docs/auth-policy.md", "src/auth.ts", "tests/auth.test.ts"],
+    writePaths: ["src/auth.ts", "tests/auth.test.ts"],
+    acceptance: ["Implementation matches the approved policy; provide scoped diff and passing authentication-test evidence."],
+    reviewTier: "llm", autoAccept: false
+  }
+] });
+```
 
 ### 运行要求
 - Node.js >= 22.6（与 pi 一致，测试直接用 node 运行 TypeScript）

@@ -366,6 +366,8 @@ export function addTasks(board: WorkLedger, values: unknown, cwd: string, option
 		if (!/^W-[A-Za-z0-9_-]+$/.test(id)) throw new Error("Task id must start with W- and contain only letters, digits, _ or -.");
 		if (/^W-\d+$/.test(id)) next = Math.max(next, Number(id.slice(2)) + 1);
 		const role = text(spec.role, "role");
+		if (spec.reviewTier !== undefined && (typeof spec.reviewTier !== "string" || !["deterministic", "llm", "none"].includes(spec.reviewTier))) throw new Error(`${id}: reviewTier must be deterministic, llm or none.`);
+		if (spec.autoAccept !== undefined && typeof spec.autoAccept !== "boolean") throw new Error(`${id}: autoAccept must be a boolean.`);
 		if (!["cp", "booker", "bridges", "ayton", "cameron", "parent"].includes(role)) throw new Error(`${id}: Unknown role "${role}". Valid roles: cp, booker, bridges, ayton, cameron, parent.`);
 		const rawWritePaths = spec.writePaths;
 		const isolation = spec.isolation === "worktree" ? "worktree" : undefined;
@@ -944,7 +946,7 @@ export function ledgerPrompt(board: WorkLedger, _slots = Infinity, validatedBatc
 		...openRequests.map(r => `${r.id} (${r.kind}, source=${r.source}): ${JSON.stringify(r.text)}`),
 		`Pending queue (ordered; completed items auto-archive). Archived tasks: ${board.tasks.length - openTasks.length}. Use team_tasks archive to query history.`,
 		...(() => {
-			const fmtTask = (t: WorkTask) => `${t.id} [${t.status}] ${t.role}: ${JSON.stringify(t.title)} requests=${t.requestIds.join(",")} deps=${t.dependsOn.join(",")} reads=${JSON.stringify(t.readPaths)} writes=${JSON.stringify(t.writePaths)} acceptance=${JSON.stringify(t.acceptance)}${t.sessionId ? ` child=${t.sessionId}` : ""}${t.reason ? ` reason=${JSON.stringify(t.reason)}` : ""}`;
+			const fmtTask = (t: WorkTask) => `${t.id} [${t.status}] ${t.role}: ${JSON.stringify(t.title)} requests=${t.requestIds.join(",")} deps=${t.dependsOn.join(",")} reads=${JSON.stringify(t.readPaths)} writes=${JSON.stringify(t.writePaths)} acceptance=${JSON.stringify(t.acceptance)} reviewTier=${t.reviewTier ?? "unset"} autoAccept=${t.autoAccept ?? "unset"}${t.reviewerRole ? ` reviewerRole=${t.reviewerRole}` : ""}${t.sessionId ? ` child=${t.sessionId}` : ""}${t.reason ? ` reason=${JSON.stringify(t.reason)}` : ""}`;
 			if (openTasks.length <= 80) return openTasks.map(fmtTask);
 			// Prevent 500 KB–1 MB prompt/JSONL bloat on huge long-running boards while preserving all active & top dispatchable items.
 			const batchIds = new Set(batch.slice(0, 30).map(t => t.id));
@@ -973,9 +975,14 @@ export function ledgerPrompt(board: WorkLedger, _slots = Infinity, validatedBatc
 		})(),
 		`Dispatchable independent batch: ${batch.slice(0, 30).map(t => t.id).join(", ") || "none"}${batch.length > 30 ? ` (+${batch.length - 30} more)` : ""}.`,
 		"New tasks append at the tail. For user urgency/insert requests use team_tasks move front/before/after/tail with a reason. Queue order controls dispatch priority ONLY: do not execute one user request to completion before starting the next. Advance multiple independent requests concurrently by default. Insertion never preempts live children or pauses unrelated work, and cannot bypass real dependencies/conflicts. Prefer splitting deliverables or safely isolating actual workspaces to eliminate avoidable conflicts; minor coordination alone is not a reason to serialize. Dispatch the whole ready independent batch now via background Agent calls with TEAM_TASK: W-id in each prompt. Then do other ready parent work. On any report return, verify only the relevant evidence, accept/rework it, release successors and refill slots immediately; do not wait for a whole wave. Before dispatching, decompose EACH objective as finely as independently executable and verifiable outputs allow. Do not delegate an entire objective as one opaque job when independent components can advance separately. Use multiple child sessions for independent components, including multiple instances of the same role: plan parallelism both WITHIN each objective and ACROSS different objectives. Declare precise per-file/workspace read-write ownership rather than artificial whole-repository conflicts. Avoid meaningless microtasks or unnecessary serial handoff chains. Planned items require explicit dependencies/read-write scopes and acceptance for each resulting deliverable. Serial work requires a real dependency, shared resource, or a stated reason; never invent parallel work or force a minimum worker count.",
-		"Reported is not done. Unknown/interrupted is not stopped. Scope checks are scheduling metadata, NOT a tool permission sandbox. Resource/port/shared-repo hazards must also be represented in dependencies. GOAL_COMPLETE is blocked by unresolved user requests or unfinished tasks.",
+		"ROLE AUTHORITY: Booker is the senior executor and may make bounded local technical decisions within the assigned goal/scope. CP retains global architecture, user-scope changes and major arbitration. Bridges/Ayton/Cameron execute assigned work and report decision needs; they have no decision authority. A review waiver never grants it.",
+		"REVIEW POLICY: Booker with unset reviewTier defaults review-exempt. Other workers default CP review; reviewTier:none explicitly waives review for small/granular non-decision read/write tasks, without requiring autoAccept:true. reviewTier:llm, autoAccept:false or explicit reviewerRole requests independent review. Explicit deterministic + autoAccept:true still requires ALL objective assertions (file:/artifact:, exit code 0); prose test counts are not verified automatically and route to review. CP/parent and review tasks never auto-accept. Exempt reports still need clean complete delivery, tangible evidence and every recognizable machine assertion; incomplete/failed/unverified/pending reports remain reported with rework/verification reasons and blocked dependencies, without an unnecessary automatic reviewer. Existing current-delivery reviewers and CP REWORK obligations remain binding; never cancel old reviewers to apply defaults.",
+		"Reported is not done until verified automatic acceptance or independent/parent acceptance. Unknown/interrupted is not stopped. Scope checks are scheduling metadata, NOT a tool permission sandbox. Resource/port/shared-repo hazards must also be represented in dependencies. GOAL_COMPLETE is blocked by unresolved user requests or unfinished tasks.",
 	].join("\n");
 }
+
+/** Only hard execution failures are fatal; free-text pass/fail phrasing is never parsed. */
+const FATAL_SUMMARY_RE = /FATAL ERROR|COMMAND FAILED WITH EXIT CODE [1-9]|UNCAUGHT EXCEPTION|EXIT CODE\s*:?\s*[1-9]/i;
 
 export function isMachineAssertion(criterion: string): boolean {
 	if (!criterion || typeof criterion !== "string") return false;
@@ -984,7 +991,6 @@ export function isMachineAssertion(criterion: string): boolean {
 		/^file:/i.test(trimmed) ||
 		/^artifact:/i.test(trimmed) ||
 		/exit(?:ed)?(?: with)?(?: code)?(?::| )+0/i.test(trimmed) ||
-		/tests?(?: passed)?:/i.test(trimmed) ||
 		/\bexit 0\b/i.test(trimmed)
 	);
 }
@@ -1004,38 +1010,61 @@ export function isDeterministic(task: WorkTask): boolean {
 	return task.reviewTier === "deterministic" && task.autoAccept === true && hasMachineAssertions(task);
 }
 
+/** Role policy only; delivery/evidence/reviewer guards still apply at settlement. */
+export function isReviewExempt(task: WorkTask): boolean {
+	if (isReviewTask(task) || !["booker", "bridges", "ayton", "cameron"].includes(task.role)) return false;
+	if (task.autoAccept === false || task.reviewerRole?.trim()) return false;
+	return task.reviewTier === "none" || (task.role === "booker" && task.reviewTier === undefined);
+}
+
+/**
+ * Deterministic-only automatic settlement.
+ *
+ * Review exemption (Booker default / explicit `reviewTier: "none"`) changes WHICH reviewer is
+ * spawned, never whether a delivery counts as accepted: an exempt delivery stays `reported`
+ * until the main CP accepts it. Inferring "done" from a subagent's prose was fragile (future
+ * tense, Markdown status headings, recovered reports without terminal proof), so the ledger
+ * settles automatically ONLY for explicit machine assertions.
+ */
 export function autoAcceptTask(
 	board: WorkLedger,
 	taskId: string,
-	evidence: string[] = ["Deterministic execution verified; auto-accepted by scheduler."],
-	options?: { cleanExit?: boolean },
+	evidence: string[] = [],
+	options?: { cleanExit?: boolean; deliveryVersion?: string; cwd?: string },
 ): boolean {
 	const task = board.tasks.find(t => t.id === taskId);
-	if (!task || terminalWork(task.status)) return false;
+	if (!task || isReviewTask(task) || !["booker", "bridges", "ayton", "cameron"].includes(task.role)) return false;
+	// An explicit review request always wins over any automatic route.
+	if (task.autoAccept === false || task.reviewerRole?.trim() || task.reviewTier === "llm") return false;
 	if (!isDeterministic(task)) return false;
-
-	// 1. Must have reached a completed terminal state (reported or reviewing), cannot auto-accept unexecuted or running tasks!
-	if (task.status !== "reported" && task.status !== "reviewing") return false;
-
-	// 2. cleanExit MUST be explicitly true. Undefined, false, or missing fails closed immediately!
+	// 1. Must have reached a completed terminal state (reported), never running/ready/etc.
+	if (task.status !== "reported") return false;
+	// 2. Fence a late report from an older delivery of the same task.
+	const version = deliveryVersionOf(task);
+	if (options?.deliveryVersion !== undefined && options.deliveryVersion !== version) return false;
+	if (board.tasks.some(t => (t.parentTaskId === task.id || t.id === reviewerTaskId(task.id))
+		&& (t.reviewedDeliveryVersion === version || (!t.reviewedDeliveryVersion && !terminalWork(t.status))))) return false;
+	if ((board.reviewRecords ?? []).some(record => record.workerTaskId === task.id && !record.discarded && record.verdict !== "STALE"
+		&& record.deliveryVersion === version)) return false;
+	// 3. Settlement must respect the same dependency invariant as an explicit done update.
+	const unfinished = task.dependsOn.filter(id => board.tasks.find(t => t.id === id)?.status !== "done");
+	if (unfinished.length) return false;
+	// 4. cleanExit MUST be explicitly true. Undefined, false, or missing fails closed immediately.
 	if (options?.cleanExit !== true) return false;
+	if (!Array.isArray(evidence) || !evidence.every(e => typeof e === "string")) return false;
+	const evText = evidence.join("\n");
+	if (!evText.trim() || FATAL_SUMMARY_RE.test(evText)) return false;
 
-	// 3. Verify evidence content: must have valid evidence and not indicate fatal execution errors
-	const evText = evidence.join(" ");
-	if (!evText.trim() || /FATAL ERROR|COMMAND FAILED WITH EXIT CODE [1-9]|UNCAUGHT EXCEPTION|EXIT CODE: [1-9]/i.test(evText)) {
-		return false;
-	}
-
-	// 4. Concrete item-by-item verification of every required machine assertion against trusted execution results
+	// 5. Concrete item-by-item verification of every required machine assertion.
 	for (const crit of task.acceptance) {
 		let verified = false;
 
 		// A. File/Artifact assertion: e.g. "file:/path/to/artifact" or "artifact:/path/to/artifact"
 		if (/^(?:file|artifact):/i.test(crit)) {
 			const targetFile = crit.replace(/^(?:file|artifact):\s*/i, "").trim();
-			const resolvedPath = isAbsolute(targetFile) 
-				? targetFile 
-				: resolve(task.worktreePath || process.cwd(), targetFile);
+			const resolvedPath = isAbsolute(targetFile)
+				? targetFile
+				: resolve(task.worktreePath || options?.cwd || process.cwd(), targetFile);
 			try {
 				if (existsSync(resolvedPath) && statSync(resolvedPath).size > 0) {
 					verified = true;
@@ -1047,33 +1076,16 @@ export function autoAcceptTask(
 
 		// B. Exit code assertion: e.g. "exit code 0", "exit: 0", "exited with code 0", "exit 0"
 		else if (/exit(?:ed)?(?: with)?(?: code)?(?::| )+0|\bexit 0\b/i.test(crit)) {
-			// cleanExit is already true, and evidence must confirm clean exit without non-zero errors
 			if (/exit(?:ed)?(?: with)?(?: code)?(?::| )+0|\bexit 0\b/i.test(evText) && !/exit(?:ed)?(?: with)?(?: code)?(?::| )+[1-9]/i.test(evText)) {
 				verified = true;
 			}
 		}
 
-		// C. Test count assertion: e.g. "tests passed: 10", "tests: 5"
-		else if (/tests?(?: passed)?(?::| )+([0-9]+)/i.test(crit)) {
-			const m = crit.match(/tests?(?: passed)?(?::| )+([0-9]+)/i);
-			const expectedCount = m ? parseInt(m[1], 10) : 0;
-			const evMatch = evText.match(/([0-9]+)\s*(?:tests?\s*)?pass(?:ed|ing)?|pass(?:ed|ing)?(?::| )+([0-9]+)/i);
-			if (evMatch) {
-				const actualCount = parseInt(evMatch[1] || evMatch[2], 10);
-				if (actualCount >= expectedCount && !/fail(?:ed|ure)?(?::| )+[1-9]/i.test(evText)) {
-					verified = true;
-				}
-			}
-		}
-
-		// If this criterion was not verified by trusted execution results or disk artifacts, fail closed to Reviewer!
-		if (!verified) {
-			return false;
-		}
+		if (!verified) return false;
 	}
 
 	task.status = "done";
-	task.evidence = evidence.length ? evidence : ["Execution verified"];
+	task.evidence = [...evidence];
 	task.reason = "Deterministic auto-acceptance verified by machine assertions";
 	task.archivedAt = new Date().toISOString();
 	board.revision++;

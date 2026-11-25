@@ -276,7 +276,8 @@ async function runVerification() {
 			// Task 0: Semantic task (not deterministic)
 			{ id: "W-sem", title: "Manual code review", role: "ayton", requestIds: [q.id], dependsOn: [], readPaths: [], writePaths: [], acceptance: ["human signs off"] },
 			// Task 1: Explicit deterministic task
-			{ id: "W-det", title: "Deterministic unit tests", role: "ayton", requestIds: [q.id], dependsOn: [], readPaths: [], writePaths: [], reviewTier: "deterministic", autoAccept: true, acceptance: ["exit code 0", "tests passed: 15"] },
+			// v1.1.4: report prose (e.g. "tests passed: 15") is no longer machine-verified; only file/artifact/exit criteria are.
+			{ id: "W-det", title: "Deterministic unit tests", role: "ayton", requestIds: [q.id], dependsOn: [], readPaths: [], writePaths: [], reviewTier: "deterministic", autoAccept: true, acceptance: ["exit code 0"] },
 		], "/workspace");
 
 		assert.equal(isDeterministic(tasks[0]), false);

@@ -19,7 +19,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import {
 	newLedger, addRequest, addTasks, addBacklog, updateTask, resolveRequest, terminalWork, liveWork, occupiesSlot,
 	readyTasks, dispatchBatch, markDispatched, observeTask, completionBlockers, ledgerPrompt, moveTask, archivePrompt,
-	taskConflict, parseTeamTaskId, isDeterministic, autoAcceptTask, createReviewerTask, nextDispatchableTasks,
+	taskConflict, parseTeamTaskId, isDeterministic, isReviewExempt, autoAcceptTask, createReviewerTask, nextDispatchableTasks,
 	reviewerTaskId, completeReviewTask, publishTasks, overlap, recordReview, deliveryVersionOf, reviewRecordsOf,
 	reclaimStaleReviews, isActiveReviewHold, scopeBlockingLive, REVIEW_STALE_MS, pruneStaleReviews,
 	setManualDispatchHold, releaseManualDispatchHold,
@@ -67,7 +67,7 @@ const TEAM_EXTENSION_PATH = (() => {
 })();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.1.3";
+export const PI_TEAMS_VERSION = "1.1.4";
 export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
@@ -588,7 +588,7 @@ export function extractEscalation(prompt: string, minChars: number): string | nu
 
 /** 本会话生效的金额上限；0 表示不设金额上限（调用次数与并发仍然有效）。 */
 /** 派活时附在任务后的契约（Agent 之间统一英文）。 */
-export function buildTaskContract(taskId: string, scope?: { role: string; readPaths: string[]; writePaths: string[] }): string {
+export function buildTaskContract(taskId: string, scope?: { role: string; readPaths: string[]; writePaths: string[]; reviewTier?: WorkTask["reviewTier"]; autoAccept?: boolean; reviewerRole?: string }): string {
 	const scopeLine = scope
 		? [`SCOPE: ${taskId} role=${scope.role} readPaths=${JSON.stringify(scope.readPaths)} writePaths=${JSON.stringify(scope.writePaths)}`]
 		: [];
@@ -600,7 +600,11 @@ export function buildTaskContract(taskId: string, scope?: { role: string; readPa
 		"3) evidence (command output or file:line)",
 		"4) test results",
 		"5) unresolved issues and risks",
-		"6) whether a lead decision is needed",
+		"6) whether a lead decision is needed; explicitly state complete/done only when ALL acceptance, integration and cleanup obligations are satisfied (otherwise INCOMPLETE and actionable next steps)",
+		"Role authority: Booker is the senior executor and may make bounded local technical decisions inside the assigned goal/scope; CP retains global architecture, user-scope changes and major arbitration. Bridges/Ayton/Cameron execute assigned tasks and report decisions needed to CP; they have no task authority to change requirements or choose global/local technical direction.",
+		"Review policy: Booker with unset reviewTier defaults to CP-review exemption. Other worker roles default to independent CP review; explicit reviewTier:none waives review for small/granular non-decision read or write tasks. reviewTier:llm, autoAccept:false or explicit reviewerRole requests independent review. Exemption only changes who reviews: an exempt delivery stays reported and the main CP accepts it after checking the evidence. Explicit deterministic + autoAccept:true still requires ALL acceptance criteria to be objective assertions (file:/artifact: existence, exit code 0); test-count prose is not auto-verified. That is the only route that settles without a reviewer or a parent acceptance call. Review tasks and parent/CP orchestration never auto-accept.",
+		...(scope ? [`Delivery review settings: reviewTier=${scope.reviewTier ?? "unset"} autoAccept=${scope.autoAccept ?? "unset"} reviewerRole=${scope.reviewerRole ?? "unset"}.`] : []),
+		"Exemption is not self-review or permission to skip evidence: report a clean terminal result with real file/command evidence. Do not claim completion for failures, aborted/unverified/incomplete output, integration or cleanup that is still pending, or outstanding dependencies. Existing reviewer holds and CP REWORK obligations remain binding.",
 		"Execution requirements:",
 		"- declare dependencies and owned paths/shared resources before touching files; do not write outside your owned paths or against another worker's live writes.",
 		"- for authorized writing tasks in Git, commit only your task-owned paths (never `git add .`); preserve unrelated dirty files in the target. Read-only roles must not edit or commit product code; non-git tasks do not need commits.",
@@ -1385,24 +1389,27 @@ export function buildPolicy(mode: Mode, cfg: TeamConfig): string {
 		`Current workload policy label: ${mode}. Economy and strict are legacy labels; quality, throughput, and autonomous execution always take priority.`,
 		"The main session is the Head Coach (orchestrator parent): stay on the sideline and do NOT play on the court (never code inline, run long test suites, or do deep line-by-line code review yourself). Own user alignment, dependency/write-set DAG, rolling 20-slot dispatch, blocker arbitration, and recording team_goal after CP review verdicts.",
 		"The five specialized child roles are:",
-		"- cp (Chris Paul — Point God): SOLE default independent reviewer (W-rev-*), architectural/technical decision-maker, and code reviewer. Runs strictly read-only (read, grep, find, ls, plus kernel bwrap read-only bash for git diff/log/evidence checks). Multiple cp instances may review independent tasks in parallel. If cp hits real provider/tool unavailability or quota errors, the parent falls back cleanly without stalling the goal.",
+		"- cp (Chris Paul — Point God): SOLE default independent reviewer (W-rev-*), global architecture/user-scope authority and major technical arbiter, and code reviewer. Runs strictly read-only (read, grep, find, ls, plus kernel bwrap read-only bash for git diff/log/evidence checks). Multiple cp instances may review independent tasks in parallel. If cp hits real provider/tool unavailability or quota errors, the parent falls back cleanly without stalling the goal.",
 		"- booker (Devin Booker — Scorer): High-difficulty/high-risk implementation (complex, cross-module, concurrency, protocol, performance) and bounded local technical decisions. Directly eligible with no prerequisite failure count or module-count threshold.",
 		"- bridges (Mikal Bridges — 3&D Workhorse): Default regular implementation, routine bug fixes, batch/mechanical changes, and serial branch integration.",
 		"- ayton (Deandre Ayton — Center / Dirty Work): Dedicated test runner & QA execution — unit/integration/regression tests, LogicQA/UIQA, bug reproduction, raw evidence collection. Never edits product code and does NOT act as default code reviewer.",
 		"- cameron (Cameron Johnson — Docs & Assets): Documentation, test plans/checklists, JSONL matrices, and requirement-code-evidence-doc consistency. Does NOT duplicate ayton's tests and does NOT act as default code reviewer.",
 		"Role-routing hard-line: Route routine code spelunking, branch/unmerged-commit inventory, branch-state scouting, worktree residue checks, log searches, and residual cleanup probes to Bridges by default (declare `declaredReadOnly: true` when investigation needs no writes). CP must not be used as a read-only chore detective; reserve CP only for `W-rev-*` independent final reviews, global architecture decisions, and major technical arbitration. Route tests and reproduction to Ayton, complex/concurrency/protocol/cross-module work to Booker, and docs/checklists/assets to Cameron.",
-		"Reviewer independence: every non-deterministic code/implementation deliverable is reviewed by a fresh cp reviewer (W-rev-*), never self-reviewed by the implementer. Pure deterministic deliverables with verified machine assertions may auto-accept. Do NOT manually register W-rev-* review tasks via team_tasks add: when a writable worker task delivers, the ledger automatically creates W-rev-<id> assigned to cp; simply dispatch that auto-created W-rev-* task (requiring VERDICT + one CRITERION line per AC with file:line or command evidence), and once cp completes, the ledger settles both W-rev-* and the worker automatically.",
+		"Role authority: Booker is the senior executor with bounded local technical decisions within its assigned goal/scope; CP retains global architecture, user-scope changes and major arbitration. Bridges/Ayton/Cameron have execution/reporting authority only, not decision authority; escalate scope or technical direction choices to CP. Review waiver never grants decision authority.",
+		"Reviewer independence and exemptions: Booker with unset reviewTier defaults to CP-review exemption. Bridges/Ayton/Cameron default to CP review; explicit reviewTier:none waives review for small/granular non-decision tasks, whether read-only or writable, without requiring autoAccept:true. reviewTier:llm, autoAccept:false or explicit reviewerRole requests independent review. Exemption routes the delivery to the main CP: the task stays reported and the parent accepts it with ONE team_tasks update after checking the evidence, so no reviewer child is spent on a trivial result. Explicit deterministic + autoAccept:true retains the ALL machine-assertions gate, never a semantic waiver, and is the only automatic route. Review tasks and CP/parent orchestration never auto-accept. Existing current-delivery reviewer obligations and CP REWORK verdicts cannot be bypassed; never cancel old reviewers to apply new defaults.",
+		"For deliveries requiring independent review, use the ledger's automatically created W-rev-<id> assigned to cp, never self-review by the implementer. Do NOT manually register W-rev-* via team_tasks add. Dispatch the auto-created reviewer with VERDICT and one CRITERION per AC with file:line or observed command evidence; the ledger settles reviewer and worker on verified PASS.",
 		"Parent sideline discipline: delegate coding (bridges/booker), testing (ayton), docs (cameron), and code review/deep technical audit (cp). Keep orchestration, DAG bookkeeping, arbitration, and final team_goal recording in the main session.",
 		"Every dispatch brief must include: goal, scope, allowed/forbidden paths, acceptance evidence, and only necessary context (file/symbol/error). Do not transcribe the whole conversation.",
 		"Use team_tasks to maintain the persistent additive request/task ledger before dispatch. A new user request adds scope; it never implicitly cancels older requests, tasks, or acceptance conditions. Resolve each request with evidence (including answered/non-actionable messages); cancellation/supersession needs explicit user authority, reason and source evidence.",
 		"Decompose work into independently verifiable deliverables, not one large role-shaped bundle. Register request IDs, dependencies, concrete read/write scopes and acceptance. Include TEAM_TASK: W-id in each Agent prompt. Parent tasks may cover decisive analysis/acceptance; retain separate integration/regression/cleanup obligations where needed.",
-		"Deterministic Scheduler & Concurrency Utilization: The deterministic Scheduler automatically manages subagent capacity up to 20 concurrency slots. Calling team_tasks or team_dispatch programmatically auto-dispatches all ready independent tasks in parallel and auto-backfills empty slots immediately as subtasks complete. Deterministic deliverables (read-only analysis, unit test runs with exit code 0) are auto-accepted to unlock successors in 0ms without waiting for manual CP review. Do not manually invoke single sequential Agent calls when multiple independent tasks can be registered and dispatched together.",
+		"Deterministic Scheduler & Concurrency Utilization: The deterministic Scheduler automatically manages subagent capacity up to 20 concurrency slots. Calling team_tasks or team_dispatch programmatically auto-dispatches all ready independent tasks in parallel and auto-backfills empty slots immediately as subtasks complete. Explicit deterministic + autoAccept:true deliverables with ALL objective assertions verified (file/artifact existence, exit code 0) auto-accept and unlock successors; declare test counts as `exit code 0` criteria instead, prose counts route to review. Review-exempt deliveries skip the reviewer child but still need one parent acceptance call; batch those acceptances with the next dispatch instead of reviewing trivia.",
 		"Scheduling is rolling, not wave/barrier based: dispatch the full ready independent batch, then work on other ready items; as each child returns, accept/rework its evidence, unlock successors and refill free slots without waiting for unrelated children. Only block on result retrieval when no compatible ready work remains. State a real dependency/resource/permission reason for serial work; do not invent parallel work or force a minimum worker count.",
 		"Prefer Agent resume for rework when the existing worker's role and cwd still fit the task; do not restart only to repeat background. Existing children retain their creation-time role snapshot. If an old child refuses an approved task because its role instructions are obsolete, confirm it has stopped, then start a fresh child with a concise evidence handoff; do not repeatedly resume the obsolete role or duplicate live writes.",
 		"Dispatch every ready independent task in the same response via background Agent calls (run_in_background: true); do not serialize work that has no real dependency. Multiple workers of the same role are allowed; do not start all roles by default.",
 		"Long tasks (expected >5 minutes, real devices, long tests, broad regressions) use run_in_background: true and get_subagent_result; foreground waits can be interrupted and misrecorded as failures.",
 		"Require workers to pass bash timeouts (<=180s), never start foreground daemons/services, never find on /, use ssh ConnectTimeout plus BatchMode, redirect interactive commands from /dev/null, and use nohup plus logs for genuinely long runs.",
 		"On aborted/timeout, verify the child's real state (resume or get_subagent_result) before re-dispatching; do not duplicate implementation.",
+		"Do not poll a working child: repeated check_subsession/get_subagent_result calls on the same session are refused by the harness and waste the turn. Dispatch, do other ready work, and act on the completion notice (or one check at a real join point).",
 		STALE_INTERRUPTED_POLICY,
 		buildParallelWorktreePolicy(),
 		`Cost discipline: ${budget}. Do not repeat analysis that already has sufficient evidence; do not call extra roles just to complete a ceremony.`,
@@ -2229,9 +2236,24 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					if (pinnedDelivery === deliveredVersion) releaseFinishedAttempt(applied.workerTask);
 					writeLease(task);
 					dirty = true;
+				} else if (isReviewExempt(task)) {
+					// Review exemption routes the delivery to the main CP instead of a spawned reviewer.
+					// It never infers "done" from the child's prose: the task stays "reported" until the
+					// parent accepts it with one team_tasks update after checking the report evidence.
+					const awaiting = `Review-exempt delivery awaiting parent acceptance: verify the report evidence, then team_tasks update ${task.id} status="done".`;
+					if (task.reason !== awaiting) { task.reason = awaiting; dirty = true; }
+					// Keep the delivered report on the task so the parent can verify it without re-reading the child.
+					const deliveryEvidence = [resolvedReportText].filter(t => t.trim().length > 0);
+					if (deliveryEvidence.length && JSON.stringify(task.evidence ?? []) !== JSON.stringify(deliveryEvidence)) {
+						task.evidence = deliveryEvidence; dirty = true;
+					}
+					// Never release an execution whose terminal state was not verified by the probe.
+					if (probe.completed && (probe.cleanExit === true || probe.terminalExitProof === true)) releaseFinishedAttempt(task);
 				} else if (isDeterministic(task) && probe.cleanExit === true && resolvedReportText.trim().length > 0) {
-					const reportContent = resolvedReportText;
-					const isAccepted = autoAcceptTask(board(), task.id, [reportContent.slice(0, 200)], { cleanExit: probe.cleanExit === true });
+					const isAccepted = autoAcceptTask(board(), task.id, [resolvedReportText], {
+						cleanExit: true, deliveryVersion: deliveryVersionOf(task),
+						cwd: (ctx as any)?.cwd || process.cwd(),
+					});
 					if (isAccepted) {
 						writeLease(task);
 					} else {
@@ -2704,7 +2726,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				programmaticDispatches.set(task.id, { runId, role, at: Date.now() });
 
 				try {
-					const prompt = `TEAM_TASK: ${task.id}\nGoal: ${task.title}\nRole: ${role}\nRead Paths: ${task.readPaths.join(", ") || "none"}\nWrite Paths: ${task.writePaths.join(", ") || "none"}\nAcceptance Criteria:\n${task.acceptance.map((a: string) => `- ${a}`).join("\n")}\n\n${buildTaskContract(task.id)}`;
+					const prompt = `TEAM_TASK: ${task.id}\nGoal: ${task.title}\nRole: ${role}\nRead Paths: ${task.readPaths.join(", ") || "none"}\nWrite Paths: ${task.writePaths.join(", ") || "none"}\nAcceptance Criteria:\n${task.acceptance.map((a: string) => `- ${a}`).join("\n")}\n\n${buildTaskContract(task.id, task)}`;
 					
 					const rawCallRes = await executeFn("Agent", {
 						subagent_type: role,
@@ -3597,7 +3619,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			}
 			// The child-side write guard reads its scope from the prompt; a manually dispatched
 			// task must carry the ledger's scope or the child is treated as read-only.
-			input.prompt = `${prompt}${reviewBlock}\nRole: ${role}\nRead Paths: ${scoped.readPaths.join(", ") || "none"}\nWrite Paths: ${scoped.writePaths.join(", ") || "none"}\n\n${buildTaskContract(taskId, { role, readPaths: scoped.readPaths, writePaths: scoped.writePaths })}`;
+			input.prompt = `${prompt}${reviewBlock}\nRole: ${role}\nRead Paths: ${scoped.readPaths.join(", ") || "none"}\nWrite Paths: ${scoped.writePaths.join(", ") || "none"}\n\n${buildTaskContract(taskId, { ...scoped, role })}`;
 		} else {
 			input.prompt = `${prompt}\n\n${buildTaskContract(taskId)}`;
 		}
@@ -3927,8 +3949,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					requestIds: { type: "array", items: { type: "string" } }, dependsOn: { type: "array", items: { type: "string" } },
 					readPaths: { type: "array", items: { type: "string" } }, writePaths: { type: "array", items: { type: "string" } },
 					acceptance: { type: "array", items: { type: "string" } },
-					reviewTier: { type: "string", enum: ["deterministic", "llm", "none"] },
-					autoAccept: { type: "boolean" },
+					reviewTier: { type: "string", enum: ["deterministic", "llm", "none"], description: "Unset: Booker defaults review-exempt, other workers default CP review. none: explicit waiver for small non-decision worker read/write tasks. llm: independent CP review. deterministic: existing ALL machine assertions gate with autoAccept:true (the only automatic settlement route). Exemption skips the reviewer child but the parent still accepts the reported delivery. Existing reviewer obligations are preserved." },
+					autoAccept: { type: "boolean", description: "false requests review even for exempt roles; true is required for deterministic machine acceptance, but not for Booker default or reviewTier:none. Never bypasses evidence or existing CP holds." },
+					reviewerRole: { type: "string", description: "Explicit independent reviewer request disables role-based review exemption; defaults do not populate this field. Reviewer must remain independent of implementer." },
 				}, required: ["title", "role", "requestIds", "dependsOn", "readPaths", "writePaths", "acceptance"] } },
 				updates: { type: "array", items: { type: "object", properties: {
 					id: { type: "string" }, status: { type: "string", enum: ["ready", "queued", "done", "blocked", "cancelled", "superseded", "reviewing", "failed"] },

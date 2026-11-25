@@ -167,6 +167,58 @@ try {
   const denied = await h.ledger({ action: "list" }); assert.equal(denied.isError, true);
   await tick(); assert.equal(h.calls.length, 0); await h.emit("session_shutdown");
  });
+ await test("hosted exemption skips the reviewer child and waits for one parent acceptance", async () => {
+  const h = harness(); await h.start();
+  const proof = join(h.ctx.cwd, "role-proof.md"); writeFileSync(proof, "Fixture verification evidence\n");
+  for (const role of ["booker", "bridges", "ayton", "cameron"]) {
+   const id = `W-light-${role}`;
+   const spec: any = h.spec(id, role);
+   if (role !== "booker") spec.reviewTier = "none";
+   await h.ledger({ action: "add", autoDispatch: false, tasks: [spec] });
+   const started = await h.agent({ subagent_type: role, prompt: `TEAM_TASK: ${id}\nPerform the bounded non-decision fixture task` });
+   assert.equal(started.isError, false, JSON.stringify(started));
+   const childId = started.result.details.sessionId, child = h.children.get(childId)!;
+   child.status = "idle";
+   child.text = `Changes: ${"Scoped fixture work verified. ".repeat(15)}\nStatus: complete\nVerification: ${proof}:1; exit code 0\nRemaining issues: none.`;
+   h.append(childId, { role: "assistant", content: [{ type: "text", text: child.text }], stopReason: "stop" });
+   const completed = await h.result(childId); assert.equal(completed.details.status, "completed"); await tick();
+   // Exemption never settles by itself: the delivery stays reported for the parent.
+   assert.equal(h.task(id).status, "reported", `${role}: ${h.task(id).reason}`);
+   assert.match(h.task(id).reason, /awaiting parent acceptance/);
+   assert.ok(h.task(id).evidence.some((e: string) => e.includes(proof)), "full report evidence is retained");
+   assert.ok(!h.state().ledger.tasks.some((t: any) => t.parentTaskId === id), "no reviewer child is spent");
+   // One parent call settles it and releases dependents.
+   const accepted = await h.ledger({ action: "update", autoDispatch: false, updates: [{ id, status: "done", evidence: [`Parent checked ${proof}`], reason: "Parent verified the reported evidence" }] });
+   assert.notEqual(accepted.isError, true, JSON.stringify(accepted));
+   assert.equal(h.task(id).status, "done");
+  }
+  await h.emit("session_shutdown");
+ });
+ await test("hosted deterministic delivery auto-accepts while an explicit review request still routes to CP", async () => {
+  const h = harness(); await h.start();
+  const proof = join(h.ctx.cwd, "det-proof.md"); writeFileSync(proof, "Fixture verification evidence\n");
+  const specs: any[] = [
+   { ...h.spec("W-det", "booker"), reviewTier: "deterministic", autoAccept: true, acceptance: [`file:${proof}`, "exit code 0"] },
+   { ...h.spec("W-review", "booker"), reviewTier: "llm" },
+   { ...h.spec("W-manual-review", "booker"), autoAccept: false }];
+  for (const spec of specs) {
+   await h.ledger({ action: "add", autoDispatch: false, tasks: [spec] });
+   const started = await h.agent({ subagent_type: spec.role, prompt: `TEAM_TASK: ${spec.id}\nScoped fixture task` });
+   assert.equal(started.isError, false, JSON.stringify(started));
+   const childId = started.result.details.sessionId, child = h.children.get(childId)!;
+   child.status = "idle"; child.text = `Status: complete\nVerification: ${proof}:1; exit code 0\nRemaining issues: none.`;
+   h.append(childId, { role: "assistant", content: [{ type: "text", text: child.text }], stopReason: "stop" });
+   await h.result(childId); await tick();
+   if (spec.id === "W-det") {
+    assert.equal(h.task(spec.id).status, "done", "deterministic machine assertions still settle automatically");
+    assert.ok(!h.state().ledger.tasks.some((t: any) => t.parentTaskId === spec.id));
+   } else {
+    assert.notEqual(h.task(spec.id).status, "done");
+    assert.ok(h.state().ledger.tasks.some((t: any) => t.parentTaskId === spec.id && t.role === "cp"), "explicit review is preserved");
+   }
+  }
+  await h.emit("session_shutdown");
+ });
  console.log(`\nTeam host hook tests passed: ${passed}`);
 } finally {
  for (const stop of cleanup) await stop();

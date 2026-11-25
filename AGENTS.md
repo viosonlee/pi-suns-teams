@@ -9,11 +9,11 @@
 
 1. **Master Session Authority (Chris Paul / CP)**:
    - The master conversation ALWAYS acts as **CP (Point God)**.
-   - CP holds supreme architectural decision authority, manages task decomposition, resolves technical conflicts, and performs final acceptance sign-off.
+   - Main CP owns significant/global architecture, user-scope decisions, major technical arbitration, task decomposition, and final goal audit/request closure. Booker may make bounded technical decisions within the assigned task and user scope; this does not transfer main authority.
    - Subagents run as isolated child sessions and CANNOT invoke subagents or spawn recursive children.
 2. **Strict Separation of Concerns**:
-   - Implementation work and review work MUST be split across distinct roles.
-   - Never allow a single Agent to write code and verify its own pull request / diff.
+   - When independent review is required, implementation and review MUST be assigned to different agents; a worker's self-check is not independent review.
+   - Task-level exemptions in §4 avoid unnecessary review, not verification or final main-CP goal audit/request closure.
 
 ---
 
@@ -23,28 +23,32 @@ Every subagent is bound to a pre-configured profile in `~/.pi/agent/agents/<role
 
 ### `cp` (Chris Paul)
 - **Permissions**: `read, bash, grep, find, ls` (**READ-ONLY SANDBOX**).
-- **Hard Constraint**: `cp` **MUST NEVER edit or write workspace files directly**. If code modifications are required, delegate to `bridges` or `booker`.
+- **Hard Constraint**: `cp` **MUST NEVER edit or write workspace files directly**. If modifications are required, request a scoped writing task from main CP for `bridges` or `booker`; children cannot delegate.
 - **Primary Duties**:
-  - Decompose user goals into discrete `Q-*` requests and `W-*` work tasks.
-  - Review diffs via `W-rev-*` tasks.
-  - Formulate audit verdicts (`PASS`, `HOLD`, `CONTINUE`).
+  - Remain read-only; main CP owns decomposition into `Q-*` requests / `W-*` tasks and dispatch.
+  - Review diffs via required `W-rev-*` tasks and advise on significant/global architecture and major arbitration.
+  - Report evidence-backed findings to main CP; the read-only child does not replace the main session's final goal audit/request closure.
 
 ### `booker` (Devin Booker)
 - **Permissions**: `read, bash, edit, write, grep, find, ls` (**FULL WRITE**).
-- **Primary Duties**: High-complexity implementations, cross-module refactoring, tough bug troubleshooting, and bounded local reviews when explicitly assigned.
+- **Primary Duties**: Advanced execution, cross-module refactoring, tough bug troubleshooting, and bounded local reviews when explicitly assigned.
+- **Authority**: Make bounded technical decisions within task/user scope. Escalate significant/global architecture, user-scope changes, and major arbitration to main CP. With `reviewTier` unset, a clean, evidenced default delivery needs no CP worker review unless review is explicitly requested (§4).
 
 ### `bridges` (Mikal Bridges)
 - **Permissions**: `read, bash, edit, write, grep, find, ls` (**FULL WRITE**).
-- **Primary Duties**: Standard feature development, endpoint implementation, routine bug fixes, and unit test additions.
+- **Primary Duties**: Execution-only standard feature development, endpoint implementation, routine bug fixes, and unit test additions.
+- **Authority**: Follow specified choices and existing conventions; no autonomous technical decisions. Escalate genuine tradeoffs or missing choices, not every routine read/write. Small, granular, non-decision tasks may use `reviewTier: "none"` (§4).
 
 ### `ayton` (Deandre Ayton)
 - **Permissions**: `read, bash, grep, find, ls` (**READ-ONLY & TEST RUNNER**).
 - **Hard Constraint**: **`ayton` IS STRICTLY FORBIDDEN FROM EDITING CODE**.
 - **Primary Duties**: Execute build commands, run test runners, probe device APIs, check live visual snapshots. If a test fails, `ayton` reports the failure trace and stops. It must NEVER attempt to fix the bug.
+- **Authority**: Execution-only, with no autonomous technical decisions or code-review authority. Escalate genuine tradeoffs/missing choices; routine specified checks need no microapproval and may use `reviewTier: "none"` when non-decision work.
 
 ### `cameron` (Cameron Johnson)
 - **Permissions**: `read, bash, edit, write, grep, find, ls` (**DOCUMENTATION & ASSETS**).
-- **Primary Duties**: Write documentation, update qualification matrices, manage test fixtures, and record verification receipts.
+- **Primary Duties**: Execution-only documentation, qualification matrices, test fixtures, and verification receipts.
+- **Authority**: No autonomous technical decisions or code-review authority. Escalate genuine tradeoffs/missing choices; routine scoped asset reads/writes need no microapproval and may use `reviewTier: "none"` when non-decision work.
 
 ---
 
@@ -61,13 +65,17 @@ All multi-agent actions are orchestrated through the **Team Ledger** (`team_task
 When registering tasks via `tools.team_tasks({ action: "add", tasks: [...] })`, each task object MUST contain:
 ```typescript
 {
-  title: string;              // Clear, imperative summary of the task
+  id?: string;               // W-* id (generated if omitted)
+  title: string;             // Clear, imperative summary of the task
   role: "cp" | "booker" | "bridges" | "ayton" | "cameron";
   requestIds: string[];       // Parent Q-* ids this task fulfills (must exist and be open)
-  dependsOn?: string[];       // Prerequisite W-* task IDs that must complete first
-  readPaths?: string[];       // Files/folders the worker will read
-  writePaths?: string[];      // Files/folders the worker will modify (empty for read-only roles!)
-  acceptance: string[];       // Concrete, machine-checkable acceptance criteria
+  dependsOn: string[];        // Prerequisite W-* task IDs; [] if none
+  readPaths: string[];        // Files/folders the worker will read
+  writePaths: string[];       // Files/folders the worker will modify; [] for read-only roles
+  acceptance: string[];       // Concrete criteria with verifiable evidence
+  reviewTier?: "deterministic" | "llm" | "none";
+  autoAccept?: boolean;      // false explicitly requests review; see §4
+  reviewerRole?: string;    // explicit reviewer (overrides the cp default); also requests review
 }
 ```
 
@@ -80,8 +88,14 @@ When registering tasks via `tools.team_tasks({ action: "add", tasks: [...] })`, 
 
 ## 4. The Independent Review Protocol (`W-rev-*`)
 
-1. **Mandatory Pairing**:
-   - Every implementation task (`W-k`) that mutates code or files MUST be followed by an independent review task (`W-rev-k`).
+1. **Review Selection (v1.1.4)**:
+   - Booker with `reviewTier` unset is exempt from CP worker review by default for a clean, evidenced delivery; this permits bounded technical decisions, not significant/global architecture or user-scope changes.
+   - Exemption changes routing only. The delivery stays `reported` and main CP accepts it with one `team_tasks update status="done"` after checking the evidence. Only explicit `deterministic` + objective assertions settles automatically; the ledger never infers `done` from report prose. Machine assertions are `file:`/`artifact:` (exists, non-empty) and `exit code 0`; test-count prose such as "15 passed" is NOT auto-verified and therefore routes to review.
+   - `reviewTier: "none"` explicitly waives worker review for small, granular, non-decision tasks, including routine reads/writes by Bridges, Ayton, or Cameron. It does not grant decision authority or additional tools.
+   - `reviewTier: "llm"` or `autoAccept: false` explicitly requests independent review, including for Booker; `autoAccept: false` overrides an otherwise exempt task.
+   - Automatic settlement requires an explicit `reviewTier: "deterministic"` with `autoAccept: true` and every criterion machine-checkable; such a task still needs review when those gates fail. Booker defaults and `none` never obtain automatic settlement at all — they route the delivery to main CP acceptance.
+   - Non-exempt implementation tasks that mutate code/files MUST have independent `W-rev-*` review. Existing reviewer obligations are not automatically canceled or retroactively bypassed by the new defaults/waiver.
+   - Exemptions waive worker review only, not delivery/evidence, integration/cleanup obligations, or main CP's final goal audit/request closure. See README for three full task-spec examples.
 2. **Reviewer Independence**:
    - The worker who executed `W-k` CANNOT be assigned to `W-rev-k`.
    - Preferred reviewers: `cp` (master/sandbox) or `booker`.
@@ -91,7 +105,8 @@ When registering tasks via `tools.team_tasks({ action: "add", tasks: [...] })`, 
    - Checkable evidence: Verify test execution output, exit codes, and assertion logs.
    - Output explicit verdict:
      - `VERDICT: PASS` — Criteria satisfied; unlocks subsequent dependent tasks.
-     - `VERDICT: HOLD` — Gaps found; triggers rework requeue.
+     - `VERDICT: REWORK` — Defects found; report actionable rework.
+     - `VERDICT: ESCALATE` / `VERDICT: INCOMPLETE` — Report missing choices or unverified required evidence, with an owner and next step.
 
 ---
 
@@ -100,11 +115,15 @@ When registering tasks via `tools.team_tasks({ action: "add", tasks: [...] })`, 
 Tasks transition strictly through the following states in the ledger:
 ```text
 [ planned / ready ] ──► [ running ] ──► [ reported ] ──► [ reviewing ] ──► [ done / archived ]
-                              │
+                              │              │
+                              │              └──► [ done / archived ] (main-CP acceptance of an exempt
+                              │                          delivery, or deterministic gates)
                               └──► [ blocked / failed ] ──► [ requeued ]
 ```
-- **`reported` != `done`**: When a subagent finishes its turn, the task is `reported`, NOT `done`.
-- A task reaches `done` ONLY when its paired `W-rev-*` passes review or CP explicitly accepts it.
+- **`reported` != `done`**: A finished child turn produces a report, not proof of completion.
+- A task may reach `done` after required review passes, explicit deterministic machine gates pass, or main CP accepts a reported exempt delivery with evidence. Exempt deliveries are never settled automatically from prose. Pending integration/cleanup, failures, aborts, and unverified results MUST NOT be marked `done`.
+- An incomplete exempt report stays `reported` for completion/rework; the waiver does not create an extra CP review requirement. Existing reviewer obligations still apply.
+- Main CP must still perform the final goal audit and close linked requests only after their tasks and acceptance conditions are verified. Task acceptance/exemption is not user-goal completion.
 
 ---
 
