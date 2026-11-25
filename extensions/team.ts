@@ -1790,7 +1790,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	const hostedCompleted = new Map<string, ChildCompletion>();
 	let hostedHarvestActive = false;
 	const hostedKey = (id: string, runId?: string) => `${id}:${runId ?? ""}`;
-	const hasHostTools = () => typeof pi.getAllTools === "function" && pi.getAllTools().some(t => t.name === "spawn_subsession");
+	const hasHostTools = () => process.env.PI_TEAMS_DISABLE_NATIVE_SPAWN === "1" && typeof pi.getAllTools === "function" && pi.getAllTools().some(t => t.name === "spawn_subsession");
 	function usesHostedTransport(id: string): boolean {
 		const task = board().tasks.find(t => t.sessionId === id);
 		if (task?.executionTransport) return task.executionTransport === "hosted";
@@ -2513,12 +2513,40 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	 * pi-web's own child tools bypass the ledger: a TEAM_TASK started with spawn_subsession stays "ready" and the
 	 * scheduler launches it again, and a pi-web run on a team child's file races the native process writing it.
 	 */
+	/**
+	 * A working team child has no output yet, so repeated status checks return the same thing and the
+	 * harness aborts the turn after identical repeats. Allow one check, then refuse with the next action.
+	 */
+	const pollCounts = new Map<string, number>();
+
 	function ledgerChannelGuard(toolName: string, input: Record<string, unknown> | undefined): { block: true; reason: string } | undefined {
 		const token = typeof input?.__piTeamsHostCall === "string" ? input.__piTeamsHostCall : "";
 		if (token && hostedCallTokens.get(token) === toolName) {
 			hostedCallTokens.delete(token);
 			delete input!.__piTeamsHostCall;
 			return undefined; // One-use parent-issued call, already reserved through Agent.
+		}
+		// Polling guard applies even when native spawning is disabled for tests: it only reads state.
+		const pollTarget = typeof input?.sessionId === "string" ? input.sessionId
+			: typeof input?.agent_id === "string" ? input.agent_id : undefined;
+		if (pollTarget && (toolName === "check_subsession" || toolName === "read_subsession" || toolName === "get_subagent_result") && isTeamChildSession(pollTarget)) {
+			// An explicit wait is a real join, not a poll; it is allowed once the parent has no other work.
+			if (toolName === "get_subagent_result" && input?.wait === true) return undefined;
+			// Working = native child still running, or a ledger attempt that has not delivered yet
+			// (hosted/pi-web children are tracked by the ledger rather than the native registry).
+			const working = isSubagentActive(pollTarget)
+				|| board().tasks.some(t => t.sessionId === pollTarget && (t.status === "running" || t.status === "uncertain"));
+			if (!working) {
+				pollCounts.delete(pollTarget);
+				return undefined;
+			}
+			const seen = pollCounts.get(pollTarget) ?? 0;
+			pollCounts.set(pollTarget, seen + 1);
+			if (seen >= 1) {
+				const live = board().tasks.find(t => t.sessionId === pollTarget && (t.status === "running" || t.status === "uncertain"));
+				return { block: true, reason: `${pollTarget}${live ? ` (${live.id})` : ""} is still working and has returned no output yet. Repeated status polling is refused: the arguments are identical, so the harness aborts the turn after a few attempts. The completion notice wakes this session automatically. Do other ready work or dispatch the next batch now; if nothing else is available, call get_subagent_result ONCE with wait:true instead of polling.` };
+			}
+			return undefined;
 		}
 		if (process.env.PI_TEAMS_DISABLE_NATIVE_SPAWN === "1") return undefined;
 		if (toolName === "spawn_subsession" || toolName === "spawn_session") {
@@ -2553,6 +2581,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		const currentParent = parentSessionId || ctxStore.current?.sessionManager?.getSessionId?.() || "";
 		if (!currentParent || info.parentSessionId !== currentParent) return;
 		const { sessionId } = info;
+		pollCounts.delete(sessionId);
 		let dirty = false;
 		let failureNote = "";
 
@@ -2828,7 +2857,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		daemonTimer = setInterval(async () => {
 			if (!state.enabled || isSubagentSession || isPumpActive || agentToolUnavailable) return;
 			const b = board();
-			const hasWork = b.tasks.some(t => t.status === "ready" || t.status === "running" || t.status === "queued");
+			const hasWork = b.tasks.some(t => t.status === "ready" || t.status === "queued");
 			if (!hasWork) return;
 			try {
 				if (disposed || !ctxStore.current) return;
@@ -3403,7 +3432,6 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		if (!state.enabled || isSubagentSession) return;
 		captureToolLauncher(ctx);
 		ensureSchedulerDaemon(ctx);
-		await refreshHostedNotifications(ctx);
 		refreshNativeNotifications(ctx);
 		const messages = event.messages.filter(message => !("customType" in message && message.customType === "team-work-ledger"));
 		return { messages: [...messages, {

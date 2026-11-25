@@ -219,6 +219,34 @@ try {
   }
   await h.emit("session_shutdown");
  });
+ await test("a working team child is checked once; repeated polls are refused before the harness aborts", async () => {
+  const h = harness(); await h.start();
+  await h.ledger({ action: "add", autoDispatch: false, tasks: [h.spec("W-poll", "bridges")] });
+  const started = await h.agent({ subagent_type: "bridges", prompt: "TEAM_TASK: W-poll\nBounded fixture task" });
+  assert.equal(started.isError, false, JSON.stringify(started));
+  const childId = started.result.details.sessionId;
+  // First check is allowed (the parent may legitimately ask once).
+  const first = await h.ctx.executeTool("check_subsession", { sessionId: childId });
+  assert.equal(first.isError, false, JSON.stringify(first.result));
+  // The child is still working: a second, identical status call is refused with the next action.
+  const second = await h.ctx.executeTool("check_subsession", { sessionId: childId });
+  assert.equal(second.isError, true, "repeated poll must be blocked");
+  const reason = String(second.result?.content?.map((c: any) => c.text ?? "").join(" ") ?? "");
+  assert.match(reason, /still working/);
+  assert.match(reason, /completion notice wakes this session automatically/);
+  assert.match(reason, /get_subagent_result ONCE with wait:true/);
+  // A real join with wait:true stays available.
+  const waited = await h.ctx.executeTool("get_subagent_result", { agent_id: childId, wait: true });
+  assert.equal(waited.isError, false, JSON.stringify(waited.result));
+  // Completion clears the counter so the delivered result can be read afterwards.
+  const child = h.children.get(childId)!;
+  child.status = "idle"; child.text = "Status: complete\nVerification: exit code 0";
+  h.append(childId, { role: "assistant", content: [{ type: "text", text: child.text }], stopReason: "stop" });
+  await h.result(childId); await tick();
+  const after = await h.ctx.executeTool("check_subsession", { sessionId: childId });
+  assert.equal(after.isError, false, "post-completion read is allowed");
+  await h.emit("session_shutdown");
+ });
  console.log(`\nTeam host hook tests passed: ${passed}`);
 } finally {
  for (const stop of cleanup) await stop();

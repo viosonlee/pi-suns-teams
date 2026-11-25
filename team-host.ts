@@ -337,24 +337,12 @@ export async function getHostedSubagentResult(sessionId: string, wait: boolean, 
 	}
 	if (attempt.role !== role) return running(sessionId, "Hosted role does not match the current attempt");
 	if (attempt.terminal) return completionResult(attempt.terminal);
-	const timeout = typeof options.waitTimeoutMs === "number" && Number.isFinite(options.waitTimeoutMs) ? Math.max(0, Math.min(MAX_WAIT_MS, options.waitTimeoutMs)) : MAX_WAIT_MS;
-	const interval = typeof options.pollIntervalMs === "number" && Number.isFinite(options.pollIntervalMs) ? Math.max(1, Math.min(1000, options.pollIntervalMs)) : 250;
-	const deadline = Date.now() + timeout;
-	do {
-		if (signal?.aborted) return running(sessionId); // Cancel the WAIT, not the child.
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		try {
-			const snapshot = wait ? await Promise.race([
-				check(sessionId, options),
-				new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Hosted wait deadline reached; child may still be working")), Math.max(0, deadline - Date.now())); }),
-			]) : await check(sessionId, options);
-			if (state.attempts.get(key) !== attempt) return running(sessionId); // In-flight OLD check after resume.
-			if (attempt.terminal) return completionResult(attempt.terminal);
-			const result = finish(sessionId, attempt, snapshot, options);
-			if (result.status !== "running" || result.isError || !wait || Date.now() >= deadline) return result;
-		} catch (error) { return running(sessionId, errorText(error)); }
-		finally { if (timer !== undefined) clearTimeout(timer); }
-		await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(interval, deadline - Date.now()))));
-	} while (Date.now() < deadline);
-	return running(sessionId);
+	try {
+		const snapshot = await check(sessionId, options);
+		if (state.attempts.get(key) !== attempt) return running(sessionId); // In-flight OLD check after resume.
+		if (attempt.terminal) return completionResult(attempt.terminal);
+		return finish(sessionId, attempt, snapshot, options);
+	} catch (error) {
+		return running(sessionId, errorText(error));
+	}
 }
