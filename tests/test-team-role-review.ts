@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -161,6 +161,23 @@ try {
 		// Hard execution failures still refuse settlement.
 		for (const text of [`Status: complete\nfile:${artifact}\nFATAL ERROR: out of memory`, `Status: complete\nfile:${artifact}\nexit code 2`]) {
 			assert.equal(accept(deterministicSetup(), text), false, text);
+		}
+	});
+
+	test("objective signals fail closed: directories, empty files, and non-zero exits", () => {
+		// A directory satisfies size>0 on Linux but is not a delivered artifact.
+		const dirShaped = join(cwd, "artifact-dir");
+		mkdirSync(dirShaped, { recursive: true });
+		const dirCase = deterministicSetup({ acceptance: [`file:${dirShaped}`] });
+		assert.equal(accept(dirCase), false);
+		assert.equal(dirCase.task.status, "reported");
+		const empty = join(cwd, "empty.txt"); writeFileSync(empty, "");
+		const emptyCase = deterministicSetup({ acceptance: [`artifact:${empty}`] });
+		assert.equal(accept(emptyCase), false);
+		// A real non-zero exit in the evidence is fatal even when no exit criterion is declared.
+		for (const text of [`Status: complete\nfile:${artifact}\nnpm test exited with code 1`, `Status: complete\nfile:${artifact}\nexit status 2`, `Status: complete\nfile:${artifact}\nexit 3`]) {
+			const f = deterministicSetup({ acceptance: [`file:${artifact}`] });
+			assert.equal(accept(f, text), false, text);
 		}
 	});
 

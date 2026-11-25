@@ -982,7 +982,7 @@ export function ledgerPrompt(board: WorkLedger, _slots = Infinity, validatedBatc
 }
 
 /** Only hard execution failures are fatal; free-text pass/fail phrasing is never parsed. */
-const FATAL_SUMMARY_RE = /FATAL ERROR|COMMAND FAILED WITH EXIT CODE [1-9]|UNCAUGHT EXCEPTION|EXIT CODE\s*:?\s*[1-9]/i;
+const FATAL_SUMMARY_RE = /FATAL ERROR|COMMAND FAILED WITH EXIT CODE [1-9]|UNCAUGHT EXCEPTION|exit(?:ed|s)?(?:\s+with)?(?:\s+(?:code|status))?\s*[:=]?\s*[1-9]/i;
 
 export function isMachineAssertion(criterion: string): boolean {
 	if (!criterion || typeof criterion !== "string") return false;
@@ -1066,7 +1066,9 @@ export function autoAcceptTask(
 				? targetFile
 				: resolve(task.worktreePath || options?.cwd || process.cwd(), targetFile);
 			try {
-				if (existsSync(resolvedPath) && statSync(resolvedPath).size > 0) {
+				// A directory reports a non-zero size too, so require a regular non-empty file.
+				const st = statSync(resolvedPath);
+				if (st.isFile() && st.size > 0) {
 					verified = true;
 				}
 			} catch {
