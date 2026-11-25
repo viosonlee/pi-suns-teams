@@ -576,6 +576,14 @@ function isTerminalFailureStatus(value: string): boolean {
 	return TERMINAL_FAILURE_MARKER_STATUSES.has(status);
 }
 
+/** Completed command evidence from the active branch, restricted to the current hosted attempt window. */
+export function completedCommandsForHostedReport(entries: SessionEntryLike[], reportNotBefore?: string): string[] {
+	const active = buildActiveBranch(entries);
+	if (!active.ok) return [];
+	const index = active.branch.findLastIndex(e => e.type === "message" && e.message?.role === "assistant");
+	return index < 0 ? [] : collectObservedCommands(active.branch, index, attemptIdentity({ reportNotBefore }));
+}
+
 function collectObservedCommands(branch: SessionEntryLike[], reportIndex: number, identity: AttemptIdentity): string[] {
 	const completedCallIds = new Set<string>();
 	for (let i = 0; i <= reportIndex; i += 1) {

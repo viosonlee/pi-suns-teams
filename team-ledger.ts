@@ -37,6 +37,19 @@ export interface WorkTask {
 	dependsOn: string[]; readPaths: string[]; writePaths: string[]; acceptance: string[];
 	status: WorkStatus; evidence: string[]; reason?: string; replacementIds?: string[];
 	sessionId?: string; runId?: string; dispatchedAt?: string; archivedAt?: string; queueNote?: string;
+	/** Persisted transport: new pi-web children are host-managed; legacy process children stay native. */
+	executionTransport?: "hosted" | "native";
+	/**
+	 * Per-task manual-dispatch hold. A held task stays in readyTasks() so an explicit Agent launch still
+	 * validates dependencies/scope, but the automatic scheduler (daemon, completion pump, reload) must not
+	 * launch it. Set by team_tasks add/update with autoDispatch:false and by requeue/ready of a task that
+	 * already owns a prior child (preserving the old-child resume intention). Cleared only by an explicit
+	 * dispatch: markDispatched(), team_dispatch, or team_tasks action dispatch/update with autoDispatch:true.
+	 * reason/evidence text never releases the hold.
+	 */
+	manualDispatch?: boolean;
+	manualDispatchReason?: string;
+	manualDispatchAt?: string;
 	reviewTier?: "deterministic" | "llm" | "none"; reviewerRole?: string; parentTaskId?: string; autoAccept?: boolean;
 	isolation?: "worktree" | "none"; declaredReadOnly?: boolean; retryCount?: number; stage?: "draft" | "publish";
 	sharedResources?: string[]; worktreePath?: string;
@@ -338,7 +351,12 @@ export interface TaskSpec {
 	dependsOn: string[]; readPaths: string[]; writePaths: string[]; acceptance: string[];
 }
 /** Validate the whole batch before mutating; IDs support dependencies inside a batch. */
-export function addTasks(board: WorkLedger, values: unknown, cwd: string): WorkTask[] {
+/** Options for addTasks; `manualDispatch` persists a per-task hold instead of pausing the scheduler. */
+export interface AddTasksOptions {
+	manualDispatch?: boolean;
+	manualDispatchReason?: string;
+}
+export function addTasks(board: WorkLedger, values: unknown, cwd: string, options: AddTasksOptions = {}): WorkTask[] {
 	if (!Array.isArray(values) || values.length === 0) throw new Error("tasks must be a nonempty array.");
 	let next = board.nextTask;
 	const created = values.map(raw => {
@@ -363,6 +381,11 @@ export function addTasks(board: WorkLedger, values: unknown, cwd: string): WorkT
 		return { id, title: text(spec.title, "title"), requestIds: strings(spec.requestIds, "requestIds", true), role,
 			dependsOn: strings(spec.dependsOn, "dependsOn"), readPaths, writePaths, acceptance: strings(spec.acceptance, "acceptance", true),
 			status: initialStatus as WorkStatus, evidence: [],
+			...(options.manualDispatch ? {
+				manualDispatch: true,
+				manualDispatchReason: options.manualDispatchReason ?? "Explicit manual dispatch requested (autoDispatch:false).",
+				manualDispatchAt: new Date().toISOString(),
+			} : {}),
 			reviewTier: spec.reviewTier as ("deterministic" | "llm" | "none" | undefined),
 			reviewerRole: typeof spec.reviewerRole === "string" ? spec.reviewerRole : undefined,
 			parentTaskId: typeof spec.parentTaskId === "string" ? spec.parentTaskId : undefined,
@@ -710,10 +733,27 @@ export function readyTasks(board: WorkLedger, now = Date.now()): WorkTask[] {
 export function dispatchBatch(board: WorkLedger, _slots = Infinity, eligible: (task: WorkTask) => boolean = () => true): WorkTask[] {
 	const selected: WorkTask[] = [];
 	for (const task of readyTasks(board)) {
+		// A per-task manual-dispatch hold excludes ONLY this task from automatic selection. Other ready
+		// automatic tasks in the same board keep dispatching; the hold never pauses the scheduler.
+		if (task.manualDispatch) continue;
 		if (task.role === "parent" || !eligible(task)) continue;
 		if (!selected.some(other => taskConflict(task, other))) selected.push(task);
 	}
 	return selected;
+}
+/** Persist a per-task manual-dispatch hold. Never pauses unrelated automatic work. */
+export function setManualDispatchHold(task: WorkTask, reason: string, at = new Date().toISOString()): void {
+	task.manualDispatch = true;
+	task.manualDispatchReason = reason;
+	task.manualDispatchAt = at;
+}
+/** Explicit release to the scheduler. Returns true when a hold was actually cleared. */
+export function releaseManualDispatchHold(task: WorkTask): boolean {
+	const held = task.manualDispatch === true;
+	delete task.manualDispatch;
+	delete task.manualDispatchReason;
+	delete task.manualDispatchAt;
+	return held;
 }
 export function markDispatched(board: WorkLedger, id: string, role: string, runId: string, resume?: string): WorkTask {
 	const task = board.tasks.find(t => t.id === id);
@@ -724,6 +764,9 @@ export function markDispatched(board: WorkLedger, id: string, role: string, runI
 	if (resume && task.sessionId && task.sessionId !== resume) throw new Error(`${id}: resume does not match the task's existing child.`);
 	if (resume && board.tasks.some(other => other.id !== id && liveWork(other.status) && other.sessionId === resume)) throw new Error(`${id}: child is already owned by live work.`);
 	task.status = "running"; task.runId = runId; task.dispatchedAt = new Date().toISOString();
+	// An explicit dispatch consumes the manual hold atomically with the reservation; nothing about the
+	// reservation is left for the daemon to re-launch.
+	releaseManualDispatchHold(task);
 	if (resume) task.sessionId = resume;
 	else delete task.sessionId; // Fresh retry must not retain the previous child's ownership.
 	board.revision++; return task;
@@ -773,6 +816,7 @@ export function updateTask(board: WorkLedger, raw: Record<string, unknown>): voi
 	}
 	const priorStatus = task.status;
 	const priorEvidence = [...(task.evidence ?? [])];
+	const priorSessionId = task.sessionId;
 	task.status = status; task.evidence = evidence; task.reason = reason; task.replacementIds = replacementIds;
 	const nowIso = new Date().toISOString();
 	task.archivedAt = terminalWork(status) ? nowIso : undefined;
@@ -792,6 +836,23 @@ export function updateTask(board: WorkLedger, raw: Record<string, unknown>): voi
 	// no-progress hold requires a NEW requeue instead of one marker authorising every following attempt.
 	if (status === "ready" && priorStatus === "blocked") {
 		task.evidence = [...(task.evidence ?? []), `${PARENT_REQUEUE_PREFIX}${nowIso}${REQUEUE_TOKEN_FIELD}${randomUUID()}`];
+	}
+	// Manual-dispatch hold semantics. A ready/queued task defaults to a hold when it already owns a prior
+	// child, so requeue cannot silently authorize a fresh child; autoDispatch:true is the explicit release.
+	// reason/evidence are bookkeeping and never release or set the hold by themselves.
+	const requestedAutoDispatch = raw.autoDispatch;
+	if (status === "ready" || status === "queued") {
+		if (requestedAutoDispatch === true) {
+			releaseManualDispatchHold(task);
+		} else if (requestedAutoDispatch === false) {
+			setManualDispatchHold(task, `${task.id} requeued with autoDispatch:false; explicit dispatch requested.`, nowIso);
+		} else if (priorSessionId && !isReviewTask(task)) {
+			// Review requeues deliberately discard the prior attempt child (new epoch), so only worker tasks
+			// carry a resumable prior session worth protecting here.
+			setManualDispatchHold(task, `${task.id} requeued while owning prior child ${priorSessionId}; resume intention preserved until explicit autoDispatch:true.`, nowIso);
+		}
+	} else if (terminalWork(status)) {
+		releaseManualDispatchHold(task);
 	}
 	// If a worker task reaches a terminal state, auto-cancel any non-live review tasks still pointing at it
 	// so stale W-rev-* items never linger in ready/failed and block request resolution.

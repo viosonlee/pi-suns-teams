@@ -20,7 +20,7 @@ fi
 
 echo -e "${YELLOW}🗑️  正在移除 pi-teams ...${NC}"
 rm -f "${PI_AGENT_DIR}/extensions/team.ts"
-for f in team-ledger.ts team-recovery.ts team-gc.ts team-review.ts team-review-evidence.ts team-scope.ts team-runner.ts; do
+for f in team-ledger.ts team-recovery.ts team-gc.ts team-review.ts team-review-evidence.ts team-scope.ts team-runner.ts team-host.ts; do
   rm -f "${PI_AGENT_DIR}/${f}"
 done
 for r in cp booker bridges ayton cameron; do

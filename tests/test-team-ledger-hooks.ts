@@ -103,7 +103,11 @@ try {
   await dispatch(h,'W-a');await result(h,'W-a','child-a','running');await dispatch(h,'W-b');await result(h,'W-b','child-b','running');
   assert.notEqual((await dispatch(h,'W-c')).block,true);await result(h,'W-c','child-c','running');
   assert.equal(h.state().ledger.tasks.filter((t:any)=>t.status==='running').length,3);
-  assert.equal((await dispatch(h,'W-a','duplicate')).block,true);
+  // Coordination change: same-task/same-role duplicate without resume is a no-op acknowledgement that
+  // Agent.execute answers with the existing child, not a blocking error. The hook itself mutates nothing.
+  const beforeDuplicate=structuredClone(h.state());
+  assert.notEqual((await dispatch(h,'W-a','duplicate')).block,true);
+  assert.deepEqual(h.state(),beforeDuplicate);
   await h.emit('tool_result',{toolName:'get_subagent_result',input:{agent_id:'child-a'},isError:false,details:{sessionId:'child-a',status:'completed'},content:[{type:'text',text:'final report'}]});
   assert.equal(h.state().ledger.tasks[0].status,'reported');assert.equal(h.state().ledger.tasks[2].status,'running');
  });
@@ -203,7 +207,10 @@ try {
   const live=h.state().ledger.tasks.filter((t:any)=>t.status==='running');assert.equal(live.length,12);assert.equal(new Set(live.map((t:any)=>t.sessionId)).size,12);
   assert.equal(h.state().calls.bridges,1000012);assert.equal(h.state().limitsOff,true);assert.equal(h.state().budgetOverrideUSD,0);
   const reloaded=harness(structuredClone(h.entries()));await reloaded.start();assert.equal(reloaded.state().ledger.tasks.filter((t:any)=>t.status==='running').length,12);
-  assert.equal((await dispatch(reloaded,'W-many-0','duplicate-after-reload')).block,true);assert.doesNotMatch(JSON.stringify(h.entries()),/Infinity/);
+  // Coordination change: a same-task/role duplicate without resume is a success acknowledgement of the
+  // existing child (Agent.execute returns its sessionId), not a blocking error; nothing is re-registered.
+  assert.notEqual((await dispatch(reloaded,'W-many-0','duplicate-after-reload')).block,true);
+  assert.equal(reloaded.state().ledger.tasks.filter((t:any)=>t.status==='running').length,12);assert.doesNotMatch(JSON.stringify(h.entries()),/Infinity/);
   const prompt=await reloaded.emit('context',{messages:[]});assert.match(prompt.messages.at(-1).content,/unlimited \(no child-count cap\)/);
  });
  await test('legacy limits and budget setters cannot re-enable or persist numeric limits',async()=>{

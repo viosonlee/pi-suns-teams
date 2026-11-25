@@ -26,6 +26,7 @@ CORE_FILES=(
   "team-review-evidence.ts"
   "team-scope.ts"
   "team-runner.ts"
+  "team-host.ts"
 )
 ROLES=("cp" "booker" "bridges" "ayton" "cameron")
 SCRIPTS=("update.sh" "uninstall.sh")

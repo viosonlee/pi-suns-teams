@@ -1,7 +1,7 @@
 ---
 description: 'Blue-Collar Center (Pure Test Executor): focused on automated testing, unit/integration/regression tests, LogicQA/UIQA, bug reproduction, and evidence logging (no code-writing permissions; excludes code review)'
 display_name: Deandre Ayton
-tools: read, bash, grep, find, ls, write, edit
+tools: read, bash, grep, find, ls
 load_skills: false
 load_extensions: true
 codemode: 'off'

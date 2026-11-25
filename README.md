@@ -35,12 +35,14 @@
 - **孤儿会话垃圾回收（GC）**：长期运行产生的庞大历史子任务会自动物理归档至 `sessions-archive/`，保证主扫描器轻量秒开。
 - **双模式自由切换**：支持 `standard`（标准模式）、`economy`（经济成本优先）与 `strict`（严格规范模式）。
 - **零数值硬编码**：移除虚假的并发数与调用次数熔断，模型单价实时从 `~/.pi/agent/models.json` 动态读取。
-- **原生子会话运行器（team-runner）**：子 Agent 以独立 `pi --mode json` 进程并行运行，会话写入 `~/.pi/agent/sessions/`，不依赖 pi-web；任务完成后自动唤醒空闲的主会话继续推进。在 pi-web 中，子会话会像 `spawn_subsession` 一样折叠嵌套在主会话下；团队任务只能经 `Agent` 派发（`spawn_subsession`/`send_session_message` 绕过台账会被拦截，避免同一任务被重复执行）。
+- **双运行器**：在 pi-web 中，新的子 Agent 优先通过宿主的受跟踪子会话运行，侧栏实时收到创建与状态通知；在 CLI 中仍使用独立 `pi --mode json` 进程。已有原生进程子会话保持原方式恢复，不在运行中迁移。宿主启动失败不会偷偷改用另一种方式重复派发。团队任务统一通过 `Agent` 派发，避免绕过台账重复执行。
+- **手动与自动派发协调**：`team_tasks add/update` 的 `autoDispatch:false` 为受影响任务持久保留手动派发权，不影响其他自动任务；用 `Agent` 提供完整任务说明/旧子会话 `resume`，或用 `team_dispatch` 显式释放给自动调度器。同一任务、同一角色的重复派发返回已有运行会话，不新增执行。重新排队的已执行任务默认保留手动恢复权，明确 `autoDispatch:true` 才授权后台重新派发。
 - **内置在线检查与自动更新**：支持一键 `/team check-update` 与 `/team update`。
 
 ### 运行要求
 - Node.js >= 22.6（与 pi 一致，测试直接用 node 运行 TypeScript）
-- `pi` CLI 在 `PATH` 中（或设置 `PI_BIN=/path/to/pi`）；子 Agent 通过它启动
+- CLI / 旧原生子会话需要 `pi` 在 `PATH` 中（或设置 `PI_BIN=/path/to/pi`）。pi-web 新子会话使用宿主工具，不依赖另一个 CLI 进程。
+- pi-web 子会话采用宿主的资源加载设置；角色提示、允许工具与任务写入范围仍由 team 强制约束。每角色的 CLI 发现开关（skills/MCP/extensions/context）仅适用于原生进程，不宣称宿主工具支持这些参数。
 - `~/.pi/agent/team.json` 中 `roles.*.model` 需改为**本机已配置**的模型（默认模板里的模型名只是示例）
 
 ---

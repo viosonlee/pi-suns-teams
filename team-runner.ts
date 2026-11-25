@@ -55,6 +55,8 @@ export interface ChildCompletion {
 	signal: NodeJS.Signals | null;
 	error?: string;
 	logFile?: string;
+	/** Authenticated, completed bash calls from the hosted attempt, for evidence audit. */
+	observedCommands?: string[];
 }
 
 export interface NativeRunnerOptions {

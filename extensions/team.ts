@@ -12,7 +12,7 @@
 
 import { existsSync, readFileSync, statSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, isAbsolute, resolve, relative } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -22,6 +22,7 @@ import {
 	taskConflict, parseTeamTaskId, isDeterministic, autoAcceptTask, createReviewerTask, nextDispatchableTasks,
 	reviewerTaskId, completeReviewTask, publishTasks, overlap, recordReview, deliveryVersionOf, reviewRecordsOf,
 	reclaimStaleReviews, isActiveReviewHold, scopeBlockingLive, REVIEW_STALE_MS, pruneStaleReviews,
+	setManualDispatchHold, releaseManualDispatchHold,
 	type WorkTask, type WorkLedger,
 } from "../team-ledger.ts";
 import { parseReviewReport } from "../team-review.ts";
@@ -52,11 +53,13 @@ import {
 	isSubagentActive,
 	stopSubagent,
 	PI_WEB_PARENT_LINK_TYPE,
+	readAgentProfile,
 	type ChildCompletion,
 	type ChildSpawnInfo,
 	type NativeRunnerOptions,
 } from "../team-runner.ts";
 import { fileURLToPath } from "node:url";
+import { launchHostedSubagent, getHostedSubagentResult, isHostedSubagent, type HostedRunnerOptions } from "../team-host.ts";
 
 /** Absolute path of this extension; force-loaded into children whose profile disables extensions. */
 const TEAM_EXTENSION_PATH = (() => {
@@ -64,7 +67,7 @@ const TEAM_EXTENSION_PATH = (() => {
 })();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.1.2";
+export const PI_TEAMS_VERSION = "1.1.3";
 export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
@@ -288,6 +291,7 @@ export interface RunRecord {
 	ms?: number;
 	/** Host status observed before recovery (kept verbatim; never rewritten). */
 	hostStatus?: string;
+	executionTransport?: "native" | "hosted";
 	messageId?: string;
 	sourceFile?: string;
 	sourceLine?: number;
@@ -1728,6 +1732,11 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	const activeCalls = new Map<string, { role: Role; taskId: string; at: number; description: string; reserveUSD: number; sessionId?: string }>();
 	let runs: RunRecord[] = [];
 	const programmaticDispatches = new Map<string, { runId: string; role: Role; at: number }>();
+	// Same-task duplicate Agent launches: the tool_call hook records the existing owner per toolCallId, the
+	// Agent.execute short-circuits on it (success with the existing sessionId, no launch/accounting), and the
+	// tool_result handlers skip cost/observation so a duplicate is never charged or recorded twice.
+	const duplicateAgentCalls = new Map<string, { taskId: string; role: string; sessionId: string }>();
+	const duplicateAgentResults = new Set<string>();
 	let subagentAssignedTask: { id: string; writePaths: string[]; isReadOnly: boolean } | null = null;
 	const ctxStore: { current: ExtensionContext | null } = { current: null };
 	let toolLauncher: ((name: string, args: Record<string, unknown>, options?: any) => Promise<any>) | null = null;
@@ -1767,7 +1776,57 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 	/** 当前进程是否是 pi-web 的子 Agent 会话（用于在子会话里也强制 bash 超时）。 */
 	let isSubagentSession = false;
+	let hostedRole: Role | undefined;
+	let hostedAllowedTools: Set<string> | undefined;
 	let parentSessionId = "";
+	const hostedCallTokens = new Map<string, string>();
+	const hostedCompleted = new Map<string, ChildCompletion>();
+	let hostedHarvestActive = false;
+	const hostedKey = (id: string, runId?: string) => `${id}:${runId ?? ""}`;
+	const hasHostTools = () => typeof pi.getAllTools === "function" && pi.getAllTools().some(t => t.name === "spawn_subsession");
+	function usesHostedTransport(id: string): boolean {
+		const task = board().tasks.find(t => t.sessionId === id);
+		if (task?.executionTransport) return task.executionTransport === "hosted";
+		const run = [...sessionRuns()].reverse().find(r => r.sessionId === id);
+		if (run?.executionTransport) return run.executionTransport === "hosted";
+		return isHostedSubagent(id, { agentDir: dir, parentSessionId });
+	}
+	function hostedOptions(ctx: any): HostedRunnerOptions {
+		return {
+			agentDir: dir, cwd: ctx?.cwd || process.cwd(), parentSessionId,
+			parentSessionFile: ctx?.sessionManager?.getSessionFile?.() || undefined,
+			getModelOverride: r => state.roleModel?.[r as Role] || cfg.roles[r as Role]?.model,
+			getThinkingOverride: r => state.roleThinking?.[r as Role] || cfg.roles[r as Role]?.thinking,
+			executeTool: async (name, args) => {
+				if (!toolLauncher) throw new Error("Host tool executor is not ready; no native fallback was launched.");
+				const token = randomUUID();
+				hostedCallTokens.set(token, name);
+				try { return await toolLauncher(name, { ...args, __piTeamsHostCall: token }); }
+				finally { hostedCallTokens.delete(token); }
+			},
+			onChildComplete: info => {
+				hostedCompleted.set(hostedKey(info.sessionId, info.runId), info);
+				handleNativeChildComplete(info);
+			},
+		};
+	}
+	function refreshHostedRole(ctx: any, prompt?: string): void {
+		if (!isSubagentSession || hostedRole) return;
+		const entries = ctx?.sessionManager?.getEntries?.() ?? [];
+		const texts = entries.filter((e: any) => e.type === "message" && e.message?.role === "user").map((e: any) => typeof e.message.content === "string" ? e.message.content : (e.message.content ?? []).map((p: any) => p.text ?? "").join("\n"));
+		if (prompt) texts.push(prompt);
+		for (const text of texts) {
+			const marker = /^PI_TEAMS_HOST_ROLE:\s*([a-z]+)\s*$/m.exec(text);
+			if (!marker) continue;
+			hostedRole = normalizeRole(marker[1]) ?? undefined;
+			const profile = hostedRole ? readAgentProfile(hostedRole, dir) : null;
+			hostedAllowedTools = new Set((profile?.tools ?? []).filter(t => !((hostedRole === "cp" || hostedRole === "ayton") && ["write", "edit", "file_write", "file_edit"].includes(t))));
+			if (typeof pi.setActiveTools === "function") pi.setActiveTools([...hostedAllowedTools]);
+			if ((hostedRole === "cp" || hostedRole === "ayton") && !subagentAssignedTask) subagentAssignedTask = { id: `${hostedRole}-readonly`, writePaths: [], isReadOnly: true };
+			break;
+		}
+	}
+	pi.on("before_agent_start", (event, ctx) => { refreshHostedRole(ctx, event.prompt); });
 	const recoveredKeys = new Set<string>();
 	const recoveredReceipts = new Map<string, { sessionId: string; messageId: string; hostStatus?: string }>();
 	const pendingRecovered = new Map<string, { report: RecoveredReport; duplicateReceipt: boolean }>();
@@ -2028,6 +2087,18 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		}
 		return `${workId}: missing, not ready, wrong role, unfinished dependency or live scope conflict. Inspect team_tasks; do not duplicate live work.`;
 	}
+	async function refreshHostedNotifications(ctx: any): Promise<void> {
+		if (!toolLauncher || hostedHarvestActive || disposed || isSubagentSession) return;
+		hostedHarvestActive = true;
+		try {
+			const tasks = board().tasks.filter(t => t.executionTransport === "hosted" && t.sessionId && ["running", "reported", "uncertain"].includes(t.status));
+			await Promise.all(tasks.map(async task => {
+				if (disposed) return;
+				await getHostedSubagentResult(task.sessionId!, false, { ...hostedOptions(ctx), role: task.role, taskId: task.id, runId: task.runId, reportNotBefore: task.dispatchedAt });
+			}));
+		} finally { hostedHarvestActive = false; }
+	}
+
 	function refreshNativeNotifications(ctx: ExtensionContext): void {
 		let dirty = false;
 		for (const entry of ctx.sessionManager.getEntries() as Array<{ type?: string; customType?: string; timestamp?: string; details?: Record<string, unknown> }>) {
@@ -2035,6 +2106,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			const details = entry.details;
 			if (!details || typeof details.sessionId !== "string" || normalizeNativeStatus(details.status) !== "completed") continue;
 			const task = leaseOwner(details.sessionId);
+			if (task?.executionTransport === "hosted") continue;
 			if (!task || !entry.timestamp || !task.dispatchedAt || !Number.isFinite(Date.parse(entry.timestamp)) || Date.parse(entry.timestamp) < Date.parse(task.dispatchedAt)) continue;
 			// Notifications are hints: authenticate the child file and require a report from this attempt.
 			const result = recoverChildReport(details.sessionId, { parentSessionId, nativeStatus: "interrupted", assumeStale: true, reportNotBefore: task.dispatchedAt });
@@ -2067,10 +2139,14 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			// A child whose process this runner still owns is settled by handleNativeChildComplete on exit
 			// (quota fallback, exit code, log tail); probing its half-written file here would pre-empt that.
 			if (task.status === "running" && isSubagentActive(task.sessionId!)) continue;
-			const probe = probeLiveChildSession(task.sessionId!, {
-				parentSessionId: currentParentId,
-				runId: task.runId,
-				dispatchedAt: task.dispatchedAt,
+			const hostedDelivery = task.executionTransport === "hosted" ? hostedCompleted.get(hostedKey(task.sessionId!, task.runId)) : undefined;
+			if (task.executionTransport === "hosted" && !hostedDelivery) continue;
+			const probe: ReturnType<typeof probeLiveChildSession> = hostedDelivery ? {
+				sessionId: task.sessionId!, completed: true, failed: !hostedDelivery.success,
+				cleanExit: hostedDelivery.success, terminalExitProof: true, status: hostedDelivery.status,
+				reportText: hostedDelivery.reportText, reason: hostedDelivery.error, observedCommands: hostedDelivery.observedCommands,
+			} : probeLiveChildSession(task.sessionId!, {
+				parentSessionId: currentParentId, runId: task.runId, dispatchedAt: task.dispatchedAt,
 			});
 			// A task the notification loop above already authenticated as "reported" is a finished
 			// attempt even when this direct probe cannot re-authenticate it. Without this the task
@@ -2263,7 +2339,23 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			// reloaded extension instance still receives children launched before the reload.
 		};
 
-		const outcome = await launchNativeSubagent({
+		const resume = typeof params.resume === "string" && params.resume.trim() ? params.resume.trim() : undefined;
+		const hosted = resume ? usesHostedTransport(resume) : hasHostTools();
+		const runId = typeof params.run_id === "string" && params.run_id ? params.run_id : `T-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+		if (!runs.some(r => r.taskId === runId)) {
+			const receipt: RunRecord = { taskId: runId, role, description, status: "running", at: new Date().toISOString(), executionTransport: hosted ? "hosted" : "native" };
+			runs.push(receipt); pi.appendEntry(RUN_TYPE, receipt);
+		}
+		const task = board().tasks.find(t => runId && t.runId === runId);
+		if (task) task.executionTransport = hosted ? "hosted" : "native";
+		const record = [...runs].reverse().find(r => r.taskId === runId);
+		if (record) record.executionTransport = hosted ? "hosted" : "native";
+		const outcome = hosted ? await launchHostedSubagent({
+			subagent_type: role, prompt, description, run_in_background: runInBackground, resume,
+			model: typeof params.model === "string" ? params.model : undefined,
+			thinking: typeof params.thinking === "string" ? params.thinking : undefined,
+			run_id: runId, wait_timeout: typeof params.wait_timeout === "number" ? params.wait_timeout : undefined,
+		}, hostedOptions(ctx), signal) : await launchNativeSubagent({
 			subagent_type: role,
 			prompt,
 			description,
@@ -2274,11 +2366,15 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			run_id: typeof params.run_id === "string" ? params.run_id : undefined,
 		}, runnerOptions, signal);
 
+		if (record && outcome.sessionId) {
+			record.sessionId = outcome.sessionId;
+			pi.appendEntry(RUN_TYPE, { ...record });
+		}
 		if (outcome.isError) {
 			return {
 				content: [{ type: "text" as const, text: `Subagent error: ${outcome.error}` }],
 				isError: true,
-				details: { sessionId: outcome.sessionId, status: outcome.status === "running" ? "running" : outcome.status, error: outcome.error },
+				details: { sessionId: outcome.sessionId, status: "launchUncertain" in outcome && outcome.launchUncertain === true ? "uncertain" : outcome.status, error: outcome.error, executionTransport: hosted ? "hosted" : "native", launchUncertain: "launchUncertain" in outcome && outcome.launchUncertain === true },
 			};
 		}
 
@@ -2289,7 +2385,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					text: `Subagent started in background. Session ID: ${outcome.sessionId}. Its report arrives in this conversation on its own when it completes (an idle team session is woken automatically); you do not need to call get_subagent_result for it. Continue with work that does not need it, or end your turn; ending it, /reload, or switching sessions does not stop the subagent.`,
 				}],
 				details: {
-					kind: "pi-native-subagent",
+					kind: hosted ? "pi-web-subagent" : "pi-native-subagent",
+					executionTransport: hosted ? "hosted" : "native",
 					sessionId: outcome.sessionId,
 					subagentSessionId: outcome.sessionId,
 					profile: role,
@@ -2305,7 +2402,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		return {
 			content: [{ type: "text" as const, text: outcome.reportText || "(Subagent finished with no output)" }],
 			details: {
-				kind: "pi-native-subagent",
+				kind: hosted ? "pi-web-subagent" : "pi-native-subagent",
+				executionTransport: hosted ? "hosted" : "native",
 				sessionId: outcome.sessionId,
 				subagentSessionId: outcome.sessionId,
 				profile: role,
@@ -2329,6 +2427,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			}
 			const role = normalizeRole(args.subagent_type ?? args.role) ?? "bridges";
 			const runIdArg = typeof args.run_id === "string" && args.run_id ? args.run_id : `T-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+			// Keep the native execute path's run_id aligned with the run record we just created; otherwise a
+			// defaulted record id and the actual child run diverge and accounting cannot match.
+			args.run_id = runIdArg;
 			state.calls[role] += 1;
 			state.tasks += 1;
 			const record: RunRecord = { taskId: runIdArg, role, description: typeof args.description === "string" ? args.description : "", status: "running", at: new Date().toISOString() };
@@ -2391,6 +2492,12 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	 * scheduler launches it again, and a pi-web run on a team child's file races the native process writing it.
 	 */
 	function ledgerChannelGuard(toolName: string, input: Record<string, unknown> | undefined): { block: true; reason: string } | undefined {
+		const token = typeof input?.__piTeamsHostCall === "string" ? input.__piTeamsHostCall : "";
+		if (token && hostedCallTokens.get(token) === toolName) {
+			hostedCallTokens.delete(token);
+			delete input!.__piTeamsHostCall;
+			return undefined; // One-use parent-issued call, already reserved through Agent.
+		}
 		if (process.env.PI_TEAMS_DISABLE_NATIVE_SPAWN === "1") return undefined;
 		if (toolName === "spawn_subsession" || toolName === "spawn_session") {
 			const prompt = typeof input?.prompt === "string" ? input.prompt : "";
@@ -2506,10 +2613,12 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 	async function schedulerPump(ctx: any, maxSlots = 20): Promise<{ launched: string[]; errors: string[]; backfillCount: number }> {
 		if (!state.enabled || isSubagentSession) return { launched: [], errors: [], backfillCount: 0 };
+		if (hasHostTools() && !toolLauncher) return { launched: [], errors: [], backfillCount: 0 }; // Wait for real host tool context; never launch an invisible CLI replacement.
 		if (agentToolUnavailable) return { launched: [], errors: ["Agent tool unavailable for programmatic dispatch (model-only host)"], backfillCount: 0 };
 		if (isPumpActive) return { launched: [], errors: ["pump_in_progress"], backfillCount: 0 };
 		isPumpActive = true;
 		try {
+			await refreshHostedNotifications(ctx);
 			refreshNativeNotifications(ctx);
 			const target = cfg.maxConcurrent > 0 ? cfg.maxConcurrent : DEFAULT_TARGET_CONCURRENCY;
 			const currentRunning = runningCount();
@@ -2526,11 +2635,63 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				? ctx.executeTool.bind(ctx)
 				: (toolLauncher ?? nativeAgentLauncher(ctx));
 
+			// Restore the exact pre-reservation identity. A launch failure must never erase a prior child's
+			// resumable sessionId/runId/dispatchedAt (attempt lineage) by rolling the task back to ready.
+			const restoreAttemptIdentity = (task: WorkTask, prev: { status: WorkTask["status"]; runId?: string; sessionId?: string; dispatchedAt?: string; revision: number }) => {
+				for (const key of ["runId", "sessionId", "dispatchedAt"] as const) {
+					const value = prev[key];
+					if (value === undefined) delete (task as any)[key];
+					else (task as any)[key] = value;
+				}
+			};
+			const childSessionOf = (result: any): { sessionId?: string; live: boolean } => {
+				const raw = result?.details?.sessionId ?? result?.details?.subagentSessionId ?? result?.sessionId ?? result?.subagentSessionId;
+				const status = String(result?.details?.status ?? result?.status ?? "");
+				return { sessionId: typeof raw === "string" && raw ? raw : undefined, live: ["running", "queued"].includes(status) };
+			};
+			// A genuine launch failure restores the pre-reservation identity instead of deleting it. When a
+			// prior child exists, the ready task gets a manual hold so a later daemon retry cannot silently
+			// launch a fresh child in place of the resumable one.
+			const rollbackLaunchReservation = (
+				task: WorkTask,
+				prev: { status: WorkTask["status"]; runId?: string; sessionId?: string; dispatchedAt?: string; revision: number },
+				errText: any,
+				label: string,
+			) => {
+				const attempts = ((task as any).dispatchAttempts || 0) + 1;
+				(task as any).dispatchAttempts = attempts;
+				restoreAttemptIdentity(task, prev);
+				if (attempts >= 3) {
+					task.status = "failed";
+					task.evidence = [...(task.evidence ?? []), `${label} after 3 attempts: ${errText}`];
+				} else {
+					task.status = "ready";
+					(task as any).nextRetryAt = Date.now() + 60000;
+					if (prev.sessionId) {
+						setManualDispatchHold(
+							task,
+							`${label}; prior child ${prev.sessionId} preserved — explicit Agent resume or team_dispatch release required.`,
+						);
+					}
+				}
+				mutated = true;
+				console.error(`[PUMP_${label === "Launch failed" ? "LAUNCH_FAILED" : "LAUNCH_EXCEPTION"}]`, task.id, `(attempt ${attempts})`, errText);
+				errors.push(`${task.id}: ${errText}`);
+			};
+
 			for (const task of toLaunch) {
+				// The batch was computed before earlier async launches; a hold set or a reservation claimed in
+				// the meantime must win. markDispatched() still re-validates status/deps/scope atomically.
+				if (task.manualDispatch || programmaticDispatches.has(task.id)) continue;
 				const role = task.role as Role;
 				const runId = `run-${task.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-				const prevStatus = task.status;
-				const prevRevision = board().revision;
+				const prevAttempt = {
+					status: task.status,
+					runId: task.runId,
+					sessionId: task.sessionId,
+					dispatchedAt: task.dispatchedAt,
+					revision: board().revision,
+				};
 
 				// State reservation: mark dispatched in ledger before async call to prevent race condition
 				try {
@@ -2545,18 +2706,36 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				try {
 					const prompt = `TEAM_TASK: ${task.id}\nGoal: ${task.title}\nRole: ${role}\nRead Paths: ${task.readPaths.join(", ") || "none"}\nWrite Paths: ${task.writePaths.join(", ") || "none"}\nAcceptance Criteria:\n${task.acceptance.map((a: string) => `- ${a}`).join("\n")}\n\n${buildTaskContract(task.id)}`;
 					
-					const callRes = await executeFn("Agent", {
+					const rawCallRes = await executeFn("Agent", {
 						subagent_type: role,
 						prompt,
 						run_in_background: true,
 						description: task.title,
 						run_id: runId,
 					}, { signal: new AbortController().signal });
-					if (callRes && !callRes.isError) {
-						const childSessionId = callRes.details?.sessionId ?? callRes.details?.subagentSessionId;
-						if (childSessionId) {
-							task.sessionId = childSessionId;
+					const callRes = rawCallRes?.result && typeof rawCallRes.result === "object" ? { ...rawCallRes.result, isError: rawCallRes.isError === true || rawCallRes.result.isError === true } : rawCallRes;
+					const child = childSessionOf(callRes);
+					if (callRes?.details?.launchUncertain === true) {
+						task.status = "uncertain";
+						if (child.sessionId) task.sessionId = child.sessionId;
+						task.reason = `Host launch outcome is uncertain: ${String(callRes.details.error ?? "missing acknowledgement")}. No automatic retry or native fallback; reconcile before another launch.`;
+						writeLease(task); mutated = true; errors.push(`${task.id}: ${task.reason}`);
+						continue;
+					}
+					// A host can accept a child and STILL return an error carrying sessionId + running/queued.
+					// That is a live execution lease, never a rollback to ready with the child id deleted.
+					const acceptedWithError = callRes?.isError === true && Boolean(child.sessionId) && child.live;
+					if (callRes && (!callRes.isError || acceptedWithError)) {
+						const errText = acceptedWithError ? (callRes?.result?.content?.[0]?.text ?? callRes?.error ?? JSON.stringify(callRes)) : "";
+						if (child.sessionId) {
+							task.sessionId = child.sessionId;
+							task.status = "running";
 							writeLease(task);
+						}
+						if (acceptedWithError) {
+							task.reason = `Host accepted a live child but returned an error (${String(errText).slice(0, 300)}); the running reservation is retained for completion/reconcile.`;
+							task.evidence = [...(task.evidence ?? []), `launch-accepted-with-error:${new Date().toISOString()}:${String(errText).slice(0, 300)}`];
+							errors.push(`${task.id}: accepted with host error: ${String(errText)}`);
 						}
 						launched.push(task.id);
 						mutated = true;
@@ -2565,64 +2744,43 @@ export default function teamExtension(pi: ExtensionAPI): void {
 						if (/Tool\s+Agent\s+not\s+found|model-only/i.test(String(errText))) {
 							// Host blocks programmatic Agent execution (model-only). Roll back cleanly without
 							// marking tasks failed or writing redundant snapshots, and circuit-break the daemon.
-							task.status = prevStatus;
-							delete task.runId;
-							delete task.dispatchedAt;
-							delete task.sessionId;
-							board().revision = prevRevision;
+							task.status = prevAttempt.status;
+							restoreAttemptIdentity(task, prevAttempt);
+							board().revision = prevAttempt.revision;
 							agentToolUnavailable = true;
 							stopSchedulerDaemon();
 							errors.push(`${task.id}: ${errText}`);
 							break;
 						}
-						// Rollback state reservation on launch failure with retry tracking
-						const attempts = ((task as any).dispatchAttempts || 0) + 1;
-						(task as any).dispatchAttempts = attempts;
-						if (attempts >= 3) {
-							task.status = "failed";
-							task.evidence = [...(task.evidence ?? []), `Launch failed after 3 attempts: ${errText}`];
-						} else {
-							task.status = "ready";
-							(task as any).nextRetryAt = Date.now() + 60000;
-						}
-						delete task.runId;
-						delete task.dispatchedAt;
-						delete task.sessionId;
-						mutated = true;
-						console.error("[PUMP_LAUNCH_FAILED]", task.id, `(attempt ${attempts})`, errText);
-						errors.push(`${task.id}: ${errText}`);
+						rollbackLaunchReservation(task, prevAttempt, errText, "Launch failed");
 					}
 				} catch (err) {
 					const errMsg = err instanceof Error ? err.message : String(err);
-					if (/Tool\s+Agent\s+not\s+found|model-only/i.test(errMsg)) {
-						task.status = prevStatus;
-						delete task.runId;
-						delete task.dispatchedAt;
-						delete task.sessionId;
-						board().revision = prevRevision;
+					const thrown = childSessionOf(err);
+					if (thrown.sessionId && thrown.live) {
+						// Same accepted-then-threw case: keep the live lease and let completion/reconcile settle it.
+						task.status = "running";
+						task.sessionId = thrown.sessionId;
+						task.reason = `Host accepted a live child but threw (${errMsg.slice(0, 300)}); the running reservation is retained for completion/reconcile.`;
+						task.evidence = [...(task.evidence ?? []), `launch-accepted-with-error:${new Date().toISOString()}:${errMsg.slice(0, 300)}`];
+						writeLease(task);
+						launched.push(task.id);
+						mutated = true;
+						errors.push(`${task.id}: accepted with host exception: ${errMsg}`);
+					} else if (/Tool\s+Agent\s+not\s+found|model-only/i.test(errMsg)) {
+						task.status = prevAttempt.status;
+						restoreAttemptIdentity(task, prevAttempt);
+						board().revision = prevAttempt.revision;
 						agentToolUnavailable = true;
 						stopSchedulerDaemon();
 						errors.push(`${task.id}: ${errMsg}`);
 						break;
-					}
-					// Rollback state reservation on exception with retry tracking
-					const attempts = ((task as any).dispatchAttempts || 0) + 1;
-					(task as any).dispatchAttempts = attempts;
-					if (attempts >= 3) {
-						task.status = "failed";
-						task.evidence = [...(task.evidence ?? []), `Launch failed after 3 exceptions: ${errMsg}`];
 					} else {
-						task.status = "ready";
-						(task as any).nextRetryAt = Date.now() + 60000;
+						rollbackLaunchReservation(task, prevAttempt, errMsg, "Launch failed");
 					}
-					delete task.runId;
-					delete task.dispatchedAt;
-					delete task.sessionId;
-					mutated = true;
-					console.error("[PUMP_LAUNCH_EXCEPTION]", task.id, `(attempt ${attempts})`, err);
-					errors.push(`${task.id}: ${errMsg}`);
 				} finally {
-					programmaticDispatches.delete(task.id);
+					// Only the reservation owner may clear it, so a newer launch cannot lose its marker.
+					if (programmaticDispatches.get(task.id)?.runId === runId) programmaticDispatches.delete(task.id);
 				}
 			}
 			if (mutated) {
@@ -3053,8 +3211,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			parentSessionId = "";
 		}
 		try {
-			const entries = ctx.sessionManager.getEntries() as Array<{ customType?: string }>;
-			isSubagentSession = entries.some((e) => e?.customType === "pi-web:subagent");
+			const entries = ctx.sessionManager.getEntries() as Array<{ customType?: string; data?: any }>;
+			isSubagentSession = entries.some(e => e?.customType === "pi-web:subagent" || (e?.customType === "pi-web.subsession.spawned" && e.data?.spawnedSessionId === parentSessionId));
+			refreshHostedRole(ctx);
 		} catch {
 			isSubagentSession = false;
 		}
@@ -3222,6 +3381,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		if (!state.enabled || isSubagentSession) return;
 		captureToolLauncher(ctx);
 		ensureSchedulerDaemon(ctx);
+		await refreshHostedNotifications(ctx);
 		refreshNativeNotifications(ctx);
 		const messages = event.messages.filter(message => !("customType" in message && message.customType === "team-work-ledger"));
 		return { messages: [...messages, {
@@ -3236,6 +3396,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		const toolName = String(event.toolName).toLowerCase();
 
 		if (isSubagentSession) {
+			refreshHostedRole(ctx);
+			if (hostedAllowedTools && !hostedAllowedTools.has(toolName)) return { block: true, reason: `Hosted ${hostedRole ?? "unknown"} child may only use its assigned role tools; ${toolName} is not allowed.` };
 			if (!subagentAssignedTask && ctx?.sessionManager) {
 				try {
 					subagentAssignedTask = detectSubagentTaskAssignment(ctx.sessionManager.getEntries() as any[]);
@@ -3328,7 +3490,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		if (toolName !== "agent") return;
 		const input = event.input as Record<string, unknown>;
 		const prompt = typeof input.prompt === "string" ? input.prompt : "";
-		const resumeId = typeof input.resume === "string" ? input.resume : undefined;
+		const resumeId = typeof input.resume === "string" && input.resume.trim() ? input.resume.trim() : undefined;
 		const resumeRole = resumeId ? leaseOwner(resumeId)?.role ?? [...leases.values()].reverse().find(t => t.sessionId === resumeId)?.role ?? [...board().tasks].reverse().find(t => t.sessionId === resumeId)?.role ?? sessionRuns().reverse().find(r => r.sessionId === resumeId)?.role : undefined;
 		if (resumeId && !resumeRole) return { block: true, reason: `Unknown resume child ownership (resume=${resumeId}); only known parent-owned children can resume in an enabled team. Fix: omit "resume" to launch a fresh child, or check valid sessionIds via team_tasks action="list".` };
 		const role = normalizeRole(input.subagent_type ?? resumeRole);
@@ -3354,10 +3516,12 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			? input.description.trim()
 			: prompt.split("\n")[0].slice(0, 80);
 
-		// Programmatic dispatch from schedulerPump: bypass duplicate ready/conflict check and duplicate reservation
-		if (workId && programmaticDispatches.has(workId)) {
+		// Programmatic dispatch from schedulerPump: bypass duplicate ready/conflict check and duplicate reservation.
+		// Ownership is proven by the run_id the pump injected, so a racing model-issued Agent call for the same
+		// task can never be mistaken for (and accounted as) the scheduler's own launch.
+		if (workId && programmaticDispatches.has(workId) && input.run_id === programmaticDispatches.get(workId)!.runId) {
 			const programmatic = programmaticDispatches.get(workId)!;
-			applyRoleModelOverrides(input, role);
+			if (!resumeId || !usesHostedTransport(resumeId)) applyRoleModelOverrides(input, role);
 			if (typeof input.run_id !== "string") input.run_id = programmatic.runId;
 
 			state.calls[role] += 1;
@@ -3369,6 +3533,18 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			pi.appendEntry(RUN_TYPE, record);
 			setStatusText(ctx);
 			return;
+		}
+
+		// Same-task/same-role duplicate without an explicit resume while the original child is already running:
+		// this is a no-op acknowledgement, not a conflict. Record it for Agent.execute so no second child,
+		// call, cost, lease or run-history entry is created, and let the call through (blocking here would
+		// prevent execute from returning the existing sessionId).
+		if (workId && !resumeId) {
+			const running = board().tasks.find(t => t.id === workId);
+			if (running && running.status === "running" && running.role === role && running.sessionId) {
+				duplicateAgentCalls.set(event.toolCallId, { taskId: workId, role, sessionId: running.sessionId });
+				return;
+			}
 		}
 
 		if (!workId && (board().tasks.length > 0 || board().requests.some(r => r.status === "open" && r.source !== "legacy-goal"))) {
@@ -3404,7 +3580,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		const taskId = `T-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 
 		// 额度不足后自动改用备用模型（同一会话粘住，不再回退到已耗尽的模型）；显式传入的 model 优先于角色默认配置
-		applyRoleModelOverrides(input, role);
+		if (!resumeId || !usesHostedTransport(resumeId)) applyRoleModelOverrides(input, role);
 		input.run_id = taskId;
 
 		if (workId) writeLease(markDispatched(board(), workId, role, taskId, resumeId));
@@ -3442,6 +3618,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	// ── 恢复钩子：先于记账运行；只读文件，不重派/不恢复/不改宿主状态 ──
 	pi.on("tool_result", async (event, ctx) => {
 		if (!state.enabled || isSubagentSession) return;
+		// Duplicate Agent acknowledgement: no child/lease/report was produced, so there is nothing to observe.
+		// duplicateAgentCalls is a fallback for a host wrapper that bypassed Agent.execute after the hook marked
+		// the duplicate; such a result must not be observed/accounted against a fresh run either.
+		if (duplicateAgentResults.has(event.toolCallId) || duplicateAgentCalls.has(event.toolCallId)) return;
 		captureToolLauncher(ctx);
 		const toolName = String(event.toolName).toLowerCase();
 		if (toolName !== "agent" && toolName !== "get_subagent_result") return;
@@ -3469,7 +3649,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		const observed = inferNativeStatus(details, event.isError === true, text);
 		const owner = leaseOwner(sessionId);
 		const reusedSession = owner && [...leases.values()].some(other => other.runId !== owner.runId && other.sessionId === sessionId);
-		if (!tracked && reusedSession && normalizeNativeStatus(observed) === "completed") {
+		if (!tracked && reusedSession && !usesHostedTransport(sessionId) && normalizeNativeStatus(observed) === "completed") {
 			const proof = recoverChildReport(sessionId, { parentSessionId: parentSessionId || ctx.sessionManager.getSessionId(), nativeStatus: observed, reportNotBefore: owner.dispatchedAt });
 			if (proof.status !== "native-completed" && proof.status !== "recovered") {
 				return { content: [...(event.content ?? []), { type: "text" as const, text: `[TEAM] Session-level completion has no fresh proof for this resumed attempt (${proof.status}: ${proof.reason}); its live reservation is retained.` }] };
@@ -3565,6 +3745,13 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 	// ── 费用/调用/失败统计（不设额度或失败熔断） ──
 	pi.on("tool_result", async (event, ctx) => {
+		if (duplicateAgentResults.has(event.toolCallId) || duplicateAgentCalls.has(event.toolCallId)) {
+			// Consumed here (last Agent accounting handler): a duplicate must not be charged or recorded,
+			// even when a host wrapper returned a fresh-looking result without Agent.execute consuming the marker.
+			duplicateAgentResults.delete(event.toolCallId);
+			duplicateAgentCalls.delete(event.toolCallId);
+			return;
+		}
 		if (!state.enabled) return;
 		if (String(event.toolName).toLowerCase() !== "agent") return;
 		const tracked = activeCalls.get(event.toolCallId);
@@ -3767,7 +3954,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			try {
 				const candidate = structuredClone(board());
 				let pruneSummary = "";
-				if (params.action === "add") addTasks(candidate, params.tasks, ctx.cwd);
+				if (params.action === "add") addTasks(candidate, params.tasks, ctx.cwd, {
+					manualDispatch: params.autoDispatch === false,
+					manualDispatchReason: params.autoDispatch === false ? "team_tasks add with autoDispatch:false; explicit dispatch requested." : undefined,
+				});
 				else if (params.action === "update") {
 					if (!Array.isArray(params.updates) || !params.updates.length) throw new Error("updates must be nonempty.");
 					for (const update of params.updates) {
@@ -3782,7 +3972,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 							throw new Error(`${target.id}: A still-live child owns this task/scope on another branch. Reconcile that execution before updating.${hold ? ` Conflict: ${hold}` : ""} Note: team_tasks update changes status/reason/evidence only (not readPaths/writePaths).`);
 						}
 						reopenDeliveredAttempt(target, update);
-						updateTask(candidate, update);
+						// autoDispatch travels with the update: false persists the per-task hold, true explicitly
+						// releases it, and omission lets updateTask apply the prior-child default.
+						updateTask(candidate, params.autoDispatch === undefined ? update : { ...update, autoDispatch: params.autoDispatch });
 					}
 				} else if (params.action === "move") {
 					if (!isObject(params.move)) throw new Error("move must be an object.");
@@ -3800,7 +3992,11 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					const modeTag = pr.dryRun ? "[DRY-RUN] " : "";
 					pruneSummary = `\n\n[PRUNE REVIEWS] ${modeTag}pruned=${pr.pruned.length}, migratedToCp=${pr.migratedToCp.length}, keptActive=${pr.keptActive}, keptPendingCp=${pr.keptPendingCp}${pr.pruned.length ? `\nPruned IDs (first 20): ${pr.pruned.slice(0, 20).map(x => `${x.id}(${x.status}/${x.role}->worker:${x.workerStatus})`).join(", ")}${pr.pruned.length > 20 ? ` (+${pr.pruned.length - 20} more)` : ""}` : ""}`;
 				} else if (params.action === "dispatch") {
-					// Direct dispatch triggered
+					// Explicit release: team_tasks dispatch is the parent authorizing the scheduler to take every
+					// pending manual hold. Unrelated automatic tasks were never paused.
+					for (const task of candidate.tasks) {
+						if ((task.status === "ready" || task.status === "queued") && task.manualDispatch) releaseManualDispatchHold(task);
+					}
 				} else if (params.action === "publish") {
 					publishTasks(candidate, Array.isArray(params.taskIds) ? (params.taskIds as string[]) : undefined);
 				} else if (!["list", "archive"].includes(String(params.action))) throw new Error("Unknown ledger action.");
@@ -3861,6 +4057,15 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			if (!state.enabled || isSubagentSession) return { content: [{ type: "text" as const, text: "Only the enabled main CP parent can run team_dispatch." }], isError: true, details: {} };
 			const params = (rawParams && typeof rawParams === "object" ? rawParams : {}) as { maxTasks?: number };
 			const maxTasks = typeof params.maxTasks === "number" && params.maxTasks > 0 ? params.maxTasks : 20;
+			// team_dispatch is an explicit release of every pending per-task manual hold.
+			let released = 0;
+			for (const task of board().tasks) {
+				if ((task.status === "ready" || task.status === "queued") && task.manualDispatch) {
+					releaseManualDispatchHold(task);
+					released++;
+				}
+			}
+			if (released) persist();
 			const pump = await schedulerPump(ctx, maxTasks);
 			return {
 				content: [{ type: "text" as const, text: `[TEAM SCHEDULER] Dispatched: ${pump.launched.join(", ") || "none"}.${pump.errors.length ? ` Errors: ${pump.errors.join("; ")}` : ""}\nActive running: ${runningCount()}/20.\n\n${currentLedgerPrompt()}` }],
@@ -3971,8 +4176,28 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			},
 			required: ["prompt"],
 		} as never,
-		async execute(_toolCallId, rawParams, signal, _onUpdate, ctx) {
+		async execute(toolCallId, rawParams, signal, _onUpdate, ctx) {
 			captureToolLauncher(ctx);
+			const duplicate = duplicateAgentCalls.get(toolCallId);
+			if (duplicate) {
+				// Consumed reservation from the tool_call hook: report success with the EXISTING child instead of
+				// launching, charging, leasing or appending run history a second time.
+				duplicateAgentCalls.delete(toolCallId);
+				duplicateAgentResults.add(toolCallId);
+				return {
+					content: [{ type: "text" as const, text: `Task ${duplicate.taskId} is already running as ${duplicate.role} (sessionId: ${duplicate.sessionId}). No new subagent was launched and no duplicate call/cost/lease was recorded; retrieve or await the existing child instead.` }],
+					details: {
+						kind: "pi-native-subagent",
+						sessionId: duplicate.sessionId,
+						subagentSessionId: duplicate.sessionId,
+						profile: duplicate.role,
+						status: "running",
+						duplicate: true,
+						taskId: duplicate.taskId,
+					},
+					isError: false,
+				};
+			}
 			return executeNativeAgent((rawParams && typeof rawParams === "object" ? rawParams : {}) as Record<string, unknown>, ctx, signal);
 		},
 	});
@@ -3999,11 +4224,17 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				cwd: (ctx as any)?.cwd || process.cwd(),
 				parentSessionId: parentSessionId || ctx?.sessionManager?.getSessionId?.() || "",
 			};
-			const res = await getSubagentResult(sessionId, wait, runnerOptions);
+			const task = board().tasks.find(t => t.sessionId === sessionId);
+		const run = [...sessionRuns()].reverse().find(r => r.sessionId === sessionId);
+		const res = usesHostedTransport(sessionId) ? await getHostedSubagentResult(sessionId, wait, {
+			...hostedOptions(ctx), role: task?.role || run?.role || "bridges", taskId: task?.id, runId: task?.runId || run?.taskId, reportNotBefore: task?.dispatchedAt,
+		}, _signal) : await getSubagentResult(sessionId, wait, runnerOptions);
+		if (task?.executionTransport === "hosted") refreshNativeNotifications(ctx);
 			if (res.status === "running") {
 				return {
 					content: [{ type: "text" as const, text: `Subagent ${sessionId} is still running.` }],
-					details: { sessionId, status: "running" },
+					details: { sessionId, status: "running", ...("error" in res && res.error ? { error: res.error } : {}) },
+					isError: "isError" in res && res.isError === true,
 				};
 			}
 			if (res.status === "completed") {
