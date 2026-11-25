@@ -204,6 +204,28 @@ function diskSnapshot(id: string, options: Pick<HostedRunnerOptions, "agentDir" 
 export function isHostedSubagent(sessionId: string, options: Pick<HostedRunnerOptions, "agentDir" | "parentSessionId" | "parentSessionFile"> = {}): boolean {
 	return diskSnapshot(sessionId, options).kind === "found";
 }
+
+/**
+ * Pure disk check (zero host tool calls): returns true only when the child JSONL file shows a
+ * fresh terminal assistant turn (non-toolUse) for the current attempt, or became structurally invalid.
+ */
+export function hasHostedTerminalSnapshotOnDisk(
+	sessionId: string,
+	options: Pick<HostedRunnerOptions, "agentDir" | "parentSessionId" | "parentSessionFile" | "state"> & { reportNotBefore?: string; runId?: string } = {},
+): boolean {
+	const disk = diskSnapshot(sessionId, options);
+	if (disk.kind === "invalid") return true;
+	if (disk.kind !== "found" || !disk.assistant) return false;
+	const assistant = disk.assistant;
+	const key = keyOf(sessionId, options);
+	const attempt = options.state?.attempts.get(key);
+	const notBefore = attempt?.notBefore ?? (options.reportNotBefore === undefined ? undefined : Date.parse(options.reportNotBefore));
+	const at = typeof assistant.message?.timestamp === "number" ? assistant.message.timestamp : Date.parse(assistant.timestamp ?? "");
+	if (notBefore !== undefined && (!Number.isFinite(at) || at < notBefore)) return false;
+	if (attempt?.resumed && assistant.id === attempt.baselineAssistantId) return false;
+	const stopReason = assistant.message?.stopReason;
+	return stopReason !== "toolUse";
+}
 function assistantText(entry: SessionEntryLike): string {
 	const content = entry.message?.content;
 	if (typeof content === "string") return content;

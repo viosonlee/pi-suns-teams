@@ -59,7 +59,13 @@ import {
 	type NativeRunnerOptions,
 } from "../team-runner.ts";
 import { fileURLToPath } from "node:url";
-import { launchHostedSubagent, getHostedSubagentResult, isHostedSubagent, type HostedRunnerOptions } from "../team-host.ts";
+import {
+	launchHostedSubagent,
+	getHostedSubagentResult,
+	isHostedSubagent,
+	hasHostedTerminalSnapshotOnDisk,
+	type HostedRunnerOptions,
+} from "../team-host.ts";
 
 /** Absolute path of this extension; force-loaded into children whose profile disables extensions. */
 const TEAM_EXTENSION_PATH = (() => {
@@ -67,7 +73,7 @@ const TEAM_EXTENSION_PATH = (() => {
 })();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.1.4";
+export const PI_TEAMS_VERSION = "1.1.5";
 export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
@@ -1788,9 +1794,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	let parentSessionId = "";
 	const hostedCallTokens = new Map<string, string>();
 	const hostedCompleted = new Map<string, ChildCompletion>();
+	const hostedProbedStamps = new Set<string>();
 	let hostedHarvestActive = false;
 	const hostedKey = (id: string, runId?: string) => `${id}:${runId ?? ""}`;
-	const hasHostTools = () => process.env.PI_TEAMS_DISABLE_NATIVE_SPAWN === "1" && typeof pi.getAllTools === "function" && pi.getAllTools().some(t => t.name === "spawn_subsession");
+	const hasHostTools = () => process.env.PI_TEAMS_DISABLE_HOSTED !== "1" && typeof pi.getAllTools === "function" && pi.getAllTools().some(t => t.name === "spawn_subsession");
 	function usesHostedTransport(id: string): boolean {
 		const task = board().tasks.find(t => t.sessionId === id);
 		if (task?.executionTransport) return task.executionTransport === "hosted";
@@ -2099,9 +2106,37 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		hostedHarvestActive = true;
 		try {
 			const tasks = board().tasks.filter(t => t.executionTransport === "hosted" && t.sessionId && ["running", "reported", "uncertain"].includes(t.status));
+			if (tasks.length === 0) return;
+			const entries = (ctx?.sessionManager?.getEntries?.() ?? []) as Array<{ id?: string; type?: string; customType?: string; timestamp?: string; details?: Record<string, unknown> }>;
+			const baseOpts = hostedOptions(ctx);
 			await Promise.all(tasks.map(async task => {
-				if (disposed) return;
-				await getHostedSubagentResult(task.sessionId!, false, { ...hostedOptions(ctx), role: task.role, taskId: task.id, runId: task.runId, reportNotBefore: task.dispatchedAt });
+				if (disposed || !task.sessionId) return;
+				const dispatchedMs = task.dispatchedAt ? Date.parse(task.dispatchedAt) : NaN;
+				const notice = [...entries].reverse().find(e =>
+					e.type === "custom_message" &&
+					e.customType === "subsession.completion" &&
+					e.details?.sessionId === task.sessionId &&
+					(!Number.isFinite(dispatchedMs) || (typeof e.timestamp === "string" && Number.isFinite(Date.parse(e.timestamp)) && Date.parse(e.timestamp) >= dispatchedMs)),
+				);
+				const diskReady = hasHostedTerminalSnapshotOnDisk(task.sessionId, {
+					agentDir: baseOpts.agentDir,
+					parentSessionId: baseOpts.parentSessionId,
+					parentSessionFile: baseOpts.parentSessionFile,
+					reportNotBefore: task.dispatchedAt,
+					runId: task.runId,
+				});
+				if (!notice && !diskReady) return;
+				const stamp = `${task.sessionId}:${task.runId ?? ""}:${notice?.id ?? (diskReady ? "disk" : "")}`;
+				if (hostedProbedStamps.has(stamp)) return;
+				hostedProbedStamps.add(stamp);
+				const res = await getHostedSubagentResult(task.sessionId, false, {
+					...baseOpts,
+					role: task.role,
+					taskId: task.id,
+					runId: task.runId,
+					reportNotBefore: task.dispatchedAt,
+				});
+				if (res.isError && !res.completion && res.error) hostedProbedStamps.delete(stamp);
 			}));
 		} finally { hostedHarvestActive = false; }
 	}
@@ -2468,7 +2503,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	 */
 	function backgroundDispatchCtx(fallbackCtx?: any): any {
 		const base = (ctxStore.current ?? fallbackCtx ?? {}) as any;
-		return { ...base, executeTool: toolLauncher ?? nativeAgentLauncher(base) };
+		const preferHostExecutor = hasHostTools() || process.env.PI_TEAMS_DISABLE_NATIVE_SPAWN === "1";
+		return { ...base, executeTool: preferHostExecutor ? (toolLauncher ?? nativeAgentLauncher(base)) : nativeAgentLauncher(base) };
 	}
 
 	const NOTIFY_REPORT_LIMIT = 8000;
@@ -2518,6 +2554,14 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	 * harness aborts the turn after identical repeats. Allow one check, then refuse with the next action.
 	 */
 	const pollCounts = new Map<string, number>();
+	const waitCounts = new Map<string, number>();
+	function clearChildPollState(sessionId: string): void {
+		pollCounts.delete(sessionId);
+		waitCounts.delete(sessionId);
+		for (const stamp of [...hostedProbedStamps]) {
+			if (stamp.startsWith(`${sessionId}:`)) hostedProbedStamps.delete(stamp);
+		}
+	}
 
 	function ledgerChannelGuard(toolName: string, input: Record<string, unknown> | undefined): { block: true; reason: string } | undefined {
 		const token = typeof input?.__piTeamsHostCall === "string" ? input.__piTeamsHostCall : "";
@@ -2526,25 +2570,62 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			delete input!.__piTeamsHostCall;
 			return undefined; // One-use parent-issued call, already reserved through Agent.
 		}
+		if (toolName === "yield_to_subsessions") {
+			const hasLiveHosted = board().tasks.some(t => t.executionTransport === "hosted" && occupiesSlot(t.status));
+			const hasLiveNative = board().tasks.some(t => t.executionTransport !== "hosted" && t.sessionId && (occupiesSlot(t.status) || isSubagentActive(t.sessionId)));
+			if (!hasLiveHosted && hasLiveNative) {
+				return {
+					block: true,
+					reason: "Native team children are running outside pi-web's subsession tracker, so yield_to_subsessions cannot observe them and would return immediately. Dispatch any remaining ready tasks or end your turn normally without calling yield_to_subsessions; completion notices wake this session automatically.",
+				};
+			}
+		}
 		// Polling guard applies even when native spawning is disabled for tests: it only reads state.
 		const pollTarget = typeof input?.sessionId === "string" ? input.sessionId
 			: typeof input?.agent_id === "string" ? input.agent_id : undefined;
 		if (pollTarget && (toolName === "check_subsession" || toolName === "read_subsession" || toolName === "get_subagent_result") && isTeamChildSession(pollTarget)) {
-			// An explicit wait is a real join, not a poll; it is allowed once the parent has no other work.
-			if (toolName === "get_subagent_result" && input?.wait === true) return undefined;
+			const hostedTarget = usesHostedTransport(pollTarget);
+			if ((toolName === "check_subsession" || toolName === "read_subsession") && !hostedTarget) {
+				return {
+					block: true,
+					reason: `${pollTarget} is a pi-teams native child process, not a pi-web tracked subsession. ${toolName} only inspects spawn_subsession children. Use get_subagent_result(agent_id="${pollTarget}", wait=false) once or wait for its automatic completion notice.`,
+				};
+			}
 			// Working = native child still running, or a ledger attempt that has not delivered yet
 			// (hosted/pi-web children are tracked by the ledger rather than the native registry).
 			const working = isSubagentActive(pollTarget)
 				|| board().tasks.some(t => t.sessionId === pollTarget && (t.status === "running" || t.status === "uncertain"));
 			if (!working) {
-				pollCounts.delete(pollTarget);
+				clearChildPollState(pollTarget);
+				return undefined;
+			}
+			const live = board().tasks.find(t => t.sessionId === pollTarget && (t.status === "running" || t.status === "uncertain"));
+			const ready = schedulableBatch();
+			// An explicit wait is a real join, allowed at most once per running attempt so it cannot hit ACP's 5-call repetition abort.
+			if (toolName === "get_subagent_result" && input?.wait === true) {
+				const waitSeen = waitCounts.get(pollTarget) ?? 0;
+				waitCounts.set(pollTarget, waitSeen + 1);
+				if (waitSeen >= 1) {
+					if (ready.length > 0) {
+						return { block: true, reason: `${pollTarget}${live ? ` (${live.id})` : ""} is still working, and ${ready.length} ready task(s) can run now. Dispatch ready tasks instead of repeating get_subagent_result(wait=true).` };
+					}
+					const nextStep = hostedTarget
+						? "Call yield_to_subsessions (alone and last) or end your turn to wait for automatic completion."
+						: "End your turn normally; the completion notice wakes this session automatically.";
+					return { block: true, reason: `${pollTarget}${live ? ` (${live.id})` : ""} is still working. Repeated get_subagent_result(wait=true) calls are refused to avoid harness loop aborts. ${nextStep}` };
+				}
 				return undefined;
 			}
 			const seen = pollCounts.get(pollTarget) ?? 0;
 			pollCounts.set(pollTarget, seen + 1);
 			if (seen >= 1) {
-				const live = board().tasks.find(t => t.sessionId === pollTarget && (t.status === "running" || t.status === "uncertain"));
-				return { block: true, reason: `${pollTarget}${live ? ` (${live.id})` : ""} is still working and has returned no output yet. Repeated status polling is refused: the arguments are identical, so the harness aborts the turn after a few attempts. The completion notice wakes this session automatically. Do other ready work or dispatch the next batch now; if nothing else is available, call get_subagent_result ONCE with wait:true instead of polling.` };
+				if (ready.length > 0) {
+					return { block: true, reason: `${pollTarget}${live ? ` (${live.id})` : ""} is still working and has returned no output yet. Repeated status polling is refused so the harness does not abort the turn. Do NOT wait or poll now: dispatch the ${ready.length} ready task(s) (${ready.slice(0, 5).map(t => t.id).join(", ")}) first.` };
+				}
+				const joinHint = hostedTarget
+					? "Call get_subagent_result ONCE with wait:true or yield_to_subsessions (alone and last) instead of polling."
+					: "Call get_subagent_result ONCE with wait:true or end your turn instead of polling.";
+				return { block: true, reason: `${pollTarget}${live ? ` (${live.id})` : ""} is still working and has returned no output yet. Repeated status polling is refused: the arguments are identical, so the harness aborts the turn after a few attempts. The completion notice wakes this session automatically. Do other ready work or dispatch the next batch now; if nothing else is available, ${joinHint}` };
 			}
 			return undefined;
 		}
@@ -2581,7 +2662,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		const currentParent = parentSessionId || ctxStore.current?.sessionManager?.getSessionId?.() || "";
 		if (!currentParent || info.parentSessionId !== currentParent) return;
 		const { sessionId } = info;
-		pollCounts.delete(sessionId);
+		clearChildPollState(sessionId);
 		let dirty = false;
 		let failureNote = "";
 
@@ -2856,9 +2937,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		if (ctx) captureToolLauncher(ctx);
 		daemonTimer = setInterval(async () => {
 			if (!state.enabled || isSubagentSession || isPumpActive || agentToolUnavailable) return;
-			const b = board();
-			const hasWork = b.tasks.some(t => t.status === "ready" || t.status === "queued");
-			if (!hasWork) return;
+			if (schedulableBatch().length === 0) return;
 			try {
 				if (disposed || !ctxStore.current) return;
 				await schedulerPump(backgroundDispatchCtx());
@@ -3344,6 +3423,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	pi.on("session_tree", async (_event, ctx) => {
 		captureToolLauncher(ctx);
 		pendingTurnReports.clear();
+		pollCounts.clear();
+		waitCounts.clear();
+		hostedProbedStamps.clear();
 		restoreFromSession(ctx); loadRecoveredKeys(activeEntries(ctx)); loadLeases(ctx);
 		if (state.enabled && !isSubagentSession && !state.ledger) { board(); persist(); }
 		setStatusText(ctx);
@@ -3367,6 +3449,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			else addRequest(ledger, event.prompt, `prompt:Q-${ledger.nextRequest}`);
 			persist();
 		}
+		await refreshHostedNotifications(ctx);
 		refreshNativeNotifications(ctx);
 		const branchEntries = activeEntries(ctx);
 		const deliverable = reconcileSessions(ctx)
@@ -3557,6 +3640,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		// 前台等待上限：避免父会话无限等一个卡住的子会话
 		const injectedWait = input.run_in_background === true ? null : enforceWaitTimeout(input, cfg.agentWaitTimeoutSeconds);
 		if (injectedWait !== null && ctx.hasUI) ctx.ui.notify(`已为本次派活设置等待上限 ${injectedWait}s`, "info");
+		if (resumeId) clearChildPollState(resumeId);
 
 		let workId: string | undefined;
 		try { workId = parseTeamTaskId(prompt); }
@@ -3921,6 +4005,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	// ── 目标循环：自动续跑与停止条件 ──
 	pi.on("agent_before_settle", async (event, ctx) => {
 		if (state.enabled && !isSubagentSession) runChildSessionGc(false, false);
+		if (event && "outcome" in event && (event as { outcome?: unknown }).outcome !== undefined && (event as { outcome?: unknown }).outcome !== "completed") return;
 		if (!state.enabled || !state.goal || state.goal.status !== "active") return;
 		// Wait for arranged child notifications only when there is no other dispatchable work.
 		const busy = runningCount() > 0 && schedulableBatch().length === 0;
@@ -4275,19 +4360,23 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				cwd: (ctx as any)?.cwd || process.cwd(),
 				parentSessionId: parentSessionId || ctx?.sessionManager?.getSessionId?.() || "",
 			};
-			const task = board().tasks.find(t => t.sessionId === sessionId);
+		const task = board().tasks.find(t => t.sessionId === sessionId);
 		const run = [...sessionRuns()].reverse().find(r => r.sessionId === sessionId);
-		const res = usesHostedTransport(sessionId) ? await getHostedSubagentResult(sessionId, wait, {
+		const hosted = usesHostedTransport(sessionId);
+		const res = hosted ? await getHostedSubagentResult(sessionId, wait, {
 			...hostedOptions(ctx), role: task?.role || run?.role || "bridges", taskId: task?.id, runId: task?.runId || run?.taskId, reportNotBefore: task?.dispatchedAt,
 		}, _signal) : await getSubagentResult(sessionId, wait, runnerOptions);
-		if (task?.executionTransport === "hosted") refreshNativeNotifications(ctx);
-			if (res.status === "running") {
-				return {
-					content: [{ type: "text" as const, text: `Subagent ${sessionId} is still running.` }],
-					details: { sessionId, status: "running", ...("error" in res && res.error ? { error: res.error } : {}) },
-					isError: "isError" in res && res.isError === true,
-				};
-			}
+		if (hosted) refreshNativeNotifications(ctx);
+		if (res.status === "running") {
+			const msg = hosted
+				? `Subagent ${sessionId} is still running in pi-web. Do NOT call get_subagent_result again — call yield_to_subsessions (alone and last) or end your turn to wait for its automatic completion notice.`
+				: `Subagent ${sessionId} is still running.`;
+			return {
+				content: [{ type: "text" as const, text: msg }],
+				details: { sessionId, status: "running", ...("error" in res && res.error ? { error: res.error } : {}) },
+				isError: "isError" in res && res.isError === true,
+			};
+		}
 			if (res.status === "completed") {
 				return {
 					content: [{ type: "text" as const, text: res.reportText || "Task completed." }],
@@ -4833,6 +4922,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			}
 
 			if (sub === "reset") {
+				pollCounts.clear();
+				waitCounts.clear();
+				hostedProbedStamps.clear();
 				state.calls = { cp: 0, booker: 0, bridges: 0, ayton: 0, cameron: 0 };
 				state.failures = { cp: 0, booker: 0, bridges: 0, ayton: 0, cameron: 0 };
 				state.spendUSD = 0;

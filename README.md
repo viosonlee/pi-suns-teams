@@ -39,6 +39,13 @@
 - **手动与自动派发协调**：`team_tasks add/update` 的 `autoDispatch:false` 为受影响任务持久保留手动派发权，不影响其他自动任务；用 `Agent` 提供完整任务说明/旧子会话 `resume`，或用 `team_dispatch` 显式释放给自动调度器。同一任务、同一角色的重复派发返回已有运行会话，不新增执行。重新排队的已执行任务默认保留手动恢复权，明确 `autoDispatch:true` 才授权后台重新派发。
 - **内置在线检查与自动更新**：支持一键 `/team check-update` 与 `/team update`。
 
+### v1.1.5：彻底根治 ACP 重复拦截、后台定时器抢占与状态门禁冲突
+
+- **零 `check_subsession` 轮询**：移除 `team-host.ts` 中 `getHostedSubagentResult` 的 250ms 紧轮询死循环，且 `refreshHostedNotifications` 在子任务运行期间仅以零工具开销检查磁盘快照与 `subsession.completion` 通知，仅在子任务真正完成或异常退出时触发一次宿主核验，彻底消除 ACP guardrail 重复调用熔断。
+- **恢复 `pi-web` 实时子会话可见性且不撞车**：在 `pi-web` 中恢复受跟踪子会话派发（实时推送侧栏创建、运行状态灯与 `yield_to_subsessions` 挂起唤醒），并通过设置 `PI_TEAMS_DISABLE_HOSTED=1` 保留随时切回纯原生 CLI 进程模式的开关。
+- **后台调度与原生/托管工具隔离**：`ensureSchedulerDaemon` 仅在存在真正可调度的就绪任务时工作；`pi.on("context")` 不再调用宿主工具；`Native` 后台派发不再复用已结束工具调用的 `ctx.executeTool`。
+- **消除门禁死胡同与异常续跑**：消解 `pollCounts` 与 `get_subagent_result(wait: true)` 的冲突提示，限制同一运行中任务对 `wait: true` 的连续重复调用；在纯 Native 运行时拦截误调 `yield_to_subsessions` / `check_subsession`；`agent_before_settle` 尊重非 `completed`（如 `aborted`）的回合终止边界，不再强行续跑已取消回合。
+
 ### v1.1.4：决策权限、工单复核与完成条件
 
 - **Booker 默认豁免**：`reviewTier` 未设置时不生成 CP 复核工单，交付后任务停在 `reported`，由主 CP 检查证据后一句话验收；Booker 可在任务及用户范围内做有界技术决策。重要/全局架构、用户范围变更、重大仲裁仍归 CP/main。

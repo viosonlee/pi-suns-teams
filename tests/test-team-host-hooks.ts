@@ -235,9 +235,11 @@ try {
   assert.match(reason, /still working/);
   assert.match(reason, /completion notice wakes this session automatically/);
   assert.match(reason, /get_subagent_result ONCE with wait:true/);
-  // A real join with wait:true stays available.
+  // A real join with wait:true stays available once, and a repeat while still working is refused.
   const waited = await h.ctx.executeTool("get_subagent_result", { agent_id: childId, wait: true });
   assert.equal(waited.isError, false, JSON.stringify(waited.result));
+  const waitedAgain = await h.ctx.executeTool("get_subagent_result", { agent_id: childId, wait: true });
+  assert.equal(waitedAgain.isError, true, "repeated wait:true while still working must be blocked");
   // Completion clears the counter so the delivered result can be read afterwards.
   const child = h.children.get(childId)!;
   child.status = "idle"; child.text = "Status: complete\nVerification: exit code 0";
@@ -245,6 +247,31 @@ try {
   await h.result(childId); await tick();
   const after = await h.ctx.executeTool("check_subsession", { sessionId: childId });
   assert.equal(after.isError, false, "post-completion read is allowed");
+  await h.emit("session_shutdown");
+ });
+ await test("working hosted children trigger zero check_subsession polls across context/before_agent_start/ticks until disk completion; aborted boundary stays stopped", async () => {
+  const h = harness(); await h.start();
+  await h.ledger({ action: "add", autoDispatch: false, tasks: [h.spec("W-nopoll", "bridges")] });
+  const started = await h.agent({ subagent_type: "bridges", prompt: "TEAM_TASK: W-nopoll\nBounded fixture task" });
+  assert.equal(started.isError, false, JSON.stringify(started));
+  const childId = started.result.details.sessionId;
+  const checksBefore = h.calls.filter(c => c.name === "check_subsession").length;
+  for (let i = 0; i < 6; i++) {
+   await h.emit("before_agent_start", { systemPrompt: "sys", prompt: "" });
+   await h.emit("context", { messages: [] });
+   await tick();
+  }
+  assert.equal(h.calls.filter(c => c.name === "check_subsession").length, checksBefore, "no check_subsession polling while hosted child is working");
+  const child = h.children.get(childId)!;
+  child.status = "idle"; child.text = "Status: complete\nVerification: exit code 0";
+  h.append(childId, { role: "assistant", content: [{ type: "text", text: child.text }], stopReason: "stop" });
+  await h.emit("before_agent_start", { systemPrompt: "sys", prompt: "" });
+  assert.equal(h.calls.filter(c => c.name === "check_subsession").length, checksBefore + 1, "harvests once when disk completion arrives");
+  assert.ok(["reported", "reviewing", "done"].includes(h.task("W-nopoll").status));
+  // Active goal must NOT force continuation on an aborted boundary.
+  h.state().goal = { objective: "g", acceptance: ["a"], status: "active", rounds: 0, stalls: 0, audits: [], nextTasks: [], createdAt: "2026-01-01", updatedAt: "2026-01-01", lastProgressAt: "2026-01-01" };
+  const abortedBoundary = await h.emit("agent_before_settle", { entries: [], outcome: "aborted" });
+  assert.notEqual(abortedBoundary.continue, true, "aborted turn boundary must not force goal continuation");
   await h.emit("session_shutdown");
  });
  console.log(`\nTeam host hook tests passed: ${passed}`);
