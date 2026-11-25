@@ -68,7 +68,31 @@ export interface NativeRunnerOptions {
 	getThinkingOverride?: (role: string) => string | undefined;
 	/** Per-launch completion callback (in addition to process-wide listeners). */
 	onChildComplete?: (info: ChildCompletion) => void;
+	/**
+	 * Called once the child session file exists (fresh or resumed, before the process starts). The parent
+	 * uses it to append the reciprocal pi-web link entry to its own session through pi.appendEntry.
+	 */
+	onChildSpawned?: (info: ChildSpawnInfo) => void;
 }
+
+export interface ChildSpawnInfo {
+	sessionId: string;
+	sessionFile: string;
+	cwd: string;
+	parentSessionId: string;
+	parentSessionFile?: string;
+	role: string;
+	taskId?: string;
+	resumed: boolean;
+}
+
+/**
+ * pi-web nests a child under its parent (collapsible "agent subsession") only when the child header's
+ * parentSession points at the parent file, the child carries this marker, and the parent carries the
+ * reciprocal PI_WEB_PARENT_LINK_TYPE entry naming the child file (pi-web sessionSummaryScanner).
+ */
+export const PI_WEB_CHILD_LINK_TYPE = "pi-web.subsession.spawned";
+export const PI_WEB_PARENT_LINK_TYPE = "pi-web.subsession.link";
 
 export interface AgentCallParams {
 	subagent_type?: string;
@@ -339,8 +363,36 @@ function createChildSessionFile(
 		data: { version: 1, status: "running", ...(runId ? { runId } : {}) },
 	};
 
-	const lines = [header, meta, statusEntry].map((entry) => JSON.stringify(entry)).join("\n") + "\n";
+	const entries: Array<Record<string, unknown>> = [header, meta, statusEntry];
+	if (parentSessionId && parentSessionFile) {
+		entries.push({
+			type: "custom",
+			id: newEntryId(),
+			parentId: statusEntry.id,
+			timestamp: now,
+			customType: PI_WEB_CHILD_LINK_TYPE,
+			data: { version: 1, spawnedBySessionId: parentSessionId, spawnedSessionId: childSessionId },
+		});
+	}
+	const lines = entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n";
 	fs.writeFileSync(sessionFile, lines, { encoding: "utf-8", mode: 0o600 });
+}
+
+/**
+ * Backfill the pi-web child marker on resumed children created before linking existed. Only when the
+ * child header already names this parent file; otherwise pi-web would reject the link anyway.
+ */
+export function ensureChildLinkMarker(sessionFile: string, childSessionId: string, parentSessionId: string, parentSessionFile: string | undefined): void {
+	if (!parentSessionId || !parentSessionFile) return;
+	try {
+		const raw = fs.readFileSync(sessionFile, "utf-8");
+		const header = JSON.parse(raw.slice(0, raw.indexOf("\n") >= 0 ? raw.indexOf("\n") : raw.length)) as { type?: string; id?: string; parentSession?: string };
+		if (header.type !== "session" || header.id !== childSessionId || header.parentSession !== parentSessionFile) return;
+		if (raw.includes(`"customType":"${PI_WEB_CHILD_LINK_TYPE}"`)) return;
+		appendSessionMarker(sessionFile, PI_WEB_CHILD_LINK_TYPE, { version: 1, spawnedBySessionId: parentSessionId, spawnedSessionId: childSessionId });
+	} catch {
+		// Linking is cosmetic (pi-web sidebar nesting); never fail a launch over it.
+	}
 }
 
 /** Append a custom marker chained to the current leaf so the active branch stays intact. */
@@ -554,6 +606,7 @@ export async function launchNativeSubagent(
 		const resolved = resolveChildSessionFile(childSessionId, sessionsRoot);
 		if (resolved.status === "found" && resolved.file) {
 			sessionFile = resolved.file;
+			ensureChildLinkMarker(sessionFile, childSessionId, parentSessionId, parentSessionFile);
 			appendSessionMarker(sessionFile, "pi-web:subagent-status", { status: "running", ...(runId ? { runId } : {}) });
 		} else {
 			sessionFile = path.join(sessionsDir, `${new Date().toISOString().replace(/:/g, "-")}_${childSessionId}.jsonl`);
@@ -563,6 +616,12 @@ export async function launchNativeSubagent(
 		childSessionId = crypto.randomUUID();
 		sessionFile = path.join(sessionsDir, `${new Date().toISOString().replace(/:/g, "-")}_${childSessionId}.jsonl`);
 		createChildSessionFile(sessionFile, childSessionId, cwd, parentSessionId, parentSessionFile, role, description, prompt, runId);
+	}
+
+	try {
+		options.onChildSpawned?.({ sessionId: childSessionId, sessionFile, cwd, parentSessionId, parentSessionFile, role, taskId, resumed: Boolean(params.resume) });
+	} catch {
+		// cosmetic linking must never break a launch
 	}
 
 	const tmpDir = runnerTmpDir();

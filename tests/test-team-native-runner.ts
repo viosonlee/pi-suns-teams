@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import {
 	appendSessionMarker,
 	buildChildArgs,
+	ensureChildLinkMarker,
 	findPiExecutable,
 	getSessionDirPath,
 	getSubagentResult,
@@ -226,6 +227,34 @@ try {
 		} finally {
 			delete process.env.PI_TEAMS_DISABLE_NATIVE_SPAWN;
 		}
+	});
+
+	await test("resumed pre-link children get the pi-web child marker once, only for their own parent", () => {
+		const parentFile = path.join(tmpRoot, "parent-link.jsonl");
+		const file = path.join(tmpRoot, "old-child.jsonl");
+		const header = { type: "session", version: 3, id: "old-child", timestamp: new Date().toISOString(), cwd: tmpRoot, parentSession: parentFile };
+		fs.writeFileSync(file, `${JSON.stringify(header)}\n${JSON.stringify({ type: "custom", id: "m1", parentId: null, timestamp: header.timestamp, customType: "pi-web:subagent", data: {} })}\n`);
+		const markers = () => fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).filter((e) => e.customType === "pi-web.subsession.spawned");
+		ensureChildLinkMarker(file, "old-child", "other-parent", path.join(tmpRoot, "other.jsonl"));
+		assert.equal(markers().length, 0, "a different parent never links");
+		ensureChildLinkMarker(file, "old-child", "parent-link", parentFile);
+		ensureChildLinkMarker(file, "old-child", "parent-link", parentFile);
+		assert.equal(markers().length, 1);
+		assert.deepEqual(markers()[0].data, { version: 1, spawnedBySessionId: "parent-link", spawnedSessionId: "old-child" });
+		assert.equal(markers()[0].parentId, "m1", "marker chains to the current leaf");
+	});
+
+	await test("fresh children carry the pi-web child marker and report the spawn", async () => {
+		const spawned: any[] = [];
+		const parentFile = path.join(tmpRoot, "parent-session.jsonl");
+		const res = await launchNativeSubagent({ subagent_type: "bridges", prompt: "TEAM_TASK: W-link\nhello", run_in_background: false }, { ...baseOptions, parentSessionFile: parentFile, onChildSpawned: (i) => spawned.push(i) });
+		assert.equal(spawned.length, 1);
+		assert.equal(spawned[0].sessionId, res.sessionId);
+		assert.equal(spawned[0].taskId, "W-link");
+		assert.equal(spawned[0].resumed, false);
+		const lines = fs.readFileSync(spawned[0].sessionFile, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+		assert.equal(lines[0].parentSession, parentFile);
+		assert.ok(lines.some((e) => e.customType === "pi-web.subsession.spawned" && e.data.spawnedSessionId === res.sessionId));
 	});
 
 	console.log(`\nNative runner tests passed: ${passed}`);

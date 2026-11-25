@@ -50,7 +50,10 @@ import {
 	getSubagentResult,
 	onSubagentComplete,
 	isSubagentActive,
+	stopSubagent,
+	PI_WEB_PARENT_LINK_TYPE,
 	type ChildCompletion,
+	type ChildSpawnInfo,
 	type NativeRunnerOptions,
 } from "../team-runner.ts";
 import { fileURLToPath } from "node:url";
@@ -61,7 +64,7 @@ const TEAM_EXTENSION_PATH = (() => {
 })();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.1.1";
+export const PI_TEAMS_VERSION = "1.1.2";
 export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
@@ -2255,6 +2258,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			teamExtensionPath: TEAM_EXTENSION_PATH,
 			getModelOverride: (r) => state.roleModel?.[r as Role] || cfg.roles[r as Role]?.model,
 			getThinkingOverride: (r) => state.roleThinking?.[r as Role] || cfg.roles[r as Role]?.thinking,
+			onChildSpawned: (info) => linkChildInPiWeb(info, ctx),
 			// Completion is delivered through the process-wide listener (handleNativeChildComplete) so a
 			// reloaded extension instance still receives children launched before the reload.
 		};
@@ -2345,6 +2349,74 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	}
 
 	const NOTIFY_REPORT_LIMIT = 8000;
+
+	/**
+	 * Record the reciprocal pi-web link so the native child nests (collapsible) under this session in pi-web,
+	 * exactly like a spawn_subsession child. The child half (pi-web.subsession.spawned) is written by team-runner.
+	 */
+	const linkedChildSessions = new Set<string>();
+	function linkChildInPiWeb(info: ChildSpawnInfo, ctx?: ExtensionContext): void {
+		if (!info.parentSessionId || !info.parentSessionFile || linkedChildSessions.has(info.sessionId)) return;
+		const manager = (ctx ?? ctxStore.current)?.sessionManager;
+		if (manager?.getSessionId?.() && manager.getSessionId() !== info.parentSessionId) return;
+		try {
+			const entries = (manager?.getEntries?.() ?? []) as Array<{ type?: string; customType?: string; data?: { spawnedSessionId?: string } }>;
+			if (entries.some(e => e.type === "custom" && e.customType === PI_WEB_PARENT_LINK_TYPE && e.data?.spawnedSessionId === info.sessionId)) {
+				linkedChildSessions.add(info.sessionId);
+				return;
+			}
+			pi.appendEntry(PI_WEB_PARENT_LINK_TYPE, {
+				version: 1,
+				spawnedBySessionId: info.parentSessionId,
+				spawnedSessionId: info.sessionId,
+				spawnedSessionFile: info.sessionFile,
+				cwd: info.cwd,
+			});
+			linkedChildSessions.add(info.sessionId);
+		} catch {
+			// cosmetic: pi-web sidebar nesting only
+		}
+	}
+
+	/** Sessions launched by this team (live native processes, ledger children, or recorded runs). */
+	function isTeamChildSession(sessionId: string): boolean {
+		return isSubagentActive(sessionId)
+			|| Boolean(leaseOwner(sessionId))
+			|| board().tasks.some(t => t.sessionId === sessionId)
+			|| sessionRuns().some(r => r.sessionId === sessionId);
+	}
+
+	/**
+	 * pi-web's own child tools bypass the ledger: a TEAM_TASK started with spawn_subsession stays "ready" and the
+	 * scheduler launches it again, and a pi-web run on a team child's file races the native process writing it.
+	 */
+	function ledgerChannelGuard(toolName: string, input: Record<string, unknown> | undefined): { block: true; reason: string } | undefined {
+		if (process.env.PI_TEAMS_DISABLE_NATIVE_SPAWN === "1") return undefined;
+		if (toolName === "spawn_subsession" || toolName === "spawn_session") {
+			const prompt = typeof input?.prompt === "string" ? input.prompt : "";
+			const workId = /^[ \t]*TEAM_TASK:[ \t]*(W-[A-Za-z0-9_.-]+)/m.exec(prompt)?.[1];
+			if (!workId) return undefined;
+			const task = board().tasks.find(t => t.id === workId);
+			return { block: true, reason: `${workId}: TEAM_TASK work must be dispatched with the Agent tool, not ${toolName}. ${toolName} bypasses the team ledger, so the task stays ${task?.status ?? "unregistered"} and the scheduler would launch it a second time. Fix: Agent {subagent_type: "${task?.role ?? "<role>"}", prompt: "TEAM_TASK: ${workId}\n..."} (run_in_background defaults to true). Team children appear nested under this session in pi-web and report back automatically.` };
+		}
+		const target = typeof input?.sessionId === "string" ? input.sessionId : "";
+		if (!target || !isTeamChildSession(target)) return undefined;
+		if (toolName === "manage_subsession") {
+			const action = String(input?.action ?? "");
+			if (action === "stop" && isSubagentActive(target)) {
+				const stopped = stopSubagent(target);
+				return { block: true, reason: `${target} is a pi-teams child process, not a pi-web run; ${stopped ? "pi-teams sent it SIGTERM instead (its ledger task settles as aborted when it exits)" : "it already exited"}. Do not retry manage_subsession for team children.` };
+			}
+			if (action === "resume") {
+				return { block: true, reason: `${target} is a pi-teams child; resuming it through pi-web bypasses the ledger${isSubagentActive(target) ? " and would write its session file concurrently with the running process" : ""}. Fix: ${isSubagentActive(target) ? "wait for its completion notice (or get_subagent_result wait=false), then " : ""}use Agent with resume="${target}" and the TEAM_TASK line for rework.` };
+			}
+			return undefined;
+		}
+		if (toolName === "send_session_message") {
+			return { block: true, reason: `${target} is a pi-teams child; messaging it starts a pi-web run outside the ledger${isSubagentActive(target) ? " that would write its session file concurrently with the running process" : ""}. Fix: ${isSubagentActive(target) ? "wait for its completion notice (or get_subagent_result wait=false), then " : ""}use Agent with resume="${target}" and the TEAM_TASK line to give it follow-up instructions.` };
+		}
+		return undefined;
+	}
 
 	/** Process-wide completion listener for natively launched children (see team-runner onSubagentComplete). */
 	function handleNativeChildComplete(info: ChildCompletion): void {
@@ -3228,6 +3300,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 		if (!state.enabled) return;
 		refreshNativeNotifications(ctx);
+		const ledgerGuard = ledgerChannelGuard(toolName, event.input as Record<string, unknown> | undefined);
+		if (ledgerGuard) return ledgerGuard;
 		// Parent role policy: the orchestrator does not implement/test/document inline.
 		if (parentWriteBlocked({ enabled: state.enabled, parentSoloWork: cfg.parentSoloWork, isSubagent: isSubagentSession, toolName })) {
 			const open = board().tasks.filter(t => !terminalWork(t.status) && t.role !== "parent");

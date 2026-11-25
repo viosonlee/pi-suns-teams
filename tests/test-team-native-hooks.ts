@@ -4,10 +4,10 @@
  * crash settlement, and listener detachment on session_shutdown. No model calls.
  */
 import { strict as assert } from "node:assert";
-import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const root = mkdtempSync(join(tmpdir(), "team-native-hooks-"));
@@ -30,6 +30,7 @@ const lines = fs.readFileSync(file, "utf8").split("\\n").filter(Boolean).map(l =
 let leaf = lines.filter(e => e.type !== "session").map(e => e.id).at(-1) ?? null;
 const add = (message) => { const id = Math.random().toString(16).slice(2, 10); fs.appendFileSync(file, JSON.stringify({ type: "message", id, parentId: leaf, timestamp: new Date().toISOString(), message }) + "\\n"); leaf = id; };
 add({ role: "user", content: prompt, timestamp: Date.now() });
+if (prompt.includes("SLEEP-ME")) { await new Promise((r) => setTimeout(r, 30000)); }
 if (prompt.includes("CRASH-ME")) { process.stderr.write("boom: segfault in provider\\n"); process.exit(3); }
 if (prompt.includes("QUOTA-ME") && model !== "fb/model") { add({ role: "assistant", content: [], stopReason: "error", errorMessage: "429 rate limit exceeded: quota exhausted", timestamp: Date.now() }); process.exit(0); }
 add({ role: "assistant", content: [{ type: "text", text: "Implemented. Evidence: exit 0." }], stopReason: "stop", timestamp: Date.now() });
@@ -72,7 +73,7 @@ function harness() {
 	};
 	team(pi);
 	return {
-		ctx, tools, notes, messages,
+		ctx, tools, notes, messages, entries,
 		state: () => [...entries].reverse().find((e) => e.customType === "team-state")?.data,
 		task: (id: string) => [...entries].reverse().find((e) => e.customType === "team-state")?.data.ledger.tasks.find((t: any) => t.id === id),
 		async emit(name: string, event: any = {}) { let e = event; for (const f of hooks.get(name) ?? []) { const p = await f(e, ctx); if (p) e = { ...e, ...p }; } return e; },
@@ -111,6 +112,58 @@ try {
 		assert.match(note.message.content, /Implemented\. Evidence: exit 0\./);
 		await until(() => h.task("W-a")?.status !== "running", "W-a leaves running");
 		assert.ok(["reported", "reviewing", "done"].includes(h.task("W-a").status), `W-a status ${h.task("W-a").status}`);
+	});
+
+	await test("native children are linked so pi-web nests them (collapsible) under the parent", async () => {
+		const sessionId = h.task("W-a").sessionId;
+		const parentFile = join(root, "parent.jsonl");
+		const link = h.entries.find((e: any) => e.customType === "pi-web.subsession.link" && e.data?.spawnedSessionId === sessionId);
+		assert.ok(link, "parent carries the reciprocal pi-web.subsession.link entry");
+		assert.equal(link.data.spawnedBySessionId, "parent");
+		assert.equal(link.data.cwd, work);
+		const childLines = readFileSync(link.data.spawnedSessionFile, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+		assert.equal(childLines[0].parentSession, parentFile, "child header points at the parent file");
+		assert.ok(childLines.some((e) => e.customType === "pi-web.subsession.spawned" && e.data.spawnedBySessionId === "parent" && e.data.spawnedSessionId === sessionId), "child carries pi-web.subsession.spawned");
+		const ids = new Set<string>();
+		for (const e of childLines.slice(1)) { assert.ok(e.parentId === null || ids.has(e.parentId), `broken parentId chain at ${e.id}`); ids.add(e.id); }
+
+		// Classify with pi-web's own scanner when pi-web is installed next to this node (skipped elsewhere).
+		const scannerPath = join(dirname(process.execPath), "..", "lib", "node_modules", "@jmfederico", "pi-web", "dist", "server", "sessions", "sessionSummaryScanner.js");
+		if (existsSync(scannerPath)) {
+			writeFileSync(parentFile, [{ type: "session", version: 3, id: "parent", timestamp: new Date().toISOString(), cwd: work }, ...h.entries.filter((e: any) => e.type === "custom").map((e: any, i: number) => ({ ...e, parentId: null, timestamp: new Date().toISOString(), id: e.id ?? `p${i}` }))].map((e) => JSON.stringify(e)).join("\n") + "\n");
+			const { SessionSummaryScanner } = await import(pathToFileURL(scannerPath).href);
+			const rows = await new SessionSummaryScanner().scanSessionSummariesInDir(dirname(link.data.spawnedSessionFile));
+			const row = rows.find((r: any) => r.id === sessionId);
+			assert.equal(row?.agentSubsession, true, "pi-web classifies the native child as a nested agent subsession");
+			console.log("  (verified with pi-web SessionSummaryScanner)");
+		}
+	});
+
+	await test("pi-web child tools cannot bypass the ledger for team work", async () => {
+		await h.ledger({ action: "add", autoDispatch: false, tasks: [spec(q, "W-s")] });
+		const spawn = await h.emit("tool_call", { toolName: "spawn_subsession", toolCallId: "call-s", input: { prompt: "TEAM_TASK: W-s\nROLE: bridges. Do it." } });
+		assert.equal(spawn.block, true);
+		assert.match(spawn.reason, /must be dispatched with the Agent tool/);
+		assert.equal(h.task("W-s").status, "ready", "blocked spawn leaves the task schedulable by the ledger only");
+		const plain = await h.emit("tool_call", { toolName: "spawn_subsession", toolCallId: "call-p", input: { prompt: "Summarize the README for me." } });
+		assert.notEqual(plain.block, true, "non-team subsessions stay allowed");
+
+		const call = await h.emit("tool_call", { toolName: "Agent", toolCallId: "call-z", input: { subagent_type: "bridges", prompt: "TEAM_TASK: W-s\nSLEEP-ME then finish." } });
+		assert.notEqual(call.block, true, call.reason);
+		const res = await h.tools.get("Agent").execute("call-z", call.input, undefined, undefined, h.ctx);
+		const child = res.details.sessionId;
+		await h.emit("tool_result", { toolName: "Agent", toolCallId: "call-z", input: call.input, isError: false, details: res.details, content: res.content });
+		const msg = await h.emit("tool_call", { toolName: "send_session_message", toolCallId: "call-m", input: { sessionId: child, message: "also do X" } });
+		assert.equal(msg.block, true);
+		assert.match(msg.reason, /concurrently with the running process/);
+		const resume = await h.emit("tool_call", { toolName: "manage_subsession", toolCallId: "call-r", input: { action: "resume", sessionId: child } });
+		assert.equal(resume.block, true);
+		const stop = await h.emit("tool_call", { toolName: "manage_subsession", toolCallId: "call-t", input: { action: "stop", sessionId: child } });
+		assert.equal(stop.block, true);
+		assert.match(stop.reason, /SIGTERM/);
+		await until(() => h.messages.some((m) => m.message.details?.sessionId === child && m.message.details?.status === "aborted"), "stopped child reports aborted");
+		const other = await h.emit("tool_call", { toolName: "send_session_message", toolCallId: "call-o", input: { sessionId: "unrelated-session", message: "hi" } });
+		assert.notEqual(other.block, true, "messages to unrelated sessions stay allowed");
 	});
 
 	await test("quota failure (exit 0 + stopReason=error) switches to the fallback model and requeues the task", async () => {

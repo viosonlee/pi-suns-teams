@@ -35,7 +35,7 @@
 - **孤儿会话垃圾回收（GC）**：长期运行产生的庞大历史子任务会自动物理归档至 `sessions-archive/`，保证主扫描器轻量秒开。
 - **双模式自由切换**：支持 `standard`（标准模式）、`economy`（经济成本优先）与 `strict`（严格规范模式）。
 - **零数值硬编码**：移除虚假的并发数与调用次数熔断，模型单价实时从 `~/.pi/agent/models.json` 动态读取。
-- **原生子会话运行器（team-runner）**：子 Agent 以独立 `pi --mode json` 进程并行运行，会话写入 `~/.pi/agent/sessions/`，不依赖 pi-web；任务完成后自动唤醒空闲的主会话继续推进。
+- **原生子会话运行器（team-runner）**：子 Agent 以独立 `pi --mode json` 进程并行运行，会话写入 `~/.pi/agent/sessions/`，不依赖 pi-web；任务完成后自动唤醒空闲的主会话继续推进。在 pi-web 中，子会话会像 `spawn_subsession` 一样折叠嵌套在主会话下；团队任务只能经 `Agent` 派发（`spawn_subsession`/`send_session_message` 绕过台账会被拦截，避免同一任务被重复执行）。
 - **内置在线检查与自动更新**：支持一键 `/team check-update` 与 `/team update`。
 
 ### 运行要求

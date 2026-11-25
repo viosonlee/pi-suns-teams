@@ -1,6 +1,6 @@
 {
   "name": "pi-teams",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "type": "module",
   "description": "Single-session multi-agent team workflow for pi: task ledger, scheduler, parallel child pi sessions, review gates",
   "main": "extensions/team.ts",
