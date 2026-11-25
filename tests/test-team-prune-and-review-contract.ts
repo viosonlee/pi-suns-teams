@@ -199,4 +199,26 @@ await test("tool_call hook auto-injects canonical AC1..ACn contract into minimal
 	assert.ok(input.prompt.includes("VERDICT: PASS | REWORK | ESCALATE | INCOMPLETE"));
 });
 
+await test("buildReviewContract injects worker delivered evidence excerpt when recorded", () => {
+	const board = newLedger();
+	const req = addRequest(board, "analyze module", "test");
+	addTasks(board, [{
+		id: "W-ro",
+		title: "Analyze root cause",
+		requestIds: [req.id],
+		role: "bridges",
+		dependsOn: [],
+		readPaths: ["src/a.ts"],
+		writePaths: [],
+		acceptance: ["Identify root cause with file:line"],
+	}], "/tmp/demo");
+	const worker = board.tasks[0];
+	worker.status = "reported";
+	worker.evidence = ["Delivered analysis: src/a.ts:42 leaks timer handles"];
+	const rev = createReviewerTask(board, worker);
+	const contract = buildReviewContract(rev, worker);
+	assert.ok(contract.includes("Worker delivered report / recorded evidence"));
+	assert.ok(contract.includes("Delivered analysis: src/a.ts:42 leaks timer handles"));
+});
+
 console.log(`\nAll ${passed} prune-reviews & auto-review-contract tests passed!`);

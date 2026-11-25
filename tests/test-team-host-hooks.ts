@@ -274,6 +274,25 @@ try {
   assert.notEqual(abortedBoundary.continue, true, "aborted turn boundary must not force goal continuation");
   await h.emit("session_shutdown");
  });
+ await test("get_subagent_result suppresses duplicate follow-up notification and persists worker evidence for review", async () => {
+  const h = harness(); await h.start();
+  await h.ledger({ action: "add", autoDispatch: false, tasks: [h.spec("W-sync", "bridges")] });
+  const started = await h.agent({ subagent_type: "bridges", prompt: "TEAM_TASK: W-sync\nBounded read-only deliverable" });
+  assert.equal(started.isError, false, JSON.stringify(started));
+  const childId = started.result.details.sessionId;
+  const child = h.children.get(childId)!;
+  const beforeNotices = h.messages.filter(m => m.customType === "pi-web:subagent-notification").length;
+  child.status = "idle";
+  child.text = "Changes: Analyzed module telemetry.\nStatus: complete\nVerification: src/telemetry.ts:18 verified";
+  h.append(childId, { role: "assistant", content: [{ type: "text", text: child.text }], stopReason: "stop" });
+  const res = await h.result(childId);
+  assert.equal(res.details.status, "completed");
+  await tick();
+  const afterNotices = h.messages.filter(m => m.customType === "pi-web:subagent-notification").length;
+  assert.equal(afterNotices, beforeNotices, "synchronous get_subagent_result must not emit delayed duplicate pi-web:subagent-notification");
+  assert.ok(h.task("W-sync").evidence.some((e: string) => e.includes("Analyzed module telemetry")), "delivered report is retained on task.evidence for reviewer");
+  await h.emit("session_shutdown");
+ });
  console.log(`\nTeam host hook tests passed: ${passed}`);
 } finally {
  for (const stop of cleanup) await stop();

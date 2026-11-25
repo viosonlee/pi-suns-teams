@@ -39,6 +39,12 @@
 - **手动与自动派发协调**：`team_tasks add/update` 的 `autoDispatch:false` 为受影响任务持久保留手动派发权，不影响其他自动任务；用 `Agent` 提供完整任务说明/旧子会话 `resume`，或用 `team_dispatch` 显式释放给自动调度器。同一任务、同一角色的重复派发返回已有运行会话，不新增执行。重新排队的已执行任务默认保留手动恢复权，明确 `autoDispatch:true` 才授权后台重新派发。
 - **内置在线检查与自动更新**：支持一键 `/team check-update` 与 `/team update`。
 
+### v1.1.6：强化纯调度编排边界、消除延迟重复唤醒与补全只读交付评审上下文
+
+- **默认严格总控模式 (`parentSoloWork: "delegated"`)**：将默认配置模板中的 `parentSoloWork` 设为 `"delegated"`，并强化主会话总控纪律：专注意图分析、需求拆解、任务台账编排、派发与验收，不亲自下场排查代码库、跑测试或替子会话抢活。
+- **消除 `get_subagent_result` 同步取回后的重复唤醒与过期通知**：通过 `syncConsumedCompletions` 与 `sentCompletionNotices` 去重，避免同步调用 `get_subagent_result` 取回结果后又延迟弹出 `pi-web:subagent-notification` 二次唤醒；并对 `runId` 已更新或任务已处于 `done` / `cancelled` / `superseded` 终态的过期子会话完成事件抑制错误状态回写与延迟唤醒。
+- **为 `W-rev-*` 复核注入工人交付报告摘要**：`refreshNativeNotifications` 在创建 reviewer 工单前自动持久化工人汇报文本到 `task.evidence`，并在 `buildReviewContract` 中向 `cp` 注入有界汇报/证据摘要，避免分析类、文档类或只读交付因看不到工人汇报而误判 `VERDICT: INCOMPLETE`。
+
 ### v1.1.5：彻底根治 ACP 重复拦截、后台定时器抢占与状态门禁冲突
 
 - **零 `check_subsession` 轮询**：移除 `team-host.ts` 中 `getHostedSubagentResult` 的 250ms 紧轮询死循环，且 `refreshHostedNotifications` 在子任务运行期间仅以零工具开销检查磁盘快照与 `subsession.completion` 通知，仅在子任务真正完成或异常退出时触发一次宿主核验，彻底消除 ACP guardrail 重复调用熔断。

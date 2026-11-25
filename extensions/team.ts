@@ -73,7 +73,7 @@ const TEAM_EXTENSION_PATH = (() => {
 })();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.1.5";
+export const PI_TEAMS_VERSION = "1.1.6";
 export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
@@ -1393,7 +1393,7 @@ export function buildPolicy(mode: Mode, cfg: TeamConfig): string {
 	const common = [
 		"## Head-Coach & Point-God CP Team Workflow (2021 Suns Roster)",
 		`Current workload policy label: ${mode}. Economy and strict are legacy labels; quality, throughput, and autonomous execution always take priority.`,
-		"The main session is the Head Coach (orchestrator parent): stay on the sideline and do NOT play on the court (never code inline, run long test suites, or do deep line-by-line code review yourself). Own user alignment, dependency/write-set DAG, rolling 20-slot dispatch, blocker arbitration, and recording team_goal after CP review verdicts.",
+		"The main session is the Head Coach (orchestrator parent): stay on the sideline and do NOT play on the court (never code inline, investigate codebases, run search/bash diagnostics/builds/tests, or do deep line-by-line code review yourself via bash/read/grep/spawn_subsession/codemode). Own user intent analysis, requirement decomposition into W-* ledger deliverables, dependency/write-set DAG, rolling 20-slot Agent dispatch, blocker arbitration, verifying child evidence, and recording team_goal.",
 		"The five specialized child roles are:",
 		"- cp (Chris Paul — Point God): SOLE default independent reviewer (W-rev-*), global architecture/user-scope authority and major technical arbiter, and code reviewer. Runs strictly read-only (read, grep, find, ls, plus kernel bwrap read-only bash for git diff/log/evidence checks). Multiple cp instances may review independent tasks in parallel. If cp hits real provider/tool unavailability or quota errors, the parent falls back cleanly without stalling the goal.",
 		"- booker (Devin Booker — Scorer): High-difficulty/high-risk implementation (complex, cross-module, concurrency, protocol, performance) and bounded local technical decisions. Directly eligible with no prerequisite failure count or module-count threshold.",
@@ -1404,7 +1404,7 @@ export function buildPolicy(mode: Mode, cfg: TeamConfig): string {
 		"Role authority: Booker is the senior executor with bounded local technical decisions within its assigned goal/scope; CP retains global architecture, user-scope changes and major arbitration. Bridges/Ayton/Cameron have execution/reporting authority only, not decision authority; escalate scope or technical direction choices to CP. Review waiver never grants decision authority.",
 		"Reviewer independence and exemptions: Booker with unset reviewTier defaults to CP-review exemption. Bridges/Ayton/Cameron default to CP review; explicit reviewTier:none waives review for small/granular non-decision tasks, whether read-only or writable, without requiring autoAccept:true. reviewTier:llm, autoAccept:false or explicit reviewerRole requests independent review. Exemption routes the delivery to the main CP: the task stays reported and the parent accepts it with ONE team_tasks update after checking the evidence, so no reviewer child is spent on a trivial result. Explicit deterministic + autoAccept:true retains the ALL machine-assertions gate, never a semantic waiver, and is the only automatic route. Review tasks and CP/parent orchestration never auto-accept. Existing current-delivery reviewer obligations and CP REWORK verdicts cannot be bypassed; never cancel old reviewers to apply new defaults.",
 		"For deliveries requiring independent review, use the ledger's automatically created W-rev-<id> assigned to cp, never self-review by the implementer. Do NOT manually register W-rev-* via team_tasks add. Dispatch the auto-created reviewer with VERDICT and one CRITERION per AC with file:line or observed command evidence; the ledger settles reviewer and worker on verified PASS.",
-		"Parent sideline discipline: delegate coding (bridges/booker), testing (ayton), docs (cameron), and code review/deep technical audit (cp). Keep orchestration, DAG bookkeeping, arbitration, and final team_goal recording in the main session.",
+		"Parent sideline discipline: delegate ALL code/filesystem investigation, editing (bridges/booker), testing (ayton), docs (cameron), and code review/deep technical audit (cp). Keep only intent analysis, task decomposition, DAG bookkeeping, Agent dispatch, arbitration, and final team_goal acceptance in the main session. Never get impatient while dispatched children are running and start doing their job yourself — wait for completion notices or do one join when no ready work remains.",
 		"Every dispatch brief must include: goal, scope, allowed/forbidden paths, acceptance evidence, and only necessary context (file/symbol/error). Do not transcribe the whole conversation.",
 		"Use team_tasks to maintain the persistent additive request/task ledger before dispatch. A new user request adds scope; it never implicitly cancels older requests, tasks, or acceptance conditions. Resolve each request with evidence (including answered/non-actionable messages); cancellation/supersession needs explicit user authority, reason and source evidence.",
 		"Decompose work into independently verifiable deliverables, not one large role-shaped bundle. Register request IDs, dependencies, concrete read/write scopes and acceptance. Include TEAM_TASK: W-id in each Agent prompt. Parent tasks may cover decisive analysis/acceptance; retain separate integration/regression/cleanup obligations where needed.",
@@ -1448,11 +1448,23 @@ export function buildReviewContract(revTask: WorkTask, workerTask: WorkTask): st
 	const deliveredPaths = workerTask.writePaths.length
 		? workerTask.writePaths.join(", ")
 		: (workerTask.readPaths.length ? workerTask.readPaths.join(", ") : "none recorded");
+	const evidenceExcerpt = (workerTask.evidence ?? [])
+		.map(e => (typeof e === "string" ? e.trim() : ""))
+		.filter(Boolean)
+		.join("\n---\n")
+		.slice(0, 4000);
 	return [
 		`[CANONICAL REVIEW CONTRACT — AUTO-INJECTED FROM LEDGER for ${revTask.id}]`,
 		`Target worker task: ${workerTask.id} (${workerTask.role}) — ${workerTask.title}`,
 		`Delivered paths: ${deliveredPaths}`,
 		`Delivery version: ${deliveryVersionOf(workerTask)}`,
+		...(evidenceExcerpt
+			? [
+				"",
+				"Worker delivered report / recorded evidence (verify claims independently on disk / via read-only bash):",
+				evidenceExcerpt,
+			]
+			: []),
 		"",
 		"Canonical Acceptance Criteria (verify EVERY AC independently on disk / via read-only bash):",
 		acLines,
@@ -2271,42 +2283,47 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					if (pinnedDelivery === deliveredVersion) releaseFinishedAttempt(applied.workerTask);
 					writeLease(task);
 					dirty = true;
-				} else if (isReviewExempt(task)) {
-					// Review exemption routes the delivery to the main CP instead of a spawned reviewer.
-					// It never infers "done" from the child's prose: the task stays "reported" until the
-					// parent accepts it with one team_tasks update after checking the report evidence.
-					const awaiting = `Review-exempt delivery awaiting parent acceptance: verify the report evidence, then team_tasks update ${task.id} status="done".`;
-					if (task.reason !== awaiting) { task.reason = awaiting; dirty = true; }
-					// Keep the delivered report on the task so the parent can verify it without re-reading the child.
-					const deliveryEvidence = [resolvedReportText].filter(t => t.trim().length > 0);
-					if (deliveryEvidence.length && JSON.stringify(task.evidence ?? []) !== JSON.stringify(deliveryEvidence)) {
-						task.evidence = deliveryEvidence; dirty = true;
+				} else {
+					const clippedReport = resolvedReportText.trim().slice(0, 6000);
+					if (clippedReport) {
+						const prev = task.evidence ?? [];
+						if (prev[0] !== clippedReport) {
+							task.evidence = [clippedReport, ...prev.filter(e => e !== clippedReport)].slice(0, 3);
+							dirty = true;
+						}
 					}
-					// Never release an execution whose terminal state was not verified by the probe.
-					if (probe.completed && (probe.cleanExit === true || probe.terminalExitProof === true)) releaseFinishedAttempt(task);
-				} else if (isDeterministic(task) && probe.cleanExit === true && resolvedReportText.trim().length > 0) {
-					const isAccepted = autoAcceptTask(board(), task.id, [resolvedReportText], {
-						cleanExit: true, deliveryVersion: deliveryVersionOf(task),
-						cwd: (ctx as any)?.cwd || process.cwd(),
-					});
-					if (isAccepted) {
-						writeLease(task);
+					if (isReviewExempt(task)) {
+						// Review exemption routes the delivery to the main CP instead of a spawned reviewer.
+						// It never infers "done" from the child's prose: the task stays "reported" until the
+						// parent accepts it with one team_tasks update after checking the report evidence.
+						const awaiting = `Review-exempt delivery awaiting parent acceptance: verify the report evidence, then team_tasks update ${task.id} status="done".`;
+						if (task.reason !== awaiting) { task.reason = awaiting; dirty = true; }
+						// Never release an execution whose terminal state was not verified by the probe.
+						if (probe.completed && (probe.cleanExit === true || probe.terminalExitProof === true)) releaseFinishedAttempt(task);
+					} else if (isDeterministic(task) && probe.cleanExit === true && resolvedReportText.trim().length > 0) {
+						const isAccepted = autoAcceptTask(board(), task.id, [resolvedReportText], {
+							cleanExit: true, deliveryVersion: deliveryVersionOf(task),
+							cwd: (ctx as any)?.cwd || process.cwd(),
+						});
+						if (isAccepted) {
+							writeLease(task);
+						} else {
+							const verdicted = alreadyVerdicted(task);
+							createReviewerTask(board(), task, task.reviewerRole, artefactFingerprint((ctx as any)?.cwd || process.cwd(), task.writePaths));
+							if (!verdicted && isActiveReviewHold(board(), { ...task, status: "reviewing" })) task.status = "reviewing";
+							releaseFinishedAttempt(task);
+						}
+						dirty = true;
 					} else {
 						const verdicted = alreadyVerdicted(task);
 						createReviewerTask(board(), task, task.reviewerRole, artefactFingerprint((ctx as any)?.cwd || process.cwd(), task.writePaths));
+						// A delivery that already carries a verdict (an INCOMPLETE review re-queued for re-review)
+						// or whose review hold is already inactive/reclaimable stays "reported" so we never
+						// ping-pong with reclaimStaleReviews() or block the write scope indefinitely.
 						if (!verdicted && isActiveReviewHold(board(), { ...task, status: "reviewing" })) task.status = "reviewing";
 						releaseFinishedAttempt(task);
+						dirty = true;
 					}
-					dirty = true;
-				} else {
-					const verdicted = alreadyVerdicted(task);
-					createReviewerTask(board(), task, task.reviewerRole, artefactFingerprint((ctx as any)?.cwd || process.cwd(), task.writePaths));
-					// A delivery that already carries a verdict (an INCOMPLETE review re-queued for re-review)
-					// or whose review hold is already inactive/reclaimable stays "reported" so we never
-					// ping-pong with reclaimStaleReviews() or block the write scope indefinitely.
-					if (!verdicted && isActiveReviewHold(board(), { ...task, status: "reviewing" })) task.status = "reviewing";
-					releaseFinishedAttempt(task);
-					dirty = true;
 				}
 			} else if (task.status === "running" && !probe.failed) {
 				// Demote abandoned/crashed running children (e.g. host restart mid-toolCall) to "uncertain"
@@ -2555,11 +2572,21 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	 */
 	const pollCounts = new Map<string, number>();
 	const waitCounts = new Map<string, number>();
+	const syncConsumedCompletions = new Set<string>();
+	const sentCompletionNotices = new Set<string>();
 	function clearChildPollState(sessionId: string): void {
 		pollCounts.delete(sessionId);
 		waitCounts.delete(sessionId);
 		for (const stamp of [...hostedProbedStamps]) {
 			if (stamp.startsWith(`${sessionId}:`)) hostedProbedStamps.delete(stamp);
+		}
+	}
+	function clearChildCompletionNoticeState(sessionId: string): void {
+		for (const key of [...syncConsumedCompletions]) {
+			if (key.startsWith(`${sessionId}:`)) syncConsumedCompletions.delete(key);
+		}
+		for (const key of [...sentCompletionNotices]) {
+			if (key.startsWith(`${sessionId}:`)) sentCompletionNotices.delete(key);
 		}
 	}
 
@@ -2667,69 +2694,87 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		let failureNote = "";
 
 		// Match by the ledger runId first: a fast child can exit before tool_result binds its sessionId to the task.
-		const runId = info.runId && board().tasks.some(t => t.runId === info.runId) ? info.runId : undefined;
-		if (info.success) {
-			syncLease(runId, sessionId, "completed");
-			if (observeTask(board(), runId, sessionId, "completed")) dirty = true;
-		} else {
-			// The child process has verifiably exited: settle the attempt instead of leaving it "uncertain".
-			const task = board().tasks.find(t => (runId ? t.runId === runId : t.sessionId === sessionId) && (t.status === "running" || t.status === "uncertain"));
-			if (task && !task.sessionId) task.sessionId = sessionId;
-			const role = normalizeRole(info.role);
-			const errorText = info.error ?? `child ${info.status}`;
-			const kind = classifyAgentFailure(errorText);
-			if (kind === "quota" && role) {
-				const applied = applyQuotaFailure(state, role, cfg, `额度/限流不足（${errorText.trim().slice(0, 80)}）`);
-				state = applied.state;
-				dirty = true;
-				const ui = ctxStore.current?.hasUI ? ctxStore.current.ui : undefined;
-				if (applied.nextModel) ui?.notify(`${ROLE_LABEL[role]} 额度不足，后续改用 ${applied.nextModel}`, "warning");
-				else ui?.notify(`${ROLE_LABEL[role]} 所有备用模型也不可用，已暂停该角色。`, "error");
-				if (task && applied.nextModel) {
-					// Release this attempt's lease, then requeue the task for the fallback model.
-					writeLease({ ...task, status: "failed", reason: `Quota failure: ${errorText.slice(0, 200)}` });
-					task.status = "ready";
-					task.reason = `Previous attempt hit a quota/rate limit; requeued for fallback model ${applied.nextModel}.`;
-					task.evidence = [...(task.evidence ?? []), `Child ${sessionId} quota failure: ${errorText.slice(0, 200)}`];
-					delete task.runId;
-					delete task.dispatchedAt;
-					delete task.sessionId;
-					board().revision++;
-					failureNote = `Requeued ${task.id} for fallback model ${applied.nextModel}.`;
+		const taskByRunId = info.runId ? board().tasks.find(t => t.runId === info.runId) : undefined;
+		const taskById = info.taskId ? board().tasks.find(t => t.id === info.taskId) : undefined;
+		const taskBySession = board().tasks.find(t => t.sessionId === sessionId);
+		const runId = taskByRunId ? info.runId : undefined;
+		const relatedTask = taskByRunId ?? taskById ?? taskBySession;
+		const staleRunId = Boolean(info.runId && relatedTask?.runId && relatedTask.runId !== info.runId);
+		const alreadyTerminal = Boolean(
+			relatedTask && (relatedTask.status === "done" || relatedTask.status === "cancelled" || relatedTask.status === "superseded"),
+		);
+		const isStaleAttempt = staleRunId || alreadyTerminal;
+
+		if (!isStaleAttempt) {
+			if (info.success) {
+				syncLease(runId, sessionId, "completed");
+				if (observeTask(board(), runId, sessionId, "completed")) dirty = true;
+			} else {
+				// The child process has verifiably exited: settle the attempt instead of leaving it "uncertain".
+				const task = board().tasks.find(t => (runId ? t.runId === runId : t.sessionId === sessionId) && (t.status === "running" || t.status === "uncertain"));
+				if (task && !task.sessionId) task.sessionId = sessionId;
+				const role = normalizeRole(info.role);
+				const errorText = info.error ?? `child ${info.status}`;
+				const kind = classifyAgentFailure(errorText);
+				if (kind === "quota" && role) {
+					const applied = applyQuotaFailure(state, role, cfg, `额度/限流不足（${errorText.trim().slice(0, 80)}）`);
+					state = applied.state;
+					dirty = true;
+					const ui = ctxStore.current?.hasUI ? ctxStore.current.ui : undefined;
+					if (applied.nextModel) ui?.notify(`${ROLE_LABEL[role]} 额度不足，后续改用 ${applied.nextModel}`, "warning");
+					else ui?.notify(`${ROLE_LABEL[role]} 所有备用模型也不可用，已暂停该角色。`, "error");
+					if (task && applied.nextModel) {
+						// Release this attempt's lease, then requeue the task for the fallback model.
+						writeLease({ ...task, status: "failed", reason: `Quota failure: ${errorText.slice(0, 200)}` });
+						task.status = "ready";
+						task.reason = `Previous attempt hit a quota/rate limit; requeued for fallback model ${applied.nextModel}.`;
+						task.evidence = [...(task.evidence ?? []), `Child ${sessionId} quota failure: ${errorText.slice(0, 200)}`];
+						delete task.runId;
+						delete task.dispatchedAt;
+						delete task.sessionId;
+						board().revision++;
+						failureNote = `Requeued ${task.id} for fallback model ${applied.nextModel}.`;
+					} else if (task) {
+						task.status = "failed";
+						task.reason = `Quota failure and no fallback model left: ${errorText.slice(0, 300)}`;
+						writeLease(task);
+						board().revision++;
+					}
 				} else if (task) {
 					task.status = "failed";
-					task.reason = `Quota failure and no fallback model left: ${errorText.slice(0, 300)}`;
+					task.reason = `Child exited (${info.status}${info.code !== null ? `, code ${info.code}` : ""}): ${errorText.slice(0, 300)}`;
+					task.evidence = [...(task.evidence ?? []), ...(info.logFile ? [`Child log: ${info.logFile}`] : [])];
 					writeLease(task);
 					board().revision++;
+					dirty = true;
 				}
-			} else if (task) {
-				task.status = "failed";
-				task.reason = `Child exited (${info.status}${info.code !== null ? `, code ${info.code}` : ""}): ${errorText.slice(0, 300)}`;
-				task.evidence = [...(task.evidence ?? []), ...(info.logFile ? [`Child log: ${info.logFile}`] : [])];
-				writeLease(task);
-				board().revision++;
-				dirty = true;
 			}
+			if (dirty) persist();
 		}
-		if (dirty) persist();
 
-		const statusWord = info.success ? "completed" : info.status;
-		let report = info.reportText ?? "";
-		if (report.length > NOTIFY_REPORT_LIMIT) report = `${report.slice(0, NOTIFY_REPORT_LIMIT)}\n…(truncated; call get_subagent_result for the full report)`;
-		const errorLine = info.success ? "" : `\nError: ${(info.error ?? "unknown").slice(0, 500)}${info.logFile ? `\nLog: ${info.logFile}` : ""}`;
-		try {
-			pi.sendMessage(
-				{
-					customType: "pi-web:subagent-notification",
-					content: `Subagent ${info.role} (${sessionId.slice(0, 8)}${info.taskId ? `, ${info.taskId}` : ""}) ${statusWord}.${failureNote ? ` ${failureNote}` : ""}${errorLine}${report ? `\n\n${report}` : ""}`,
-					display: true,
-					details: { sessionId, status: statusWord, role: info.role, taskId: info.taskId, completedAt: new Date().toISOString() },
-				},
-				// Wake an idle CP parent (or queue after the current turn) so it can review/accept and continue.
-				{ triggerTurn: true, deliverAs: "followUp" },
-			);
-		} catch {
-			// best-effort notification
+		const noticeKey = `${sessionId}:${info.runId ?? ""}`;
+		const consumedSync = syncConsumedCompletions.has(noticeKey) || syncConsumedCompletions.has(`${sessionId}:*`);
+		const duplicateNotice = sentCompletionNotices.has(noticeKey);
+		if (!isStaleAttempt && !consumedSync && !duplicateNotice) {
+			sentCompletionNotices.add(noticeKey);
+			const statusWord = info.success ? "completed" : info.status;
+			let report = info.reportText ?? "";
+			if (report.length > NOTIFY_REPORT_LIMIT) report = `${report.slice(0, NOTIFY_REPORT_LIMIT)}\n…(truncated; call get_subagent_result for the full report)`;
+			const errorLine = info.success ? "" : `\nError: ${(info.error ?? "unknown").slice(0, 500)}${info.logFile ? `\nLog: ${info.logFile}` : ""}`;
+			try {
+				pi.sendMessage(
+					{
+						customType: "pi-web:subagent-notification",
+						content: `Subagent ${info.role} (${sessionId.slice(0, 8)}${info.taskId ? `, ${info.taskId}` : ""}) ${statusWord}.${failureNote ? ` ${failureNote}` : ""}${errorLine}${report ? `\n\n${report}` : ""}`,
+						display: true,
+						details: { sessionId, status: statusWord, role: info.role, taskId: info.taskId, completedAt: new Date().toISOString() },
+					},
+					// Wake an idle CP parent (or queue after the current turn) so it can review/accept and continue.
+					{ triggerTurn: true, deliverAs: "followUp" },
+				);
+			} catch {
+				// best-effort notification
+			}
 		}
 
 		if (info.taskId && (info.taskId.startsWith("W-rev-") || board().tasks.find(t => t.id === info.taskId)?.parentTaskId)) {
@@ -3425,6 +3470,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		pendingTurnReports.clear();
 		pollCounts.clear();
 		waitCounts.clear();
+		syncConsumedCompletions.clear();
+		sentCompletionNotices.clear();
 		hostedProbedStamps.clear();
 		restoreFromSession(ctx); loadRecoveredKeys(activeEntries(ctx)); loadLeases(ctx);
 		if (state.enabled && !isSubagentSession && !state.ledger) { board(); persist(); }
@@ -3640,7 +3687,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		// 前台等待上限：避免父会话无限等一个卡住的子会话
 		const injectedWait = input.run_in_background === true ? null : enforceWaitTimeout(input, cfg.agentWaitTimeoutSeconds);
 		if (injectedWait !== null && ctx.hasUI) ctx.ui.notify(`已为本次派活设置等待上限 ${injectedWait}s`, "info");
-		if (resumeId) clearChildPollState(resumeId);
+		if (resumeId) { clearChildPollState(resumeId); clearChildCompletionNoticeState(resumeId); }
 
 		let workId: string | undefined;
 		try { workId = parseTeamTaskId(prompt); }
@@ -4363,10 +4410,27 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		const task = board().tasks.find(t => t.sessionId === sessionId);
 		const run = [...sessionRuns()].reverse().find(r => r.sessionId === sessionId);
 		const hosted = usesHostedTransport(sessionId);
-		const res = hosted ? await getHostedSubagentResult(sessionId, wait, {
-			...hostedOptions(ctx), role: task?.role || run?.role || "bridges", taskId: task?.id, runId: task?.runId || run?.taskId, reportNotBefore: task?.dispatchedAt,
-		}, _signal) : await getSubagentResult(sessionId, wait, runnerOptions);
-		if (hosted) refreshNativeNotifications(ctx);
+		const expectedRunId = task?.runId || run?.taskId || "";
+		const syncKey = `${sessionId}:${expectedRunId}`;
+		const syncAnyKey = `${sessionId}:*`;
+		syncConsumedCompletions.add(syncKey);
+		syncConsumedCompletions.add(syncAnyKey);
+		let res: Awaited<ReturnType<typeof getSubagentResult>>;
+		try {
+			res = hosted ? await getHostedSubagentResult(sessionId, wait, {
+				...hostedOptions(ctx), role: task?.role || run?.role || "bridges", taskId: task?.id, runId: expectedRunId || undefined, reportNotBefore: task?.dispatchedAt,
+			}, _signal) : await getSubagentResult(sessionId, wait, runnerOptions);
+		} catch (err) {
+			syncConsumedCompletions.delete(syncKey);
+			syncConsumedCompletions.delete(syncAnyKey);
+			throw err;
+		}
+		if (res.status === "running") {
+			syncConsumedCompletions.delete(syncKey);
+			syncConsumedCompletions.delete(syncAnyKey);
+		}
+		if (hosted) await refreshHostedNotifications(ctx);
+		refreshNativeNotifications(ctx);
 		if (res.status === "running") {
 			const msg = hosted
 				? `Subagent ${sessionId} is still running in pi-web. Do NOT call get_subagent_result again — call yield_to_subsessions (alone and last) or end your turn to wait for its automatic completion notice.`
@@ -4924,6 +4988,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			if (sub === "reset") {
 				pollCounts.clear();
 				waitCounts.clear();
+				syncConsumedCompletions.clear();
+				sentCompletionNotices.clear();
 				hostedProbedStamps.clear();
 				state.calls = { cp: 0, booker: 0, bridges: 0, ayton: 0, cameron: 0 };
 				state.failures = { cp: 0, booker: 0, bridges: 0, ayton: 0, cameron: 0 };

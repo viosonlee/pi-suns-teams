@@ -14,7 +14,7 @@
   "goalMaxStalls": 0,
   "bashTimeoutSeconds": 180,
   "bashMaxTimeoutSeconds": 900,
-  "parentSoloWork": "allow",
+  "parentSoloWork": "delegated",
   "agentWaitTimeoutSeconds": 600,
   "autoGcChildSessions": true,
   "gcReviewerCooldownMinutes": 60,
