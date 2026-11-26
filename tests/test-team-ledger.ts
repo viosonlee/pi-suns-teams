@@ -60,9 +60,12 @@ test('relative scopes normalize and globs reject atomically',()=>{
  assert.throws(()=>addTasks(b,[spec(q.id,'W-b'),spec(q.id,'W-c',{writePaths:['src/**']})],'/repo'),/globs/); assert.deepEqual(b,before);
 });
 test('DAG cycle, unknown dependencies, duplicate IDs, read-only role writes reject atomically',()=>{
- for(const items of [[spec('Q-1','W-a',{dependsOn:['W-b']}),spec('Q-1','W-b',{dependsOn:['W-a']})],[spec('Q-1','W-a',{dependsOn:['W-unknown']})],[spec('Q-1','W-a'),spec('Q-1','W-a')],[spec('Q-1','W-a',{role:'ayton'})]]) {
+ for(const items of [[spec('Q-1','W-a',{dependsOn:['W-b']}),spec('Q-1','W-b',{dependsOn:['W-a']})],[spec('Q-1','W-a',{dependsOn:['W-unknown']})],[spec('Q-1','W-a'),spec('Q-1','W-a')],[spec('Q-1','W-a',{role:'cp'})]]) {
   const {b}=fixture(); const before=structuredClone(b); assert.throws(()=>addTasks(b,items,'/repo')); assert.deepEqual(b,before);
  }
+ const {b,q}=fixture();
+ addTasks(b,[spec(q.id,'W-ayton-tests',{role:'ayton',writePaths:['tests/W-a.test.ts']})],'/repo');
+ assert.deepEqual(b.tasks[0].writePaths,['/repo/tests/W-a.test.ts']);
 });
 test('reported is not done; verified return unlocks successors while unrelated child still runs',()=>{
  const {b,q}=fixture(); addTasks(b,[spec(q.id,'W-a'),spec(q.id,'W-b'),spec(q.id,'W-c',{dependsOn:['W-a']})],'/repo');

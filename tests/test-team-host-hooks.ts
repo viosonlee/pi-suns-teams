@@ -167,13 +167,13 @@ try {
   const denied = await h.ledger({ action: "list" }); assert.equal(denied.isError, true);
   await tick(); assert.equal(h.calls.length, 0); await h.emit("session_shutdown");
  });
- await test("hosted exemption skips the reviewer child and waits for one parent acceptance", async () => {
+ await test("hosted exemption skips the reviewer child and waits for one parent acceptance; booker/bridges default CP review", async () => {
   const h = harness(); await h.start();
   const proof = join(h.ctx.cwd, "role-proof.md"); writeFileSync(proof, "Fixture verification evidence\n");
   for (const role of ["booker", "bridges", "ayton", "cameron"]) {
    const id = `W-light-${role}`;
    const spec: any = h.spec(id, role);
-   if (role !== "booker") spec.reviewTier = "none";
+   if (role === "booker" || role === "bridges") spec.reviewTier = "none";
    await h.ledger({ action: "add", autoDispatch: false, tasks: [spec] });
    const started = await h.agent({ subagent_type: role, prompt: `TEAM_TASK: ${id}\nPerform the bounded non-decision fixture task` });
    assert.equal(started.isError, false, JSON.stringify(started));
@@ -192,6 +192,24 @@ try {
    assert.notEqual(accepted.isError, true, JSON.stringify(accepted));
    assert.equal(h.task(id).status, "done");
   }
+  await h.ledger({ action: "add", autoDispatch: false, tasks: [h.spec("W-booker-default-rev", "booker")] });
+  const revStarted = await h.agent({ subagent_type: "booker", prompt: "TEAM_TASK: W-booker-default-rev\nComplex core fix" });
+  const revChildId = revStarted.result.details.sessionId, revChild = h.children.get(revChildId)!;
+  revChild.status = "idle";
+  revChild.text = `Changes: Core fix.\nStatus: complete\nVerification: ${proof}:1; exit code 0`;
+  h.append(revChildId, { role: "assistant", content: [{ type: "text", text: revChild.text }], stopReason: "stop" });
+  await h.result(revChildId); await tick();
+  assert.ok(h.state().ledger.tasks.some((t: any) => t.parentTaskId === "W-booker-default-rev" && t.role === "cp"), "booker default routes to independent cp review");
+  await h.emit("session_shutdown");
+ });
+ await test("hosted ayton with writable test writePaths retains scoped write access while blocking product paths", async () => {
+  const h = harness({ child: true }); await h.start();
+  await h.emit("before_agent_start", { prompt: "PI_TEAMS_HOST_ROLE: ayton\nTEAM_TASK: W-test-write\nRole: ayton\nRead Paths: src/app.ts\nWrite Paths: tests/app.test.ts" });
+  assert.ok(h.activeTools.at(-1)?.includes("write"), "ayton with declared test writePaths keeps write tool");
+  const blockedProd = await h.emit("tool_call", { toolName: "write", toolCallId: "tc-prod", input: { path: "src/app.ts", content: "bad" } });
+  assert.equal(blockedProd.block, true, "writes outside declared test writePaths remain blocked");
+  const allowedTest = await h.emit("tool_call", { toolName: "write", toolCallId: "tc-test", input: { path: "tests/app.test.ts", content: "ok" } });
+  assert.notEqual(allowedTest.block, true, "writes inside declared test writePaths are permitted");
   await h.emit("session_shutdown");
  });
  await test("hosted deterministic delivery auto-accepts while an explicit review request still routes to CP", async () => {

@@ -17,12 +17,12 @@ writeFileSync(artifact, "delivered\nverified\n");
 const report = `Status: complete\nChanges: ${artifact}:1\nVerification: exit code 0; 10 tests passed\nRemaining issues: none.`;
 
 /** W-1 delivers; W-2 depends on it; acceptance is semantic unless fields override it. */
-const setup = (role = "booker", fields: Record<string, unknown> = {}) => {
+const setup = (role = "ayton", fields: Record<string, unknown> = {}) => {
 	const board = newLedger();
 	const request = addRequest(board, "bounded role delivery", "role-review-test");
 	const [task, successor] = addTasks(board, [
 		{ id: "W-1", title: "Small scoped delivery", role, requestIds: [request.id], dependsOn: [],
-			readPaths: [artifact], writePaths: role === "ayton" || role === "cp" || role === "parent" ? [] : [artifact],
+			readPaths: [artifact], writePaths: role === "cp" || role === "parent" ? [] : [artifact],
 			acceptance: ["The scoped change satisfies the requested behavior"], ...fields },
 		{ id: "W-2", title: "Use delivered output", role: "bridges", requestIds: [request.id], dependsOn: ["W-1"],
 			readPaths: [artifact], writePaths: [], acceptance: ["Verify successor"] },
@@ -39,19 +39,23 @@ const acceptParent = (fixture: ReturnType<typeof setup>) =>
 	updateTask(fixture.board, { id: fixture.task.id, status: "done", evidence: [report], reason: "Parent checked the report evidence" });
 
 try {
-	test("Booker defaults review-exempt: no reviewer, stays reported until the parent accepts", () => {
-		const f = setup();
-		assert.equal(isReviewExempt(f.task), true);
-		assert.equal(isDeterministic(f.task), false);
-		assert.ok(!readyTasks(f.board).includes(f.successor));
-		// Exemption never settles a delivery by itself, whatever the prose says.
-		assert.equal(accept(f), false);
-		assert.equal(f.task.status, "reported");
-		assert.equal(f.board.tasks.length, 2, "no reviewer ceremony");
-		assert.ok(!readyTasks(f.board).includes(f.successor), "successor waits for acceptance");
-		acceptParent(f);
-		assert.equal(f.task.status, "done");
-		assert.ok(readyTasks(f.board).includes(f.successor));
+	test("Ayton and Cameron default review-exempt: no reviewer, stays reported until the parent accepts; Ayton supports test/artifact writes", () => {
+		for (const role of ["ayton", "cameron"]) {
+			for (const writePaths of [[], [artifact]]) {
+				const f = setup(role, { writePaths });
+				assert.equal(isReviewExempt(f.task), true);
+				assert.equal(isDeterministic(f.task), false);
+				assert.ok(!readyTasks(f.board).includes(f.successor));
+				// Exemption never settles a delivery by itself, whatever the prose says.
+				assert.equal(accept(f), false);
+				assert.equal(f.task.status, "reported");
+				assert.equal(f.board.tasks.length, 2, "no reviewer ceremony");
+				assert.ok(!readyTasks(f.board).includes(f.successor), "successor waits for acceptance");
+				acceptParent(f);
+				assert.equal(f.task.status, "done");
+				assert.ok(readyTasks(f.board).includes(f.successor));
+			}
+		}
 	});
 
 	test("exemption does not infer completion from prose: pending/future/failed phrasing is irrelevant", () => {
@@ -83,13 +87,13 @@ try {
 		}
 	});
 
-	test("lower-role default CP review vs explicit none for small read/write work", () => {
-		for (const role of ["bridges", "ayton", "cameron"]) {
+	test("product-writer default CP review (booker, bridges) vs explicit none for small read/write work", () => {
+		for (const role of ["booker", "bridges"]) {
 			const defaultTask = setup(role);
 			assert.equal(isReviewExempt(defaultTask.task), false);
 			assert.equal(accept(defaultTask), false);
 			assert.equal(createReviewerTask(defaultTask.board, defaultTask.task).role, "cp");
-			for (const writePaths of role === "ayton" ? [[]] : [[], [artifact]]) {
+			for (const writePaths of [[], [artifact]]) {
 				const waived = setup(role, { reviewTier: "none", writePaths });
 				assert.equal(waived.task.autoAccept, undefined, "none needs no extra flag");
 				assert.equal(isReviewExempt(waived.task), true);

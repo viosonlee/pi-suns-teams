@@ -19,11 +19,11 @@
 
 | 角色 | 代号 | 权限约束 | 职责定位 | 默认思考等级 |
 |---|---|---|---|---|
-| **Chris Paul (CP)** | `cp` | **只读** (`read, bash, grep, find, ls`，禁止修改代码) | **复核 / 重大仲裁**：承接必要的 `W-rev-*`、重要/全局架构与重大技术仲裁；主会话担任 CP，保留用户范围决策、最终目标审核与需求关闭。 | `max` |
-| **Devin Booker** | `booker` | **读写** (`read, bash, edit, write, ...`) | **高级执行者**：复杂实现及任务/用户范围内的有界技术决策；默认干净且有证据的交付无需 CP 工单复核，显式要求复核除外。重要/全局架构、用户范围变更、重大仲裁仍归 CP/main。 | `xhigh` |
-| **Mikal Bridges** | `bridges` | **读写** (`read, bash, edit, write, ...`) | **纯执行开发员**：落实明确的功能、接口与 Bug 修复；不自主做技术决策，真实取舍/缺失选择需上报，常规非决策读写不需逐次批准。 | `high` |
-| **Deandre Ayton** | `ayton` | **只读** (`read, bash, grep, find, ls`，**坚决不写代码**) | **纯执行验证员**：运行指定测试、构建、设备检查并汇报证据；不做代码复核或自主技术决策，缺陷交给写入角色，真实取舍/缺失选择交主控。 | `medium` |
-| **Cameron Johnson** | `cameron` | **读写** (`read, bash, edit, write, ...`) | **纯执行资产管家**：按既定要求维护文档、矩阵、资产与证据；不做代码复核或自主技术决策，真实取舍/缺失选择需上报，常规非决策读写不需逐次批准。 | `medium` |
+| **Chris Paul (`cp`)** | `cp` | **严格只读** (`read, bash, grep, find, ls` + `bwrap` 只读沙盒) | **独立 Code Reviewer / 架构仲裁**：专门审查 `booker`/`bridges` 的业务代码变更（`W-rev-*`）与全局架构仲裁，不干跑腿侦察；主会话担任 **Head Coach（总控）**负责拆解、调度与终验。 | `max` |
+| **Devin Booker** | `booker` | **读写** (`read, bash, edit, write, ...`) | **核心架构攻坚专家**：复杂实现、跨模块重构、并发/协议与疑难排障；**不再兼职跑常规测试或实机部署**。业务实现默认经过 `cp` 独立复核把关（纯分析可 `reviewTier: "none"`）。 | `high` |
+| **Mikal Bridges** | `bridges` | **读写** (`read, bash, edit, write, ...`) | **主力研发 & 只读侦察**：日常功能、Bugfix、代码/日志侦察（`declaredReadOnly: true`）与分支集成。业务改动默认经过 `cp` 复核，小改/侦察可 `reviewTier: "none"` 秒过。 | `high` |
+| **Deandre Ayton** | `ayton` | **测试与实机验证** (`read, bash, edit, write, grep, find, ls`，写权限受 `writePaths` 约束) | **全能 QA & 实机测试工程师**：单元/集成/回归测试、UIQA 与**授权实机/物理设备巡检**，允许在 `tests/`/`artifacts/` 等测试目录写入脚本/日志/截图，**严禁修改产品源码**。默认**免 `cp` 二审**（主会话验收或确定性断言自动过账）。 | `medium` |
+| **Cameron Johnson** | `cameron` | **读写** (`read, bash, edit, write, ...`) | **Release & Ops + 文档管家**：编译打包、测试环境/实机推包部署、发布清单、CHANGELOG/README、验收矩阵一致性核对（不改产品逻辑，不重复 Ayton 的测试）。默认**免 `cp` 二审**。 | `medium` |
 
 ---
 
@@ -38,6 +38,15 @@
 - **双运行器**：在 pi-web 中，新的子 Agent 优先通过宿主的受跟踪子会话运行，侧栏实时收到创建与状态通知；在 CLI 中仍使用独立 `pi --mode json` 进程。已有原生进程子会话保持原方式恢复，不在运行中迁移。宿主启动失败不会偷偷改用另一种方式重复派发。团队任务统一通过 `Agent` 派发，避免绕过台账重复执行。
 - **手动与自动派发协调**：`team_tasks add/update` 的 `autoDispatch:false` 为受影响任务持久保留手动派发权，不影响其他自动任务；用 `Agent` 提供完整任务说明/旧子会话 `resume`，或用 `team_dispatch` 显式释放给自动调度器。同一任务、同一角色的重复派发返回已有运行会话，不新增执行。重新排队的已执行任务默认保留手动恢复权，明确 `autoDispatch:true` 才授权后台重新派发。
 - **内置在线检查与自动更新**：支持一键 `/team check-update` 与 `/team update`。
+
+### v1.2.0：方案 B 角色定位重塑（速度 × 质量平衡 + Ayton 实机/测试赋权）
+
+- **解除 `ayton` 的“全盘只读死结”，统一归口自动化与实机测试**：`team-ledger.ts` 与 `team.ts` 允许 `ayton` 在 `writePaths` 中声明测试脚本与日志/截图产物目录（如 `tests/`、`artifacts/`），仅在 `writePaths: []` 时维持内核 `bwrap` 只读沙盒；放开授权范围内的实机/物理设备检验权限，仅严禁修改产品源码或未经授权刷写固件/删数据，避免实机测试再误派给 `booker`。
+- **`cameron` 转型为 `Release & Ops + 文档管家`**：承接编译打包、测试/实机环境部署推包、发布清单、CHANGELOG/文档与一致性核对，与 `ayton`（专职验证/抓证据）形成清晰衔接。
+- **“速度 × 质量”双轨复核倒挂纠偏**：
+  - `ayton`（测试/实机验证）与 `cameron`（打包/部署/文档）在 `reviewTier` 未设置时**默认免除 `cp` 二次复核**（交付停在 `reported` 由主会话验收，或走 `deterministic + autoAccept` 自动过账），极大加快闭环；
+  - `booker` 与 `bridges`（产品代码修改）在 `reviewTier` 未设置时**统一默认经过独立 `cp` 复核**，确保核心代码质量底线；纯侦察与小改动可显式设 `reviewTier: "none"` 快速通过。
+- **清晰区分 `Head Coach` 与 `cp`**：全链路统一主会话为 **Head Coach（总控/调度台）**，子角色 `cp` 专职做独立代码评审与重大仲裁。
 
 ### v1.1.6：强化纯调度编排边界、消除延迟重复唤醒与补全只读交付评审上下文
 

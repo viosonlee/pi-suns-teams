@@ -73,7 +73,7 @@ const TEAM_EXTENSION_PATH = (() => {
 })();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.1.6";
+export const PI_TEAMS_VERSION = "1.2.0";
 export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
@@ -608,7 +608,7 @@ export function buildTaskContract(taskId: string, scope?: { role: string; readPa
 		"5) unresolved issues and risks",
 		"6) whether a lead decision is needed; explicitly state complete/done only when ALL acceptance, integration and cleanup obligations are satisfied (otherwise INCOMPLETE and actionable next steps)",
 		"Role authority: Booker is the senior executor and may make bounded local technical decisions inside the assigned goal/scope; CP retains global architecture, user-scope changes and major arbitration. Bridges/Ayton/Cameron execute assigned tasks and report decisions needed to CP; they have no task authority to change requirements or choose global/local technical direction.",
-		"Review policy: Booker with unset reviewTier defaults to CP-review exemption. Other worker roles default to independent CP review; explicit reviewTier:none waives review for small/granular non-decision read or write tasks. reviewTier:llm, autoAccept:false or explicit reviewerRole requests independent review. Exemption only changes who reviews: an exempt delivery stays reported and the main CP accepts it after checking the evidence. Explicit deterministic + autoAccept:true still requires ALL acceptance criteria to be objective assertions (file:/artifact: existence, exit code 0); test-count prose is not auto-verified. That is the only route that settles without a reviewer or a parent acceptance call. Review tasks and parent/CP orchestration never auto-accept.",
+		"Review policy: Ayton (QA/real-device verification) and Cameron (Release/Ops/Docs) with unset reviewTier default to CP-review exemption. Booker and Bridges (product code writers) default to independent CP review; explicit reviewTier:none waives review for bounded analysis or small/granular non-decision read or write tasks. reviewTier:llm, autoAccept:false or explicit reviewerRole requests independent review. Exemption only changes who reviews: an exempt delivery stays reported and the main CP accepts it after checking the evidence. Explicit deterministic + autoAccept:true still requires ALL acceptance criteria to be objective assertions (file:/artifact: existence, exit code 0); test-count prose is not auto-verified. That is the only route that settles without a reviewer or a parent acceptance call. Review tasks and parent/CP orchestration never auto-accept.",
 		...(scope ? [`Delivery review settings: reviewTier=${scope.reviewTier ?? "unset"} autoAccept=${scope.autoAccept ?? "unset"} reviewerRole=${scope.reviewerRole ?? "unset"}.`] : []),
 		"Exemption is not self-review or permission to skip evidence: report a clean terminal result with real file/command evidence. Do not claim completion for failures, aborted/unverified/incomplete output, integration or cleanup that is still pending, or outstanding dependencies. Existing reviewer holds and CP REWORK obligations remain binding.",
 		"Execution requirements:",
@@ -1395,14 +1395,14 @@ export function buildPolicy(mode: Mode, cfg: TeamConfig): string {
 		`Current workload policy label: ${mode}. Economy and strict are legacy labels; quality, throughput, and autonomous execution always take priority.`,
 		"The main session is the Head Coach (orchestrator parent): stay on the sideline and do NOT play on the court (never code inline, investigate codebases, run search/bash diagnostics/builds/tests, or do deep line-by-line code review yourself via bash/read/grep/spawn_subsession/codemode). Own user intent analysis, requirement decomposition into W-* ledger deliverables, dependency/write-set DAG, rolling 20-slot Agent dispatch, blocker arbitration, verifying child evidence, and recording team_goal.",
 		"The five specialized child roles are:",
-		"- cp (Chris Paul — Point God): SOLE default independent reviewer (W-rev-*), global architecture/user-scope authority and major technical arbiter, and code reviewer. Runs strictly read-only (read, grep, find, ls, plus kernel bwrap read-only bash for git diff/log/evidence checks). Multiple cp instances may review independent tasks in parallel. If cp hits real provider/tool unavailability or quota errors, the parent falls back cleanly without stalling the goal.",
-		"- booker (Devin Booker — Scorer): High-difficulty/high-risk implementation (complex, cross-module, concurrency, protocol, performance) and bounded local technical decisions. Directly eligible with no prerequisite failure count or module-count threshold.",
-		"- bridges (Mikal Bridges — 3&D Workhorse): Default regular implementation, routine bug fixes, batch/mechanical changes, and serial branch integration.",
-		"- ayton (Deandre Ayton — Center / Dirty Work): Dedicated test runner & QA execution — unit/integration/regression tests, LogicQA/UIQA, bug reproduction, raw evidence collection. Never edits product code and does NOT act as default code reviewer.",
-		"- cameron (Cameron Johnson — Docs & Assets): Documentation, test plans/checklists, JSONL matrices, and requirement-code-evidence-doc consistency. Does NOT duplicate ayton's tests and does NOT act as default code reviewer.",
-		"Role-routing hard-line: Route routine code spelunking, branch/unmerged-commit inventory, branch-state scouting, worktree residue checks, log searches, and residual cleanup probes to Bridges by default (declare `declaredReadOnly: true` when investigation needs no writes). CP must not be used as a read-only chore detective; reserve CP only for `W-rev-*` independent final reviews, global architecture decisions, and major technical arbitration. Route tests and reproduction to Ayton, complex/concurrency/protocol/cross-module work to Booker, and docs/checklists/assets to Cameron.",
-		"Role authority: Booker is the senior executor with bounded local technical decisions within its assigned goal/scope; CP retains global architecture, user-scope changes and major arbitration. Bridges/Ayton/Cameron have execution/reporting authority only, not decision authority; escalate scope or technical direction choices to CP. Review waiver never grants decision authority.",
-		"Reviewer independence and exemptions: Booker with unset reviewTier defaults to CP-review exemption. Bridges/Ayton/Cameron default to CP review; explicit reviewTier:none waives review for small/granular non-decision tasks, whether read-only or writable, without requiring autoAccept:true. reviewTier:llm, autoAccept:false or explicit reviewerRole requests independent review. Exemption routes the delivery to the main CP: the task stays reported and the parent accepts it with ONE team_tasks update after checking the evidence, so no reviewer child is spent on a trivial result. Explicit deterministic + autoAccept:true retains the ALL machine-assertions gate, never a semantic waiver, and is the only automatic route. Review tasks and CP/parent orchestration never auto-accept. Existing current-delivery reviewer obligations and CP REWORK verdicts cannot be bypassed; never cancel old reviewers to apply new defaults.",
+		"- cp (Chris Paul — Independent Reviewer & Arbiter): SOLE default independent reviewer (W-rev-*), global architecture/user-scope authority advisor and major technical arbiter, and code reviewer. Runs strictly read-only (read, grep, find, ls, plus kernel bwrap read-only bash for git diff/log/evidence checks). Multiple cp instances may review independent tasks in parallel. If cp hits real provider/tool unavailability or quota errors, the parent falls back cleanly without stalling the goal.",
+		"- booker (Devin Booker — Scorer): High-difficulty/high-risk implementation (complex, cross-module, concurrency, protocol, performance, tough unresolved root-cause fixes) and bounded local technical decisions. Directly eligible with no prerequisite failure count or module-count threshold. Do NOT route routine builds, deployments, or physical/automated tests to booker.",
+		"- bridges (Mikal Bridges — 3&D Workhorse): Default regular implementation, routine bug fixes, batch/mechanical changes, routine code/log scouting (`declaredReadOnly: true`), and serial branch integration.",
+		"- ayton (Deandre Ayton — SDET & Physical QA): Dedicated test writer/runner & physical-device QA — unit/integration/regression tests, LogicQA/UIQA, bug reproduction, raw evidence collection, and authorized real-device/hardware inspection and verification. May own test/artifact writePaths (`tests/`, `artifacts/`) when writing tests or capturing device logs/screenshots; never edits product business logic and does NOT act as default code reviewer.",
+		"- cameron (Cameron Johnson — Release & Ops + Docs): Build & packaging preparation, test-env / physical-device package deployment, release scripts, documentation (`README`, `CHANGELOG`), test plans/checklists, JSONL matrices, and requirement-code-evidence-doc consistency. Does NOT alter core product logic, does NOT duplicate ayton's tests, and does NOT act as default code reviewer.",
+		"Role-routing hard-line: Route ALL automated testing, UIQA, bug reproduction, AND physical-device/hardware QA verification to Ayton (NEVER route testing to Booker). Route builds, packaging, test/device deployment, release assets, and documentation to Cameron. Route routine code spelunking, branch/unmerged-commit inventory, branch-state scouting, worktree residue checks, log searches, and residual cleanup probes to Bridges by default (declare `declaredReadOnly: true` when investigation needs no writes). Reserve CP strictly for `W-rev-*` independent code reviews, global architecture decisions, and major technical arbitration; reserve Booker strictly for high-difficulty/complex/cross-module/protocol/concurrency implementation and tough unresolved troubleshooting.",
+		"Role authority: Booker is the senior executor with bounded local technical decisions within its assigned goal/scope; CP retains global architecture, user-scope changes and major arbitration. Bridges/Ayton/Cameron have execution/reporting authority only, not product decision authority; escalate scope or technical direction choices to CP. Review waiver never grants product decision authority.",
+		"Reviewer independence and exemptions: Ayton (QA/real-device verification) and Cameron (Release/Ops/Docs) with unset reviewTier default to CP-review exemption so test runs, builds/deployments, and docs settle quickly after parent evidence inspection. Booker and Bridges (product code writers) default to independent CP review (`W-rev-*`); explicit reviewTier:none waives review for bounded read-only analysis or small/granular non-decision tasks without requiring autoAccept:true. reviewTier:llm, autoAccept:false or explicit reviewerRole requests independent review for any role. Exemption routes the delivery to the main Head Coach: the task stays reported and the parent accepts it with ONE team_tasks update after checking the evidence, so no reviewer child is spent on routine QA/release deliveries. Explicit deterministic + autoAccept:true retains the ALL machine-assertions gate, never a semantic waiver, and is the only automatic route. Review tasks and CP/parent orchestration never auto-accept. Existing current-delivery reviewer obligations and CP REWORK verdicts cannot be bypassed; never cancel old reviewers to apply new defaults.",
 		"For deliveries requiring independent review, use the ledger's automatically created W-rev-<id> assigned to cp, never self-review by the implementer. Do NOT manually register W-rev-* via team_tasks add. Dispatch the auto-created reviewer with VERDICT and one CRITERION per AC with file:line or observed command evidence; the ledger settles reviewer and worker on verified PASS.",
 		"Parent sideline discipline: delegate ALL code/filesystem investigation, editing (bridges/booker), testing (ayton), docs (cameron), and code review/deep technical audit (cp). Keep only intent analysis, task decomposition, DAG bookkeeping, Agent dispatch, arbitration, and final team_goal acceptance in the main session. Never get impatient while dispatched children are running and start doing their job yourself — wait for completion notices or do one join when no ready work remains.",
 		"Every dispatch brief must include: goal, scope, allowed/forbidden paths, acceptance evidence, and only necessary context (file/symbol/error). Do not transcribe the whole conversation.",
@@ -1837,8 +1837,15 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		};
 	}
 	function refreshHostedRole(ctx: any, prompt?: string): void {
-		if (!isSubagentSession || hostedRole) return;
+		if (!isSubagentSession) return;
 		const entries = ctx?.sessionManager?.getEntries?.() ?? [];
+		if (!subagentAssignedTask) {
+			const mergedEntries = prompt
+				? [...entries, { type: "message", message: { role: "user", content: prompt } }]
+				: entries;
+			subagentAssignedTask = detectSubagentTaskAssignment(mergedEntries as any[]);
+		}
+		if (hostedRole) return;
 		const texts = entries.filter((e: any) => e.type === "message" && e.message?.role === "user").map((e: any) => typeof e.message.content === "string" ? e.message.content : (e.message.content ?? []).map((p: any) => p.text ?? "").join("\n"));
 		if (prompt) texts.push(prompt);
 		for (const text of texts) {
@@ -1846,9 +1853,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			if (!marker) continue;
 			hostedRole = normalizeRole(marker[1]) ?? undefined;
 			const profile = hostedRole ? readAgentProfile(hostedRole, dir) : null;
-			hostedAllowedTools = new Set((profile?.tools ?? []).filter(t => !((hostedRole === "cp" || hostedRole === "ayton") && ["write", "edit", "file_write", "file_edit"].includes(t))));
+			const forceReadOnlyRole = hostedRole === "cp" || (hostedRole === "ayton" && (!subagentAssignedTask || subagentAssignedTask.isReadOnly));
+			hostedAllowedTools = new Set((profile?.tools ?? []).filter(t => !(forceReadOnlyRole && ["write", "edit", "file_write", "file_edit"].includes(t))));
 			if (typeof pi.setActiveTools === "function") pi.setActiveTools([...hostedAllowedTools]);
-			if ((hostedRole === "cp" || hostedRole === "ayton") && !subagentAssignedTask) subagentAssignedTask = { id: `${hostedRole}-readonly`, writePaths: [], isReadOnly: true };
+			if (forceReadOnlyRole && !subagentAssignedTask) subagentAssignedTask = { id: `${hostedRole}-readonly`, writePaths: [], isReadOnly: true };
 			break;
 		}
 	}
@@ -3348,7 +3356,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	function statusText(): string {
 		const lines: string[] = [];
 		lines.push(`工作流：${state.enabled ? "已启用" : "未启用"}　模式：${state.mode}`);
-		lines.push(`角色：CP=主会话 parent（main session，负责全局决策/分析/DAG/调度/最终验收）；cp=可选第二意见 consultant（非每轮必需）；booker=有界分析/复审+难实现；bridges=常规实现；ayton=测试；cameron=文档`);
+		lines.push(`角色：Head Coach=主会话 parent（总控/拆解/DAG/调度/终验）；cp (CP)=独立评审/架构仲裁；booker=核心攻坚；bridges=常规实现/侦察/集成；ayton=全能测试/实机QA；cameron=构建打包/部署/发布文档`);
 		lines.push(`主模型策略：${cfg.mainModelPolicy}（preserve=保持当前模型/思考等级；mode=旧行为按模式切换）`);
 		if (state.startedAt) lines.push(`启用时间：${state.startedAt}`);
 		lines.push(
@@ -4109,8 +4117,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					requestIds: { type: "array", items: { type: "string" } }, dependsOn: { type: "array", items: { type: "string" } },
 					readPaths: { type: "array", items: { type: "string" } }, writePaths: { type: "array", items: { type: "string" } },
 					acceptance: { type: "array", items: { type: "string" } },
-					reviewTier: { type: "string", enum: ["deterministic", "llm", "none"], description: "Unset: Booker defaults review-exempt, other workers default CP review. none: explicit waiver for small non-decision worker read/write tasks. llm: independent CP review. deterministic: existing ALL machine assertions gate with autoAccept:true (the only automatic settlement route). Exemption skips the reviewer child but the parent still accepts the reported delivery. Existing reviewer obligations are preserved." },
-					autoAccept: { type: "boolean", description: "false requests review even for exempt roles; true is required for deterministic machine acceptance, but not for Booker default or reviewTier:none. Never bypasses evidence or existing CP holds." },
+					reviewTier: { type: "string", enum: ["deterministic", "llm", "none"], description: "Unset: Ayton (QA/real-device) & Cameron (Release/Ops/Docs) default review-exempt; Booker & Bridges default CP review. none: explicit waiver for bounded analysis or small non-decision tasks. llm: independent CP review. deterministic: existing ALL machine assertions gate with autoAccept:true (the only automatic settlement route). Exemption skips the reviewer child but the parent still accepts the reported delivery. Existing reviewer obligations are preserved." },
+					autoAccept: { type: "boolean", description: "false requests review even for exempt roles; true is required for deterministic machine acceptance, but not for Ayton/Cameron defaults or reviewTier:none. Never bypasses evidence or existing CP holds." },
 					reviewerRole: { type: "string", description: "Explicit independent reviewer request disables role-based review exemption; defaults do not populate this field. Reviewer must remain independent of implementer." },
 				}, required: ["title", "role", "requestIds", "dependsOn", "readPaths", "writePaths", "acceptance"] } },
 				updates: { type: "array", items: { type: "object", properties: {
@@ -5043,11 +5051,11 @@ export default function teamExtension(pi: ExtensionAPI): void {
 						"📖 /team model 帮助说明：",
 						"\n用于查看与动态调整五人团队各角色的底层大模型及思考程度（即时生效并持久化保存）。",
 						"\n【支持的角色】",
-						"• cp      (Chris Paul)       — 战术决策、代码审核与验收裁决",
-						"• booker  (Devin Booker)     — 复杂实现、攻坚与有界深度分析",
-						"• bridges (Mikal Bridges)    — 常规开发、代码编写与日常调试",
-						"• ayton   (Deandre Ayton)    — 自动化测试、复现与验证（只读执行）",
-						"• cameron (Cameron Johnson)  — 文档编写、测试清单与交付物整理",
+						"• cp      (Chris Paul)       — 独立代码审核、全局架构把关与重大技术仲裁（只读沙盒）",
+						"• booker  (Devin Booker)     — 高难实现、复杂重构、协议并发攻坚与深度排障（默认过 cp 复核）",
+						"• bridges (Mikal Bridges)    — 常规开发、日常修复、只读侦察与分支集成（业务代码默认过 cp 复核）",
+						"• ayton   (Deandre Ayton)    — 自动化/实机测试与验证（可写测试与产物目录，禁改产品源码，默认免二审）",
+						"• cameron (Cameron Johnson)  — 构建打包、测试环境/实机推包部署、验收矩阵与发布文档（默认免二审）",
 						"\n【思考级别可选值】",
 						"• off | minimal | low | medium | high | xhigh | max",
 						"\n【常用命令】",

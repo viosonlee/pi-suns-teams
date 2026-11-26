@@ -377,7 +377,7 @@ export function addTasks(board: WorkLedger, values: unknown, cwd: string, option
 		}
 		const readPaths = paths(spec.readPaths, "readPaths", cwd);
 		const writePaths = paths(rawWritePaths ?? [], "writePaths", cwd);
-		if ((role === "cp" || role === "ayton") && writePaths.length) throw new Error(`${id}: ${role} tasks cannot own writes (received writePaths: ${writePaths.join(", ")}). Fix: set writePaths: [] (and declaredReadOnly: true), or assign write work to booker/bridges/cameron.`);
+		if ((role === "cp") && writePaths.length) throw new Error(`${id}: ${role} tasks cannot own writes (received writePaths: ${writePaths.join(", ")}). Fix: set writePaths: [] (and declaredReadOnly: true), or assign write work to booker/bridges/cameron/ayton (tests/artifacts only).`);
 		const stage = spec.stage === "draft" ? "draft" : "publish";
 		const initialStatus = stage === "draft" ? "planned" : (spec.status === "queued" ? "queued" : "ready");
 		return { id, title: text(spec.title, "title"), requestIds: strings(spec.requestIds, "requestIds", true), role,
@@ -647,7 +647,8 @@ export function reviewDispatchOwnershipProblem(board: WorkLedger, task: WorkTask
 
 export function isWriterTask(task: WorkTask): boolean {
 	if (task.declaredReadOnly === true) return false;
-	if (task.role === "cp" || task.role === "ayton") return false;
+	if (task.role === "cp") return false;
+	if (task.role === "ayton") return task.writePaths.length > 0;
 	return task.writePaths.length > 0 || task.role === "bridges" || task.role === "booker" || task.role === "cameron";
 }
 
@@ -975,8 +976,8 @@ export function ledgerPrompt(board: WorkLedger, _slots = Infinity, validatedBatc
 		})(),
 		`Dispatchable independent batch: ${batch.slice(0, 30).map(t => t.id).join(", ") || "none"}${batch.length > 30 ? ` (+${batch.length - 30} more)` : ""}.`,
 		"New tasks append at the tail. For user urgency/insert requests use team_tasks move front/before/after/tail with a reason. Queue order controls dispatch priority ONLY: do not execute one user request to completion before starting the next. Advance multiple independent requests concurrently by default. Insertion never preempts live children or pauses unrelated work, and cannot bypass real dependencies/conflicts. Prefer splitting deliverables or safely isolating actual workspaces to eliminate avoidable conflicts; minor coordination alone is not a reason to serialize. Dispatch the whole ready independent batch now via background Agent calls with TEAM_TASK: W-id in each prompt. Then do other ready parent work. On any report return, verify only the relevant evidence, accept/rework it, release successors and refill slots immediately; do not wait for a whole wave. Before dispatching, decompose EACH objective as finely as independently executable and verifiable outputs allow. Do not delegate an entire objective as one opaque job when independent components can advance separately. Use multiple child sessions for independent components, including multiple instances of the same role: plan parallelism both WITHIN each objective and ACROSS different objectives. Declare precise per-file/workspace read-write ownership rather than artificial whole-repository conflicts. Avoid meaningless microtasks or unnecessary serial handoff chains. Planned items require explicit dependencies/read-write scopes and acceptance for each resulting deliverable. Serial work requires a real dependency, shared resource, or a stated reason; never invent parallel work or force a minimum worker count.",
-		"ROLE AUTHORITY: Booker is the senior executor and may make bounded local technical decisions within the assigned goal/scope. CP retains global architecture, user-scope changes and major arbitration. Bridges/Ayton/Cameron execute assigned work and report decision needs; they have no decision authority. A review waiver never grants it.",
-		"REVIEW POLICY: Booker with unset reviewTier defaults review-exempt. Other workers default CP review; reviewTier:none explicitly waives review for small/granular non-decision read/write tasks, without requiring autoAccept:true. reviewTier:llm, autoAccept:false or explicit reviewerRole requests independent review. Explicit deterministic + autoAccept:true still requires ALL objective assertions (file:/artifact:, exit code 0); prose test counts are not verified automatically and route to review. CP/parent and review tasks never auto-accept. Exempt reports still need clean complete delivery, tangible evidence and every recognizable machine assertion; incomplete/failed/unverified/pending reports remain reported with rework/verification reasons and blocked dependencies, without an unnecessary automatic reviewer. Existing current-delivery reviewers and CP REWORK obligations remain binding; never cancel old reviewers to apply defaults.",
+		"ROLE AUTHORITY: Booker is the senior executor and may make bounded local technical decisions within the assigned goal/scope. CP retains global architecture, user-scope changes and major arbitration. Bridges/Ayton/Cameron execute assigned work and report decision needs; they have no product decision authority. Ayton owns automated & physical-device testing (may write tests/artifacts, never product business code); Cameron owns build/packaging/device deployment, release assets & docs (never product business code). A review waiver never grants product decision authority.",
+		"REVIEW POLICY: Ayton (QA/real-device verification) and Cameron (Release/Ops/Docs) with unset reviewTier default review-exempt (delivery stays reported for fast parent acceptance, or uses deterministic+autoAccept:true for pure machine assertions). Booker and Bridges (product code writers) default to independent CP review; explicit reviewTier:none waives review for bounded analysis or small non-decision tasks, without requiring autoAccept:true. reviewTier:llm, autoAccept:false or explicit reviewerRole requests independent review. Explicit deterministic + autoAccept:true still requires ALL objective assertions (file:/artifact:, exit code 0); prose test counts are not verified automatically and route to review. CP/parent and review tasks never auto-accept. Exempt reports still need clean complete delivery, tangible evidence and every recognizable machine assertion; incomplete/failed/unverified/pending reports remain reported with rework/verification reasons and blocked dependencies, without an unnecessary automatic reviewer. Existing current-delivery reviewers and CP REWORK obligations remain binding; never cancel old reviewers to apply defaults.",
 		"Reported is not done until verified automatic acceptance or independent/parent acceptance. Unknown/interrupted is not stopped. Scope checks are scheduling metadata, NOT a tool permission sandbox. Resource/port/shared-repo hazards must also be represented in dependencies. GOAL_COMPLETE is blocked by unresolved user requests or unfinished tasks.",
 	].join("\n");
 }
@@ -1014,13 +1015,14 @@ export function isDeterministic(task: WorkTask): boolean {
 export function isReviewExempt(task: WorkTask): boolean {
 	if (isReviewTask(task) || !["booker", "bridges", "ayton", "cameron"].includes(task.role)) return false;
 	if (task.autoAccept === false || task.reviewerRole?.trim()) return false;
-	return task.reviewTier === "none" || (task.role === "booker" && task.reviewTier === undefined);
+	if (task.reviewTier === "none") return true;
+	return task.reviewTier === undefined && (task.role === "ayton" || task.role === "cameron");
 }
 
 /**
  * Deterministic-only automatic settlement.
  *
- * Review exemption (Booker default / explicit `reviewTier: "none"`) changes WHICH reviewer is
+ * Review exemption (Ayton/Cameron default / explicit `reviewTier: "none"`) changes WHICH reviewer is
  * spawned, never whether a delivery counts as accepted: an exempt delivery stays `reported`
  * until the main CP accepts it. Inferring "done" from a subagent's prose was fragile (future
  * tense, Markdown status headings, recovered reports without terminal proof), so the ledger
