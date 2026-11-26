@@ -311,6 +311,62 @@ try {
   assert.ok(h.task("W-sync").evidence.some((e: string) => e.includes("Analyzed module telemetry")), "delivered report is retained on task.evidence for reviewer");
   await h.emit("session_shutdown");
  });
+ await test("v1.2.1 yield guard blocks passivity on ready/reported/unwarned-blockers; cp brief skips self-review and role aligns", async () => {
+  const h = harness(); await h.start();
+  await h.ledger({ action: "add", autoDispatch: false, tasks: [
+   { ...h.spec("W-cp-brief", "cp"), writePaths: [], acceptance: ["Brief complete"] },
+   { ...h.spec("W-ready-extra", "ayton"), writePaths: [], acceptance: ["Checks complete"] },
+  ] });
+  // Cannot yield while ready tasks exist.
+  const yieldOnReady = await h.emit("tool_call", { toolName: "yield_to_subsessions", toolCallId: "y-ready", input: {} });
+  assert.equal(yieldOnReady.block, true);
+  assert.match(yieldOnReady.reason, /ready unconflicted task/);
+  // Launch W-cp-brief even if subagent_type was omitted -> aligns to task's cp role cleanly.
+  const cpStarted = await h.agent({ prompt: "TEAM_TASK: W-cp-brief\nInspect scope", run_in_background: true });
+  assert.equal(cpStarted.isError, false, JSON.stringify(cpStarted));
+  const cpCall = h.calls.find(c => c.name === "spawn_subsession");
+  assert.match(cpCall!.args.prompt, /^PI_TEAMS_HOST_ROLE: cp/);
+  const ayStarted = await h.agent({ subagent_type: "ayton", prompt: "TEAM_TASK: W-ready-extra\nRun checks", run_in_background: true });
+  const ayId = ayStarted.result.details.sessionId;
+  // Poll twice while working to trip pollCounts, then finish on disk -> immediate wait=false must unlock.
+  await h.ctx.executeTool("get_subagent_result", { agent_id: ayId, wait: false });
+  const blockedPoll = await h.ctx.executeTool("get_subagent_result", { agent_id: ayId, wait: false });
+  assert.equal(blockedPoll.isError, true, "second poll while still working blocks");
+  h.children.get(ayId)!.status = "idle";
+  h.children.get(ayId)!.text = "Verification: exit code 0";
+  h.append(ayId, { role: "assistant", content: [{ type: "text", text: "Verification: exit code 0" }], stopReason: "stop" });
+  const unlockedHarvest = await h.result(ayId);
+  assert.equal(unlockedHarvest.details.status, "completed", "disk completion immediately unlocks get_subagent_result(wait=false)");
+  // Finish cp brief -> must stay reported without spawning recursive W-rev-cp-brief, and block yield while reported awaits acceptance.
+  const cpId = cpStarted.result.details.sessionId;
+  h.children.get(cpId)!.status = "idle";
+  h.children.get(cpId)!.text = "Findings: verified file:line";
+  h.append(cpId, { role: "assistant", content: [{ type: "text", text: "Findings: verified file:line" }], stopReason: "stop" });
+  const cpRes = await h.result(cpId);
+  assert.equal(cpRes.details.status, "completed");
+  assert.equal(h.task("W-cp-brief").status, "reported");
+  assert.ok(!h.state().ledger.tasks.some((t: any) => t.parentTaskId === "W-cp-brief"), "cp brief must not create recursive cp-review-cp");
+  const yieldOnReported = await h.emit("tool_call", { toolName: "yield_to_subsessions", toolCallId: "y-rep", input: {} });
+  assert.equal(yieldOnReported.block, true);
+  assert.match(yieldOnReported.reason, /reported delivery/);
+  // Settle both reported tasks, block one new task, and verify blocker escalation blocks once before allowing explicit yield.
+  await h.ledger({ action: "update", autoDispatch: false, updates: [
+   { id: "W-cp-brief", status: "done", evidence: ["verified"], reason: "accepted" },
+   { id: "W-ready-extra", status: "done", evidence: ["exit code 0"], reason: "accepted" },
+  ] });
+  await h.ledger({ action: "add", autoDispatch: false, tasks: [
+   { ...h.spec("W-blocked-need-user", "ayton"), writePaths: [], acceptance: ["device check"] },
+  ] });
+  await h.ledger({ action: "update", autoDispatch: false, updates: [
+   { id: "W-blocked-need-user", status: "blocked", evidence: ["device offline"], reason: "Waiting on physical device access" },
+  ] });
+  const yieldOnBlocker = await h.emit("tool_call", { toolName: "yield_to_subsessions", toolCallId: "y-blk", input: {} });
+  assert.equal(yieldOnBlocker.block, true);
+  assert.match(yieldOnBlocker.reason, /blocked\/uncertain\/failed task/);
+  const yieldAfterWarn = await h.emit("tool_call", { toolName: "yield_to_subsessions", toolCallId: "y-blk2", input: {} });
+  assert.notEqual(yieldAfterWarn.block, true, "second yield for same already-surfaced blocker set does not trap loop");
+  await h.emit("session_shutdown");
+ });
  console.log(`\nTeam host hook tests passed: ${passed}`);
 } finally {
  for (const stop of cleanup) await stop();

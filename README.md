@@ -39,6 +39,14 @@
 - **手动与自动派发协调**：`team_tasks add/update` 的 `autoDispatch:false` 为受影响任务持久保留手动派发权，不影响其他自动任务；用 `Agent` 提供完整任务说明/旧子会话 `resume`，或用 `team_dispatch` 显式释放给自动调度器。同一任务、同一角色的重复派发返回已有运行会话，不新增执行。重新排队的已执行任务默认保留手动恢复权，明确 `autoDispatch:true` 才授权后台重新派发。
 - **内置在线检查与自动更新**：支持一键 `/team check-update` 与 `/team update`。
 
+### v1.2.1：彻底整治主会话消极 `yield`、僵尸 `running` 卡锁与阻塞静默不上报
+
+- **`yield_to_subsessions` 防躺平与阻塞唤醒门禁**：当账本仍有可直接派发的 `ready` 任务、可由主会话验收/处理的 `reported` 交付、或新暴露且未处理/上报的 `blocked` / `uncertain` / `failed` 阻塞项时，拦截静默挂起，强制主会话先拆解派满可用槽位、结算已完成结果或将具体阻塞点明确上报给用户。
+- **修复 `Hosted role does not match` 幽灵 `running` 死锁与报错吞没**：`Agent` 传入/恢复时统一将解析后的角色回写 `subagent_type` 并在 `executeNativeAgent` 对齐台账任务角色；`get_subagent_result` 在遇到 `running + error` 时完整透出错误原因不再误导主会话；`refreshHostedNotifications` 在未获终态且遇错时不永久毒化探活印记。
+- **`manage_subsession(stop)` 与磁盘终态即时回收**：当子会话被停机或磁盘已有终端快照/完成通知时，立即清除 `pollCounts` 并直接放行非阻塞 `get_subagent_result(wait=false)` 完成结算，消除“刚 stop 完却因防轮询被拒收”的卡顿。
+- **豁免 `cp` 只读咨询/简报任务的自我递归 `W-rev-*`**：`role: "cp"` 的独立分析/简报任务交付后直接进入 `reported` 由 Head Coach 验收（除非显式 `reviewTier: "llm"`），消除 `cp` 审 `cp` 陷入 `Review INCOMPLETE` 阻塞死循环。
+- **台账置顶 `ACTION REQUIRED` 与激进拆解引导**：在每次上下文注入的账本头部高亮待派发、待验收和阻塞任务清单，督促主会话按文件粒度或独立 `worktree` 批量填满并发。
+
 ### v1.2.0：方案 B 角色定位重塑（速度 × 质量平衡 + Ayton 实机/测试赋权）
 
 - **解除 `ayton` 的“全盘只读死结”，统一归口自动化与实机测试**：`team-ledger.ts` 与 `team.ts` 允许 `ayton` 在 `writePaths` 中声明测试脚本与日志/截图产物目录（如 `tests/`、`artifacts/`），仅在 `writePaths: []` 时维持内核 `bwrap` 只读沙盒；放开授权范围内的实机/物理设备检验权限，仅严禁修改产品源码或未经授权刷写固件/删数据，避免实机测试再误派给 `booker`。

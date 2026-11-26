@@ -19,7 +19,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import {
 	newLedger, addRequest, addTasks, addBacklog, updateTask, resolveRequest, terminalWork, liveWork, occupiesSlot,
 	readyTasks, dispatchBatch, markDispatched, observeTask, completionBlockers, ledgerPrompt, moveTask, archivePrompt,
-	taskConflict, parseTeamTaskId, isDeterministic, isReviewExempt, autoAcceptTask, createReviewerTask, nextDispatchableTasks,
+	taskConflict, parseTeamTaskId, isDeterministic, isReviewExempt, isReviewTask, autoAcceptTask, createReviewerTask, nextDispatchableTasks,
 	reviewerTaskId, completeReviewTask, publishTasks, overlap, recordReview, deliveryVersionOf, reviewRecordsOf,
 	reclaimStaleReviews, isActiveReviewHold, scopeBlockingLive, REVIEW_STALE_MS, pruneStaleReviews,
 	setManualDispatchHold, releaseManualDispatchHold,
@@ -73,7 +73,7 @@ const TEAM_EXTENSION_PATH = (() => {
 })();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.2.0";
+export const PI_TEAMS_VERSION = "1.2.1";
 export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
@@ -1409,7 +1409,7 @@ export function buildPolicy(mode: Mode, cfg: TeamConfig): string {
 		"Use team_tasks to maintain the persistent additive request/task ledger before dispatch. A new user request adds scope; it never implicitly cancels older requests, tasks, or acceptance conditions. Resolve each request with evidence (including answered/non-actionable messages); cancellation/supersession needs explicit user authority, reason and source evidence.",
 		"Decompose work into independently verifiable deliverables, not one large role-shaped bundle. Register request IDs, dependencies, concrete read/write scopes and acceptance. Include TEAM_TASK: W-id in each Agent prompt. Parent tasks may cover decisive analysis/acceptance; retain separate integration/regression/cleanup obligations where needed.",
 		"Deterministic Scheduler & Concurrency Utilization: The deterministic Scheduler automatically manages subagent capacity up to 20 concurrency slots. Calling team_tasks or team_dispatch programmatically auto-dispatches all ready independent tasks in parallel and auto-backfills empty slots immediately as subtasks complete. Explicit deterministic + autoAccept:true deliverables with ALL objective assertions verified (file/artifact existence, exit code 0) auto-accept and unlock successors; declare test counts as `exit code 0` criteria instead, prose counts route to review. Review-exempt deliveries skip the reviewer child but still need one parent acceptance call; batch those acceptances with the next dispatch instead of reviewing trivia.",
-		"Scheduling is rolling, not wave/barrier based: dispatch the full ready independent batch, then work on other ready items; as each child returns, accept/rework its evidence, unlock successors and refill free slots without waiting for unrelated children. Only block on result retrieval when no compatible ready work remains. State a real dependency/resource/permission reason for serial work; do not invent parallel work or force a minimum worker count.",
+		"Scheduling is rolling, not wave/barrier based: proactively analyze ALL open user requests upfront and decompose independent items into fine file-scoped or worktree-isolated W-* tasks to keep up to 20 parallel slots filled—never trickle 1-3 tasks and yield while open backlog remains. As each child returns, immediately settle reported work, unlock successors, split write-scope bottlenecks into independent worktrees where appropriate, and refill free slots. NEVER use yield_to_subsessions to dodge a scope lock, blocked reviewer, or unresolved dependency: resolve/split/reconcile what you can now, OR explicitly escalate every concrete blocker and needed human decision directly to the user before stopping/yielding.",
 		"Prefer Agent resume for rework when the existing worker's role and cwd still fit the task; do not restart only to repeat background. Existing children retain their creation-time role snapshot. If an old child refuses an approved task because its role instructions are obsolete, confirm it has stopped, then start a fresh child with a concise evidence handoff; do not repeatedly resume the obsolete role or duplicate live writes.",
 		"Dispatch every ready independent task in the same response via background Agent calls (run_in_background: true); do not serialize work that has no real dependency. Multiple workers of the same role are allowed; do not start all roles by default.",
 		"Long tasks (expected >5 minutes, real devices, long tests, broad regressions) use run_in_background: true and get_subagent_result; foreground waits can be interrupted and misrecorded as failures.",
@@ -2156,7 +2156,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					runId: task.runId,
 					reportNotBefore: task.dispatchedAt,
 				});
-				if (res.isError && !res.completion && res.error) hostedProbedStamps.delete(stamp);
+				if (!res.completion && (res.isError || res.error)) hostedProbedStamps.delete(stamp);
 			}));
 		} finally { hostedHarvestActive = false; }
 	}
@@ -2300,7 +2300,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 							dirty = true;
 						}
 					}
-					if (isReviewExempt(task)) {
+					const cpBriefExempt = task.role === "cp" && !isReviewTask(task) && task.autoAccept !== false && !task.reviewerRole?.trim() && task.reviewTier !== "llm";
+					if (isReviewExempt(task) || cpBriefExempt) {
 						// Review exemption routes the delivery to the main CP instead of a spawned reviewer.
 						// It never infers "done" from the child's prose: the task stays "reported" until the
 						// parent accepts it with one team_tasks update after checking the report evidence.
@@ -2382,6 +2383,19 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	function reconcileBacklog(): void {
 		if (state.goal) state.goal.nextTasks = board().tasks.filter(t => !terminalWork(t.status)).map(t => t.title);
 	}
+	function allReadyTasksToDispatch(): ReturnType<typeof readyTasks> {
+		const now = Date.now();
+		settleReclaimedReviews(now);
+		return readyTasks(board(), now).filter(task =>
+			task.role !== "parent"
+			&& !((task as any).nextRetryAt && (task as any).nextRetryAt > now)
+			&& !heldConflict(task)
+			&& !decideCall({
+				role: task.role as Role, prompt: task.title,
+				state, cfg, prices, activeCount: runningCount(),
+			}).block,
+		);
+	}
 	function schedulableBatch(): ReturnType<typeof dispatchBatch> {
 		const now = Date.now();
 		settleReclaimedReviews(now);
@@ -2400,7 +2414,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		ctx: any,
 		signal?: AbortSignal,
 	): Promise<any> {
-		const rawRole = params.subagent_type ?? params.role;
+		const runId = typeof params.run_id === "string" && params.run_id ? params.run_id : `T-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+		const task = board().tasks.find(t => runId && t.runId === runId);
+		const rawRole = params.subagent_type ?? params.role ?? task?.role;
 		const role = normalizeRole(rawRole) || "bridges";
 		const prompt = typeof params.prompt === "string" ? params.prompt : "";
 		const description = typeof params.description === "string" && params.description.trim()
@@ -2423,12 +2439,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 		const resume = typeof params.resume === "string" && params.resume.trim() ? params.resume.trim() : undefined;
 		const hosted = resume ? usesHostedTransport(resume) : hasHostTools();
-		const runId = typeof params.run_id === "string" && params.run_id ? params.run_id : `T-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 		if (!runs.some(r => r.taskId === runId)) {
 			const receipt: RunRecord = { taskId: runId, role, description, status: "running", at: new Date().toISOString(), executionTransport: hosted ? "hosted" : "native" };
 			runs.push(receipt); pi.appendEntry(RUN_TYPE, receipt);
 		}
-		const task = board().tasks.find(t => runId && t.runId === runId);
 		if (task) task.executionTransport = hosted ? "hosted" : "native";
 		const record = [...runs].reverse().find(r => r.taskId === runId);
 		if (record) record.executionTransport = hosted ? "hosted" : "native";
@@ -2582,6 +2596,29 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	const waitCounts = new Map<string, number>();
 	const syncConsumedCompletions = new Set<string>();
 	const sentCompletionNotices = new Set<string>();
+	let yieldedBlockerWarnedDigest = "";
+	function isHostedFinishedOnDisk(sessionId: string): boolean {
+		const live = board().tasks.find(t => t.sessionId === sessionId && (t.status === "running" || t.status === "uncertain"));
+		const currentCtx = ctxStore.current;
+		const baseOpts = hostedOptions(currentCtx ?? {});
+		if (hasHostedTerminalSnapshotOnDisk(sessionId, {
+			agentDir: baseOpts.agentDir,
+			parentSessionId: baseOpts.parentSessionId,
+			parentSessionFile: baseOpts.parentSessionFile,
+			reportNotBefore: live?.dispatchedAt,
+			runId: live?.runId,
+		})) {
+			return true;
+		}
+		const entries = (currentCtx?.sessionManager?.getEntries?.() ?? []) as Array<{ type?: string; customType?: string; timestamp?: string; details?: Record<string, unknown> }>;
+		const dispatchedMs = live?.dispatchedAt ? Date.parse(live.dispatchedAt) : NaN;
+		return entries.some(e =>
+			e.type === "custom_message" &&
+			e.customType === "subsession.completion" &&
+			e.details?.sessionId === sessionId &&
+			(!Number.isFinite(dispatchedMs) || (typeof e.timestamp === "string" && Number.isFinite(Date.parse(e.timestamp)) && Date.parse(e.timestamp) >= dispatchedMs)),
+		);
+	}
 	function clearChildPollState(sessionId: string): void {
 		pollCounts.delete(sessionId);
 		waitCounts.delete(sessionId);
@@ -2614,6 +2651,43 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					reason: "Native team children are running outside pi-web's subsession tracker, so yield_to_subsessions cannot observe them and would return immediately. Dispatch any remaining ready tasks or end your turn normally without calling yield_to_subsessions; completion notices wake this session automatically.",
 				};
 			}
+			const ready = allReadyTasksToDispatch();
+			if (ready.length > 0) {
+				const sample = ready.slice(0, 6).map(t => `${t.id}(${t.role})`).join(", ");
+				const extra = ready.length > 6 ? ` (+${ready.length - 6} more)` : "";
+				return {
+					block: true,
+					reason: `Cannot yield_to_subsessions while ${ready.length} ready unconflicted task(s) can dispatch now: ${sample}${extra}. Dispatch them via Agent or team_dispatch first to fill available concurrency slots instead of sleeping.`,
+				};
+			}
+			const openTasks = board().tasks.filter(t => !terminalWork(t.status));
+			const actionableReported = openTasks.filter(t => {
+				if (t.status !== "reported") return false;
+				if (isReviewTask(t)) return true;
+				const rev = openTasks.find(r => r.id === reviewerTaskId(t.id) && r.reviewedDeliveryVersion === deliveryVersionOf(t));
+				return !(rev && (rev.status === "ready" || rev.status === "running" || rev.status === "queued"));
+			});
+			if (actionableReported.length > 0) {
+				const sample = actionableReported.slice(0, 6).map(t => `${t.id}(${t.role})`).join(", ");
+				const extra = actionableReported.length > 6 ? ` (+${actionableReported.length - 6} more)` : "";
+				return {
+					block: true,
+					reason: `Cannot yield_to_subsessions while ${actionableReported.length} reported delivery(ies) await parent acceptance, rework dispatch, or blocker resolution: ${sample}${extra}. Accept clean deliveries via team_tasks update status="done", unblock/rework failed chains, or report blockers to the user instead of sleeping.`,
+				};
+			}
+			const blockers = openTasks.filter(t => t.status === "blocked" || t.status === "uncertain" || t.status === "failed");
+			if (blockers.length > 0) {
+				const digest = blockers.map(b => `${b.id}:${b.status}:${(b.reason || "").slice(0, 60)}`).sort().join("|");
+				if (digest !== yieldedBlockerWarnedDigest) {
+					yieldedBlockerWarnedDigest = digest;
+					const summary = blockers.slice(0, 6).map(b => `${b.id}[${b.status}]${b.reason ? `(${b.reason.slice(0, 60)})` : ""}`).join("; ");
+					const extra = blockers.length > 6 ? ` (+${blockers.length - 6} more)` : "";
+					return {
+						block: true,
+						reason: `Cannot quietly yield_to_subsessions while ${blockers.length} blocked/uncertain/failed task(s) need action or user escalation: ${summary}${extra}. Resolve/reconcile/split worktrees for what can move now, OR report these exact blockers and needed decisions directly to the user in your message BEFORE yielding.`,
+					};
+				}
+			}
 		}
 		// Polling guard applies even when native spawning is disabled for tests: it only reads state.
 		const pollTarget = typeof input?.sessionId === "string" ? input.sessionId
@@ -2626,6 +2700,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					reason: `${pollTarget} is a pi-teams native child process, not a pi-web tracked subsession. ${toolName} only inspects spawn_subsession children. Use get_subagent_result(agent_id="${pollTarget}", wait=false) once or wait for its automatic completion notice.`,
 				};
 			}
+			if (toolName === "get_subagent_result" && input?.wait !== true && hostedTarget && isHostedFinishedOnDisk(pollTarget)) {
+				clearChildPollState(pollTarget);
+				return undefined;
+			}
 			// Working = native child still running, or a ledger attempt that has not delivered yet
 			// (hosted/pi-web children are tracked by the ledger rather than the native registry).
 			const working = isSubagentActive(pollTarget)
@@ -2635,7 +2713,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				return undefined;
 			}
 			const live = board().tasks.find(t => t.sessionId === pollTarget && (t.status === "running" || t.status === "uncertain"));
-			const ready = schedulableBatch();
+			const ready = allReadyTasksToDispatch();
 			// An explicit wait is a real join, allowed at most once per running attempt so it cannot hit ACP's 5-call repetition abort.
 			if (toolName === "get_subagent_result" && input?.wait === true) {
 				const waitSeen = waitCounts.get(pollTarget) ?? 0;
@@ -2679,6 +2757,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			if (action === "stop" && isSubagentActive(target)) {
 				const stopped = stopSubagent(target);
 				return { block: true, reason: `${target} is a pi-teams child process, not a pi-web run; ${stopped ? "pi-teams sent it SIGTERM instead (its ledger task settles as aborted when it exits)" : "it already exited"}. Do not retry manage_subsession for team children.` };
+			}
+			if (action === "stop") {
+				clearChildPollState(target);
 			}
 			if (action === "resume") {
 				return { block: true, reason: `${target} is a pi-teams child; resuming it through pi-web bypasses the ledger${isSubagentActive(target) ? " and would write its session file concurrently with the running process" : ""}. Fix: ${isSubagentActive(target) ? "wait for its completion notice (or get_subagent_result wait=false), then " : ""}use Agent with resume="${target}" and the TEAM_TASK line for rework.` };
@@ -3481,6 +3562,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		syncConsumedCompletions.clear();
 		sentCompletionNotices.clear();
 		hostedProbedStamps.clear();
+		yieldedBlockerWarnedDigest = "";
 		restoreFromSession(ctx); loadRecoveredKeys(activeEntries(ctx)); loadLeases(ctx);
 		if (state.enabled && !isSubagentSession && !state.ledger) { board(); persist(); }
 		setStatusText(ctx);
@@ -3664,7 +3746,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		}
 		if (toolName === "get_subagent_result") {
 			const input = event.input as Record<string, unknown>;
-			const ready = schedulableBatch();
+			const ready = allReadyTasksToDispatch();
 			if (input.wait === true && ready.length > 0) {
 				const sample = ready.slice(0, 10).map(t => `${t.id}(${t.role})`).join(", ");
 				const extra = ready.length > 10 ? ` (+${ready.length - 10} more)` : "";
@@ -3681,8 +3763,11 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		const resumeId = typeof input.resume === "string" && input.resume.trim() ? input.resume.trim() : undefined;
 		const resumeRole = resumeId ? leaseOwner(resumeId)?.role ?? [...leases.values()].reverse().find(t => t.sessionId === resumeId)?.role ?? [...board().tasks].reverse().find(t => t.sessionId === resumeId)?.role ?? sessionRuns().reverse().find(r => r.sessionId === resumeId)?.role : undefined;
 		if (resumeId && !resumeRole) return { block: true, reason: `Unknown resume child ownership (resume=${resumeId}); only known parent-owned children can resume in an enabled team. Fix: omit "resume" to launch a fresh child, or check valid sessionIds via team_tasks action="list".` };
-		const role = normalizeRole(input.subagent_type ?? resumeRole);
+		const preWorkId = /^[ \t]*TEAM_TASK:[ \t]*(W-[A-Za-z0-9_.-]+)/m.exec(prompt)?.[1];
+		const preWorkTask = preWorkId ? board().tasks.find(t => t.id === preWorkId) : undefined;
+		const role = normalizeRole(input.subagent_type ?? preWorkTask?.role ?? resumeRole);
 		if (!role) return { block: true, reason: `Unsupported or missing subagent_type ("${String(input.subagent_type ?? "")}"). Enabled team parents must use a supported team role (cp, booker, bridges, ayton, cameron). Fix: set subagent_type to the TEAM_TASK's owning role.` };
+		input.subagent_type = role;
 		if (resumeId && (leaseOwner(resumeId) || legacyHeld(resumeId))) {
 			const owner = leaseOwner(resumeId);
 			const ownerInfo = owner ? ` (owned by ${owner.id}, status=${owner.status})` : "";
@@ -4440,12 +4525,15 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		if (hosted) await refreshHostedNotifications(ctx);
 		refreshNativeNotifications(ctx);
 		if (res.status === "running") {
+			const errDetail = "error" in res && typeof res.error === "string" && res.error.trim() ? res.error.trim() : "";
 			const msg = hosted
-				? `Subagent ${sessionId} is still running in pi-web. Do NOT call get_subagent_result again — call yield_to_subsessions (alone and last) or end your turn to wait for its automatic completion notice.`
-				: `Subagent ${sessionId} is still running.`;
+				? errDetail
+					? `Subagent ${sessionId} did not settle cleanly (${errDetail}). Inspect/reconcile this task instead of blindly calling yield_to_subsessions.`
+					: `Subagent ${sessionId} is still running in pi-web. Do NOT call get_subagent_result again — call yield_to_subsessions (alone and last) or end your turn to wait for its automatic completion notice.`
+				: `Subagent ${sessionId} is still running.${errDetail ? ` (${errDetail})` : ""}`;
 			return {
 				content: [{ type: "text" as const, text: msg }],
-				details: { sessionId, status: "running", ...("error" in res && res.error ? { error: res.error } : {}) },
+				details: { sessionId, status: "running", ...(errDetail ? { error: errDetail } : {}) },
 				isError: "isError" in res && res.isError === true,
 			};
 		}
@@ -4999,6 +5087,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				syncConsumedCompletions.clear();
 				sentCompletionNotices.clear();
 				hostedProbedStamps.clear();
+				yieldedBlockerWarnedDigest = "";
 				state.calls = { cp: 0, booker: 0, bridges: 0, ayton: 0, cameron: 0 };
 				state.failures = { cp: 0, booker: 0, bridges: 0, ayton: 0, cameron: 0 };
 				state.spendUSD = 0;

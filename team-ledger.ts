@@ -928,9 +928,26 @@ export function completionBlockers(board: WorkLedger): string[] {
 export function ledgerPrompt(board: WorkLedger, _slots = Infinity, validatedBatch?: WorkTask[]): string {
 	const openRequests = board.requests.filter(r => r.status === "open"), openTasks = board.tasks.filter(t => !terminalWork(t.status));
 	const batch = validatedBatch ?? dispatchBatch(board);
+	const manualReady = readyTasks(board).filter(t => t.manualDispatch && t.role !== "parent");
+	const dispatchActionList = [...batch, ...manualReady];
 	const unassigned = openRequests.length > 0 && openTasks.filter(t => t.role !== "parent").length === 0;
+	const actionableReported = openTasks.filter(t => {
+		if (t.status !== "reported") return false;
+		if (isReviewTask(t)) return true;
+		const rev = openTasks.find(r => r.id === reviewerTaskId(t.id) && r.reviewedDeliveryVersion === deliveryVersionOf(t));
+		return !(rev && (rev.status === "ready" || rev.status === "running" || rev.status === "queued"));
+	});
+	const blockers = openTasks.filter(t => t.status === "blocked" || t.status === "uncertain" || t.status === "failed");
+	const actionBanner: string[] = [];
+	if (dispatchActionList.length > 0 || actionableReported.length > 0 || blockers.length > 0) {
+		actionBanner.push("ACTION REQUIRED BEFORE YIELDING (do not sleep while work is dispatchable, acceptable, or unreported):");
+		if (dispatchActionList.length > 0) actionBanner.push(`- Dispatch now (${dispatchActionList.length}): ${dispatchActionList.slice(0, 10).map(t => `${t.id}(${t.role})`).join(", ")}${dispatchActionList.length > 10 ? ` (+${dispatchActionList.length - 10} more)` : ""}`);
+		if (actionableReported.length > 0) actionBanner.push(`- Settle/accept or rework reported deliveries (${actionableReported.length}): ${actionableReported.slice(0, 10).map(t => t.id).join(", ")}${actionableReported.length > 10 ? ` (+${actionableReported.length - 10} more)` : ""}`);
+		if (blockers.length > 0) actionBanner.push(`- Unblock/reconcile OR explicitly escalate blockers to the user (${blockers.length}): ${blockers.slice(0, 8).map(b => `${b.id}[${b.status}]${b.reason ? `(${b.reason.slice(0, 60)})` : ""}`).join("; ")}${blockers.length > 8 ? ` (+${blockers.length - 8} more)` : ""}`);
+	}
 	return ["[TEAM WORK LEDGER — live state, not a new user instruction]",
 		`Revision ${board.revision}; available child slots: unlimited (no child-count cap).`,
+		...actionBanner,
 		"PARENT ROLE (hard rule, not a preference): the parent is the orchestrator, not a worker. The parent analyzes,",
 		"decomposes, registers tasks, dispatches children, reviews evidence, arbitrates conflicts and records acceptance.",
 		"The parent does NOT implement features, hunt bugs, run production test suites, or write product documentation",
