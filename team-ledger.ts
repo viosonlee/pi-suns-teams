@@ -406,6 +406,14 @@ export function addTasks(board: WorkLedger, values: unknown, cwd: string, option
 			if (writePaths.length >= 6) {
 				throw new Error(`${id}: too many writePaths (${writePaths.length}) in one task. Split into smaller parallel 1-3 file slices (scout exact files first with read-only bridges if needed), or pass splitWaiverReason if strictly indivisible.`);
 			}
+			const rawWorktreePath = typeof spec.worktreePath === "string" && spec.worktreePath.trim() ? resolve(cwd, spec.worktreePath.trim()) : undefined;
+			const isSeparateWorktree = isolation === "worktree" || Boolean(rawWorktreePath && rawWorktreePath !== resolve(cwd));
+			if (isSeparateWorktree && rawList.length > 0) {
+				const isDocLikePath = (p: string) => /\.(?:md|mdx|txt|rst|csv|jsonl?)$/i.test(p) || /(?:^|\/)(?:docs?|checklists?|reports?|notes?)\//i.test(p.replace(/\\/g, "/"));
+				if (rawList.every(isDocLikePath)) {
+					throw new Error(`${id}: do not spawn a separate git worktree for pure documentation/checklist/report files (${rawList.join(", ")}). Use file-scoped writePaths in the shared workspace (WORKTREE_NOT_USED), or pass splitWaiverReason if same-file contention is unavoidable.`);
+				}
+			}
 		}
 		const stage = spec.stage === "draft" ? "draft" : "publish";
 		const initialStatus = stage === "draft" ? "planned" : (spec.status === "queued" ? "queued" : "ready");
@@ -427,6 +435,24 @@ export function addTasks(board: WorkLedger, values: unknown, cwd: string, option
 			...(splitWaiverReason ? { splitWaiverReason } : {}) };
 	});
 	const all = [...board.tasks, ...created];
+	const normCwd = resolve(cwd);
+	const activeExtraWtRoots = new Set<string>();
+	for (const t of all) {
+		if (terminalWork(t.status)) continue;
+		const wt = typeof t.worktreePath === "string" && t.worktreePath.trim() ? resolve(cwd, t.worktreePath.trim()) : "";
+		if (wt && wt !== normCwd) activeExtraWtRoots.add(wt);
+		else if (t.isolation === "worktree" && !wt) activeExtraWtRoots.add(`anon:${t.id}`);
+	}
+	if (activeExtraWtRoots.size > 5) {
+		const addsExtraWtWithoutWaiver = created.some(t => {
+			if (t.id.startsWith("W-rev-") || t.parentTaskId || t.role === "parent" || t.splitWaiverReason) return false;
+			const wt = typeof t.worktreePath === "string" && t.worktreePath.trim() ? resolve(cwd, t.worktreePath.trim()) : "";
+			return t.isolation === "worktree" || Boolean(wt && wt !== normCwd);
+		});
+		if (addsExtraWtWithoutWaiver) {
+			throw new Error(`Too many concurrent isolated worktrees (${activeExtraWtRoots.size}; max 5 without splitWaiverReason). Use file-scoped shared-workspace parallelism or merge and clean up existing worktrees (/team gc --worktrees) before spawning more.`);
+		}
+	}
 	if (new Set(all.map(t => t.id)).size !== all.length) {
 		const seen = new Set<string>();
 		const dups = new Set<string>();

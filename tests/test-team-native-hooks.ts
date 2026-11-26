@@ -32,7 +32,7 @@ const add = (message) => { const id = Math.random().toString(16).slice(2, 10); f
 add({ role: "user", content: prompt, timestamp: Date.now() });
 if (prompt.includes("SLEEP-ME")) { await new Promise((r) => setTimeout(r, 30000)); }
 if (prompt.includes("CRASH-ME")) { process.stderr.write("boom: segfault in provider\\n"); process.exit(3); }
-if (prompt.includes("QUOTA-ME") && model !== "fb/model") { add({ role: "assistant", content: [], stopReason: "error", errorMessage: "429 rate limit exceeded: quota exhausted", timestamp: Date.now() }); process.exit(0); }
+if ((prompt.includes("QUOTA-ME") && model !== "fb/model") || (prompt.includes("QUOTA-ALWAYS") && model !== "manual/override")) { add({ role: "assistant", content: [], stopReason: "error", errorMessage: "429 rate limit exceeded: quota exhausted", timestamp: Date.now() }); process.exit(0); }
 add({ role: "assistant", content: [{ type: "text", text: "Implemented. Evidence: exit 0." }], stopReason: "stop", timestamp: Date.now() });
 `, { mode: 0o755 });
 const argvLog = join(root, "argv.log");
@@ -73,7 +73,7 @@ function harness() {
 	};
 	team(pi);
 	return {
-		ctx, tools, notes, messages, entries,
+		ctx, tools, commands, notes, messages, entries,
 		state: () => [...entries].reverse().find((e) => e.customType === "team-state")?.data,
 		task: (id: string) => [...entries].reverse().find((e) => e.customType === "team-state")?.data.ledger.tasks.find((t: any) => t.id === id),
 		async emit(name: string, event: any = {}) { let e = event; for (const f of hooks.get(name) ?? []) { const p = await f(e, ctx); if (p) e = { ...e, ...p }; } return e; },
@@ -185,6 +185,42 @@ try {
 		await h.emit("tool_result", { toolName: "Agent", toolCallId: "call-c", input: call.input, isError: false, details: res.details, content: res.content });
 		await until(() => h.task("W-c")?.status === "failed", "W-c failed");
 		assert.match(h.task("W-c").reason, /boom: segfault/);
+	});
+
+	await test("paused role unlocks on explicit different model and /team model command (without overwriting input.model)", async () => {
+		// Exhaust the remaining bridges fallback (`fb/model`) with QUOTA-ALWAYS so `unavailable.bridges` is set
+		await h.ledger({ action: "add", autoDispatch: false, tasks: [spec(q, "W-pause")] });
+		const c1 = await h.emit("tool_call", { toolName: "Agent", toolCallId: "call-p1", input: { subagent_type: "bridges", prompt: "TEAM_TASK: W-pause\nQUOTA-ALWAYS fail." } });
+		assert.notEqual(c1.block, true, c1.reason);
+		const r1 = await h.tools.get("Agent").execute("call-p1", c1.input, undefined, undefined, h.ctx);
+		await h.emit("tool_result", { toolName: "Agent", toolCallId: "call-p1", input: c1.input, isError: false, details: r1.details, content: r1.content });
+		await until(() => Boolean(h.state().unavailable?.bridges), "bridges paused on exhausted fallback");
+		assert.equal(h.state().unavailableModel?.bridges, "fb/model");
+
+		// Calling without an explicit model is blocked while paused
+		await h.ledger({ action: "add", autoDispatch: false, tasks: [spec(q, "W-pause-2")] });
+		const blocked = await h.emit("tool_call", { toolName: "Agent", toolCallId: "call-p2", input: { subagent_type: "bridges", prompt: "TEAM_TASK: W-pause-2\nTry same model." } });
+		assert.equal(blocked.block, true);
+
+		// Calling with explicit different model (`manual/override`) bypasses stale pause AND preserves `input.model`
+		const bypass = await h.emit("tool_call", { toolName: "Agent", toolCallId: "call-p3", input: { subagent_type: "bridges", model: "manual/override", prompt: "TEAM_TASK: W-pause-2\nQUOTA-ALWAYS succeed on manual." } });
+		assert.notEqual(bypass.block, true, bypass.reason);
+		assert.equal(bypass.input.model, "manual/override", "applyRoleModelOverrides must not overwrite explicit input.model");
+		const r3 = await h.tools.get("Agent").execute("call-p3", bypass.input, undefined, undefined, h.ctx);
+		await h.emit("tool_result", { toolName: "Agent", toolCallId: "call-p3", input: bypass.input, isError: false, details: r3.details, content: r3.content });
+		await until(() => !h.state().unavailable?.bridges && ["reported", "reviewing", "done"].includes(h.task("W-pause-2")?.status), "success with manual model clears pause and settles task");
+
+		// Re-pause via QUOTA-ALWAYS, then run `/team model bridges switched/model` and verify lock clears
+		await h.ledger({ action: "add", autoDispatch: false, tasks: [spec(q, "W-pause-3")] });
+		const c4 = await h.emit("tool_call", { toolName: "Agent", toolCallId: "call-p4", input: { subagent_type: "bridges", prompt: "TEAM_TASK: W-pause-3\nQUOTA-ALWAYS fail again." } });
+		const r4 = await h.tools.get("Agent").execute("call-p4", c4.input, undefined, undefined, h.ctx);
+		await h.emit("tool_result", { toolName: "Agent", toolCallId: "call-p4", input: c4.input, isError: false, details: r4.details, content: r4.content });
+		await until(() => Boolean(h.state().unavailable?.bridges), "bridges re-paused");
+
+		await h.commands.get("team").handler("model bridges switched/model", h.ctx);
+		assert.equal(h.state().roleModel?.bridges, "switched/model");
+		assert.equal(h.state().unavailable?.bridges, undefined, "/team model must clear stale unavailable lock");
+		assert.equal(h.state().fallbackTried?.bridges, undefined, "/team model must reset fallbackTried");
 	});
 
 	await test("after session_shutdown the instance no longer reacts to child completions", async () => {

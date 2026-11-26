@@ -22,6 +22,7 @@ CORE_FILES=(
   "team-ledger.ts"
   "team-recovery.ts"
   "team-gc.ts"
+  "team-worktree.ts"
   "team-review.ts"
   "team-review-evidence.ts"
   "team-scope.ts"

@@ -47,6 +47,12 @@ import {
 	type ChildGcResult,
 } from "../team-gc.ts";
 import {
+	auditWorktrees,
+	cleanupSafeWorktrees,
+	DEFAULT_WORKTREE_GRACE_MS,
+	type WorktreeCleanupResult,
+} from "../team-worktree.ts";
+import {
 	launchNativeSubagent,
 	getSubagentResult,
 	onSubagentComplete,
@@ -73,7 +79,7 @@ const TEAM_EXTENSION_PATH = (() => {
 })();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.2.2";
+export const PI_TEAMS_VERSION = "1.2.3";
 export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
@@ -220,6 +226,11 @@ export interface TeamState {
 	roleThinking?: Partial<Record<Role, string>>;
 	/** 额度不足 / 鉴权失败而暂停的角色。 */
 	unavailable: Partial<Record<Role, string>>;
+	/** 触发暂停时正在使用的模型及时间戳（用于换模型/改配置/过冷静期后自动解除锁定）。 */
+	unavailableModel?: Partial<Record<Role, string>>;
+	unavailableAt?: Partial<Record<Role, number>>;
+	/** 由额度失败自动切换备用模型时记录的原基础模型，便于配置更新后失效旧粘滞模型。 */
+	autoFallbackBase?: Partial<Record<Role, string>>;
 	/** 已尝试过的备用模型索引。 */
 	fallbackTried: Partial<Record<Role, number>>;
 	/** Legacy state compatibility only; restored as 0, never a budget gate. */
@@ -359,6 +370,9 @@ export function initialState(cfg: TeamConfig): TeamState {
 		roleModel: {},
 		roleThinking: {},
 		unavailable: {},
+		unavailableModel: {},
+		unavailableAt: {},
+		autoFallbackBase: {},
 		fallbackTried: {},
 		budgetOverrideUSD: 0,
 		limitsOff: true,
@@ -646,6 +660,7 @@ export function buildParallelWorktreePolicy(): string {
 		"Multiple workers of the same role are allowed; do not start all five roles by default. Testing and documentation discovery may overlap implementation when independent; dependent final tests and integration wait for their inputs.",
 		"Never let two workers write the same shared files, git index, or branch concurrently. A git worktree isolates files and the index but NOT external devices, databases, ports, or build resources/caches: allocate unique resources per worker or serialize those tasks.",
 		"Use worktree isolation intentionally: only inside a git repository and only for writable independent tasks. Read-only review/test/discovery work, trivial edits, and non-git directories do not need a worktree; do not inject isolation unconditionally.",
+		"Default to file-scoped shared-workspace parallelism (`WORKTREE_NOT_USED`): disjoint source files, docs, checklists, and tests run in the shared workspace without extra worktrees. Reserve temporary worktrees strictly for true same-file concurrent source collisions — never spawn separate worktrees for docs/, checklists/, or non-conflicting files, and avoid duplicating heavy build caches (`bin/`, `obj/`, `node_modules/`) inside throwaway trees.",
 		"Same-file independent code changes may run in isolated worktrees behind an agreed interface and be integrated serially afterwards. Actually dependent tasks wait for their dependency to land; do not parallelize them.",
 		"One integration owner per repository (normally bridges; booker only for already-escalated work). CP only reviews; ayton tests and does not merge product code.",
 		"Child workers may create their own temporary worktree with `git worktree add -b <unique-branch> <path> <agreed-base>` and must record ownership (task id, path, branch, base SHA). For writable work that must be retained, prefer a parent-managed/manual worktree.",
@@ -655,7 +670,7 @@ export function buildParallelWorktreePolicy(): string {
 		"After verified integration and evidence preservation, the integration owner promptly checks that the task branch is merged into the designated target and the task-owned worktree is clean, removes it with `git worktree remove`, deletes only the merged task-owned branch with `git branch -d`, and verifies absence via worktree/branch listings. If native cleanup already removed the tree, verify absence and still clean the merged task branch. Cleanup is part of delivery, not a later optional chore.",
 		"Refuse to integrate into a dirty target, on conflicts, or when cleanup would be unsafe: report INTEGRATION_PENDING or CLEANUP_PENDING as unresolved. Never claim complete/GOAL_COMPLETE while your own integration or cleanup is pending.",
 		"Do not delete user-owned worktrees/branches or unmerged/uncommitted material, and never force cleanup. On abort/failure, return the worktree change commits and recovery information; never automatically resume or redo the work.",
-		"The team extension performs no automatic git merge or delete; this policy is advisory and the single integration owner executes it manually.",
+		"The team extension performs no automatic git merge or delete of dirty/unmerged/user-owned worktrees; non-destructive idle GC (`cleanupSafeWorktrees` / `/team gc --worktrees`) only removes verified clean already-merged or ledger-superseded temporary worktrees (never `--force` or `-D`).",
 	].join("\n");
 }
 
@@ -675,6 +690,33 @@ export interface DecisionInput {
 	cfg: TeamConfig;
 	prices: PriceMap;
 	activeCount: number;
+	explicitModel?: string;
+	nowMs?: number;
+}
+
+export const DEFAULT_UNAVAILABLE_COOLDOWN_MS = 10 * 60_000;
+
+/**
+ * Returns the active pause reason for `role`, or `null` if the lock was lifted by an explicit
+ * different `model`, a newer model selection, or expiry of the cooldown window.
+ */
+export function isRoleUnavailable(
+	state: TeamState,
+	role: Role,
+	explicitModel?: string,
+	nowMs: number = Date.now(),
+): string | null {
+	const reason = state.unavailable?.[role];
+	if (!reason) return null;
+	const explicitTrim = typeof explicitModel === "string" && explicitModel.trim() ? explicitModel.trim() : undefined;
+	const pausedModel = state.unavailableModel?.[role];
+	if (explicitTrim && pausedModel && explicitTrim !== pausedModel) return null;
+	if (pausedModel && state.roleModel?.[role] && state.roleModel[role] !== pausedModel && !explicitTrim) return null;
+	const pausedAt = state.unavailableAt?.[role];
+	if (typeof pausedAt === "number" && Number.isFinite(pausedAt) && (nowMs - pausedAt) >= DEFAULT_UNAVAILABLE_COOLDOWN_MS) {
+		return null;
+	}
+	return reason;
 }
 
 export type BlockKind = "evidence" | "paused";
@@ -692,13 +734,14 @@ export function effectiveMaxCalls(_state: TeamState, _cfg: TeamConfig, _role: Ro
 }
 
 export function decideCall(input: DecisionInput): Decision {
-	const { role, state, cfg, prices } = input;
+	const { role, state, cfg, prices, explicitModel, nowMs } = input;
 	if (!role) return { block: false, reserveUSD: 0 };
 
-	if (state.unavailable?.[role]) {
+	const pausedReason = isRoleUnavailable(state, role, explicitModel, nowMs);
+	if (pausedReason) {
 		return {
 			block: true,
-			reason: `${ROLE_LABEL[role]} 已暂停（${state.unavailable[role]}）。不要重复尝试同一角色；主会话（主教练）可改派其他可用角色，或等该角色恢复后再调度。`,
+			reason: `${ROLE_LABEL[role]} 已暂停（${pausedReason}）。可用 /team model ${role} <模型名> 换模型解锁，或 /team unpause ${role} / 等冷静期后重试。`,
 			reserveUSD: 0,
 		};
 	}
@@ -870,18 +913,73 @@ export function applyStateDelta(state: TeamState, delta: TeamStateDelta, cfg: Te
 		roleModel: { ...(out.roleModel ?? {}) },
 		roleThinking: { ...(out.roleThinking ?? {}) },
 		unavailable: { ...(out.unavailable ?? {}) },
+		unavailableModel: { ...(out.unavailableModel ?? {}) },
+		unavailableAt: { ...(out.unavailableAt ?? {}) },
+		autoFallbackBase: { ...(out.autoFallbackBase ?? {}) },
 		fallbackTried: { ...(out.fallbackTried ?? {}) },
 		budgetOverrideUSD: 0,
 		limitsOff: true,
 	};
 }
 
-export function stateFromEntries(entries: unknown, cfg: TeamConfig): { state: TeamState; runs: RunRecord[] } {
+export function clearRoleQuotaLock(state: TeamState, role: Role, clearAutoFallback = false): void {
+	if (state.unavailable) delete state.unavailable[role];
+	if (state.unavailableModel) delete state.unavailableModel[role];
+	if (state.unavailableAt) delete state.unavailableAt[role];
+	if (state.fallbackTried) delete state.fallbackTried[role];
+	if (clearAutoFallback) {
+		if (state.roleModel && state.autoFallbackBase?.[role]) delete state.roleModel[role];
+		if (state.autoFallbackBase) delete state.autoFallbackBase[role];
+	}
+}
+
+export function reconcileQuotaState(
+	state: TeamState,
+	cfg: TeamConfig,
+	lastUnavailableEntryAt: Partial<Record<Role, number>> = {},
+	nowMs: number = Date.now(),
+): void {
+	for (const role of ROLES) {
+		const fallbackBase = state.autoFallbackBase?.[role];
+		if (fallbackBase && cfg.roles[role]?.model && cfg.roles[role].model !== fallbackBase) {
+			clearRoleQuotaLock(state, role, true);
+			continue;
+		}
+		if (!state.unavailable?.[role]) continue;
+		const effectiveModel = state.roleModel?.[role] || cfg.roles[role]?.model;
+		const pausedModel = state.unavailableModel?.[role];
+		if (pausedModel && effectiveModel && effectiveModel !== pausedModel) {
+			clearRoleQuotaLock(state, role, false);
+			continue;
+		}
+		const pausedAt = state.unavailableAt?.[role];
+		if (typeof pausedAt === "number" && Number.isFinite(pausedAt) && (nowMs - pausedAt) >= DEFAULT_UNAVAILABLE_COOLDOWN_MS) {
+			clearRoleQuotaLock(state, role, false);
+			continue;
+		}
+		// Legacy (< v1.2.3) pause state with no unavailableModel/unavailableAt:
+		// clear if the role now uses a non-fallback model (user switched via /team model or team.json)
+		// or the legacy pause entry is older than the cooldown window.
+		if (!pausedModel && pausedAt === undefined) {
+			const fallbacks = cfg.fallbacks?.[role] ?? [];
+			const explicitSwitched = Boolean(state.roleModel?.[role] && !fallbacks.includes(state.roleModel[role]!));
+			const legacyEntryAt = lastUnavailableEntryAt[role];
+			const legacyExpired = typeof legacyEntryAt === "number" && Number.isFinite(legacyEntryAt) && (nowMs - legacyEntryAt) >= DEFAULT_UNAVAILABLE_COOLDOWN_MS;
+			if (explicitSwitched || legacyExpired) {
+				clearRoleQuotaLock(state, role, false);
+			}
+		}
+	}
+}
+
+export function stateFromEntries(entries: unknown, cfg: TeamConfig, nowMs: number = Date.now()): { state: TeamState; runs: RunRecord[] } {
 	let state = initialState(cfg);
 	const runs: RunRecord[] = [];
+	const lastUnavailableEntryAt: Partial<Record<Role, number>> = {};
 	for (const entry of Array.isArray(entries) ? entries : []) {
-		const e = entry as { type?: string; customType?: string; data?: unknown };
+		const e = entry as { type?: string; customType?: string; timestamp?: string; data?: unknown };
 		if (e?.type !== "custom") continue;
+		const entryMs = typeof e.timestamp === "string" ? Date.parse(e.timestamp) : NaN;
 		if (e.customType === "team-state" && e.data && typeof e.data === "object") {
 			const saved = structuredClone(e.data) as Partial<TeamState>;
 			state = {
@@ -894,6 +992,9 @@ export function stateFromEntries(entries: unknown, cfg: TeamConfig): { state: Te
 				roleModel: { ...(saved.roleModel ?? {}) },
 				roleThinking: { ...(saved.roleThinking ?? {}) },
 				unavailable: { ...(saved.unavailable ?? {}) },
+				unavailableModel: { ...(saved.unavailableModel ?? {}) },
+				unavailableAt: { ...(saved.unavailableAt ?? {}) },
+				autoFallbackBase: { ...(saved.autoFallbackBase ?? {}) },
 				fallbackTried: { ...(saved.fallbackTried ?? {}) },
 				budgetOverrideUSD: 0,
 				limitsOff: true,
@@ -901,14 +1002,30 @@ export function stateFromEntries(entries: unknown, cfg: TeamConfig): { state: Te
 				modeModelApplied: saved.modeModelApplied === true
 					|| (saved.modeModelApplied === undefined && typeof saved.prevModel === "string" && saved.prevModel.length > 0),
 			};
+			for (const role of ROLES) {
+				if (state.unavailable?.[role] && Number.isFinite(entryMs)) lastUnavailableEntryAt[role] = entryMs;
+				else if (!state.unavailable?.[role]) delete lastUnavailableEntryAt[role];
+			}
 		}
 		if (e.customType === "team-state-delta" && e.data && typeof e.data === "object") {
-			state = applyStateDelta(state, e.data as TeamStateDelta, cfg);
+			const delta = e.data as TeamStateDelta;
+			state = applyStateDelta(state, delta, cfg);
+			const topUnavail = delta.top?.unavailable;
+			if (topUnavail && typeof topUnavail === "object") {
+				for (const role of ROLES) {
+					if ((topUnavail as Record<string, unknown>)[role] && Number.isFinite(entryMs)) {
+						lastUnavailableEntryAt[role] = entryMs;
+					} else if (!(topUnavail as Record<string, unknown>)[role]) {
+						delete lastUnavailableEntryAt[role];
+					}
+				}
+			}
 		}
 		if (e.customType === "team-run" && e.data && typeof e.data === "object") {
 			runs.push(e.data as RunRecord);
 		}
 	}
+	reconcileQuotaState(state, cfg, lastUnavailableEntryAt, nowMs);
 	// Older running receipts must not vanish merely because 50 newer calls were logged.
 	return { state, runs };
 }
@@ -1330,17 +1447,32 @@ export function formatRecoveredReport(report: RecoveredReport, options: { alread
 
 /** 额度 / 限流 / 鉴权类失败——不是任务失败，换模型或暂停，不要反复重试。 */
 export function isQuotaError(text: string): boolean {
-	return /(429|402|quota|insufficient|rate.?limit|cooling|too many requests|额度|余额不足|超出配额|欠费|停止服务)/i.test(text ?? "");
+	const t = text ?? "";
+	if (!t) return false;
+	if (/(insufficient[_\s-]?(?:quota|credits?|balance|funds|tokens?|capacity|allowance)|quota[_\s-]?(?:exceeded|exhausted|limit|reached)|out\s+of\s+quota|rate.?limit|cooling|too many requests|eligible_promo|limit_window_minutes|额度|余额不足|超出配额|欠费|停止服务)/i.test(t)) {
+		return true;
+	}
+	// Strip code line/col/port numbers like `MainMenu.razor(429,12)` or `line 429` before checking bare HTTP 429/402.
+	const stripped = t
+		.replace(/\b(?:line|lines|col|column|port|step|task|pr|issue|#)\s*[:=#-]?\s*(?:429|402)\b/gi, " ")
+		.replace(/\(\s*(?:429|402)\s*,\s*\d+\s*\)/g, " ");
+	return /(?:^|[\s(:[\]{}"'])(?:429|402)(?=$|[\s):[\]{}"',.!?])/.test(stripped);
 }
 
-export function pickFallback(role: Role, cfg: TeamConfig, tried: number): string | null {
+export function pickFallback(role: Role, cfg: TeamConfig, tried: number, currentModel?: string): { nextModel: string | null; nextTried: number } {
 	const list = cfg.fallbacks[role] ?? [];
-	return list[tried] ?? null;
+	let idx = Math.max(0, tried);
+	while (idx < list.length && currentModel && list[idx] === currentModel) {
+		idx++;
+	}
+	const nextModel = list[idx] ?? null;
+	return { nextModel, nextTried: nextModel ? idx + 1 : idx };
 }
 
 export interface QuotaOutcome {
 	nextModel: string | null;
 	unavailable: string | null;
+	nextTried?: number;
 }
 
 /** 额度失败后的处理结果：先切备用模型，全部用完则暂停该角色。 */
@@ -1349,10 +1481,11 @@ export function handleQuotaFailure(
 	cfg: TeamConfig,
 	tried: number,
 	reason: string,
+	currentModel?: string,
 ): QuotaOutcome {
-	const nextModel = pickFallback(role, cfg, tried);
-	if (nextModel) return { nextModel, unavailable: null };
-	return { nextModel: null, unavailable: reason };
+	const { nextModel, nextTried } = pickFallback(role, cfg, tried, currentModel);
+	if (nextModel) return { nextModel, unavailable: null, nextTried };
+	return { nextModel: null, unavailable: reason, nextTried };
 }
 
 export interface QuotaStateResult {
@@ -1362,15 +1495,43 @@ export interface QuotaStateResult {
 }
 
 /** 把额度失败反映到状态：先换备用模型；都不可用时只暂停该角色。可选 cp 不可用不暂停总目标。 */
-export function applyQuotaFailure(state: TeamState, role: Role, cfg: TeamConfig, reason: string): QuotaStateResult {
+export function applyQuotaFailure(
+	state: TeamState,
+	role: Role,
+	cfg: TeamConfig,
+	reason: string,
+	activeModel?: string,
+	nowMs: number = Date.now(),
+): QuotaStateResult {
+	const currentModel = (activeModel && activeModel.trim()) || state.roleModel?.[role] || cfg.roles[role]?.model;
 	const tried = state.fallbackTried?.[role] ?? 0;
-	const outcome = handleQuotaFailure(role, cfg, tried, reason);
-	const next: TeamState = { ...state, fallbackTried: { ...(state.fallbackTried ?? {}), [role]: tried + (outcome.nextModel ? 1 : 0) } };
+	const outcome = handleQuotaFailure(role, cfg, tried, reason, currentModel);
+	const next: TeamState = {
+		...state,
+		fallbackTried: { ...(state.fallbackTried ?? {}), [role]: outcome.nextTried ?? tried },
+	};
 	if (outcome.nextModel) {
 		next.roleModel = { ...(next.roleModel ?? {}), [role]: outcome.nextModel };
+		next.autoFallbackBase = { ...(next.autoFallbackBase ?? {}), [role]: state.autoFallbackBase?.[role] ?? cfg.roles[role]?.model };
+		if (next.unavailable?.[role]) {
+			next.unavailable = { ...(next.unavailable ?? {}) };
+			delete next.unavailable[role];
+		}
+		if (next.unavailableModel?.[role]) {
+			next.unavailableModel = { ...(next.unavailableModel ?? {}) };
+			delete next.unavailableModel[role];
+		}
+		if (next.unavailableAt?.[role] !== undefined) {
+			next.unavailableAt = { ...(next.unavailableAt ?? {}) };
+			delete next.unavailableAt[role];
+		}
 		return { state: next, nextModel: outcome.nextModel, paused: false };
 	}
 	next.unavailable = { ...(next.unavailable ?? {}), [role]: outcome.unavailable ?? "额度不足" };
+	if (currentModel) {
+		next.unavailableModel = { ...(next.unavailableModel ?? {}), [role]: currentModel };
+	}
+	next.unavailableAt = { ...(next.unavailableAt ?? {}), [role]: nowMs };
 	// 不在这里停止目标：主会话 CP 的决策与审核不依赖任何子角色（含可选 cp 咨询）。
 	return { state: next, nextModel: null, paused: true };
 }
@@ -1412,7 +1573,7 @@ export function buildPolicy(mode: Mode, cfg: TeamConfig): string {
 		"Parent sideline discipline: delegate ALL code/filesystem investigation, editing (bridges/booker), testing (ayton), docs (cameron), and code review/deep technical audit (cp). Keep only intent analysis, task decomposition, DAG bookkeeping, Agent dispatch, arbitration, and final team_goal acceptance in the main session. Never get impatient while dispatched children are running and start doing their job yourself — wait for completion notices or do one join when no ready work remains.",
 		"Every dispatch brief must include: goal, scope, allowed/forbidden paths, acceptance evidence, and only necessary context (file/symbol/error). Do not transcribe the whole conversation.",
 		"Use team_tasks to maintain the persistent additive request/task ledger before dispatch. A new user request adds scope; it never implicitly cancels older requests, tasks, or acceptance conditions. Resolve each request with evidence (including answered/non-actionable messages); cancellation/supersession needs explicit user authority, reason and source evidence.",
-		"Decompose work into small, single-slice verifiable deliverables (1-3 ACs, 1-3 concrete files per task), NEVER one large multi-layer role bundle. Two-Phase Fan-Out: for unfamiliar or cross-file features/bugs, FIRST launch 1 fast read-only bridges scout (`declaredReadOnly: true`, `reviewTier: \"none\"`) to map exact `file:line` targets and parallel slices; THEN fan out narrow file-scoped tasks in parallel across bridges/booker plus separate concrete-file `ayton` test tasks (never lock generic `tests/` directory on feature tasks). Use `reviewTier: \"none\"` on narrow unambiguous single-file slices to eliminate review ceremony overhead, or integrate slices cleanly before one combined `cp` review + `ayton` regression. Register request IDs, dependencies, concrete read/write scopes and acceptance. Include TEAM_TASK: W-id in each Agent prompt. Parent tasks may cover decisive analysis/acceptance; retain separate integration/regression/cleanup obligations where needed.",
+		"Decompose work into small, single-slice verifiable deliverables (1-3 ACs, 1-3 concrete files per task), NEVER one large multi-layer role bundle. Two-Phase Fan-Out: for unfamiliar or cross-file features/bugs, FIRST launch 1 fast read-only bridges scout (`declaredReadOnly: true`, `reviewTier: \"none\"`) to map exact `file:line` targets and parallel slices; THEN fan out narrow file-scoped tasks in parallel across bridges/booker in the shared workspace (`WORKTREE_NOT_USED`) plus separate concrete-file `ayton` test tasks (never lock generic `tests/` directory on feature tasks). Only isolate into a temporary git worktree for genuine concurrent same-file source collisions (never for docs/checklists or read-only checks, max 5 concurrent extra worktrees, and avoid heavy duplicate `bin/`/`obj/` caches). Use `reviewTier: \"none\"` on narrow unambiguous single-file slices to eliminate review ceremony overhead, or integrate slices cleanly before one combined `cp` review + `ayton` regression. Register request IDs, dependencies, concrete read/write scopes and acceptance. Include TEAM_TASK: W-id in each Agent prompt. Parent tasks may cover decisive analysis/acceptance; retain separate integration/regression/cleanup obligations where needed.",
 		"Deterministic Scheduler & Concurrency Utilization: The deterministic Scheduler automatically manages subagent capacity up to 20 concurrency slots. Calling team_tasks or team_dispatch programmatically auto-dispatches all ready independent tasks in parallel and auto-backfills empty slots immediately as subtasks complete. Explicit deterministic + autoAccept:true deliverables with ALL objective assertions verified (file/artifact existence, exit code 0) auto-accept and unlock successors; declare test counts as `exit code 0` criteria instead, prose counts route to review. Review-exempt deliveries skip the reviewer child but still need one parent acceptance call; batch those acceptances with the next dispatch instead of reviewing trivia.",
 		"Scheduling is rolling, not wave/barrier based: proactively analyze ALL open user requests upfront and decompose independent items into fine file-scoped or worktree-isolated W-* tasks to keep up to 20 parallel slots filled—never trickle 1-3 tasks and yield while open backlog remains. As each child returns, immediately settle reported work, unlock successors, split write-scope bottlenecks into independent worktrees where appropriate, and refill free slots. NEVER use yield_to_subsessions to dodge a scope lock, blocked reviewer, or unresolved dependency: resolve/split/reconcile what you can now, OR explicitly escalate every concrete blocker and needed human decision directly to the user before stopping/yielding.",
 		"Prefer Agent resume for rework when the existing worker's role and cwd still fit the task; do not restart only to repeat background. Existing children retain their creation-time role snapshot. If an old child refuses an approved task because its role instructions are obsolete, confirm it has stopped, then start a fresh child with a concise evidence handoff; do not repeatedly resume the obsolete role or duplicate live writes.",
@@ -1759,7 +1920,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	let cfg = loadConfigFrom(cfgFile);
 	let prices = loadPrices(modelsFile);
 	let state = initialState(cfg);
-	const activeCalls = new Map<string, { role: Role; taskId: string; at: number; description: string; reserveUSD: number; sessionId?: string }>();
+	const activeCalls = new Map<string, { role: Role; taskId: string; at: number; description: string; reserveUSD: number; sessionId?: string; model?: string }>();
 	let runs: RunRecord[] = [];
 	const programmaticDispatches = new Map<string, { runId: string; role: Role; at: number }>();
 	// Same-task duplicate Agent launches: the tool_call hook records the existing owner per toolCallId, the
@@ -1772,17 +1933,18 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	let toolLauncher: ((name: string, args: Record<string, unknown>, options?: any) => Promise<any>) | null = null;
 
 	/**
-	 * Model/thinking for a dispatch: a sticky quota fallback (state.roleModel) always wins because the
-	 * configured model is known to be exhausted; otherwise an explicit per-call value is preserved and
-	 * the role's configured default only fills a missing value.
+	 * Model/thinking for a dispatch: an explicit per-call model always wins; otherwise a sticky quota
+	 * fallback (state.roleModel) wins over cfg.roles[role].model until reset/reconfigured.
 	 */
 	function applyRoleModelOverrides(input: Record<string, unknown>, role: Role): void {
 		const explicit = (v: unknown) => typeof v === "string" && v.trim().length > 0;
 		const sticky = state.roleModel?.[role];
-		if (sticky) input.model = sticky;
-		else if (!explicit(input.model) && cfg.roles[role]?.model) input.model = cfg.roles[role].model;
-		const thinking = state.roleThinking?.[role]
-			|| (explicit(input.thinking) ? String(input.thinking) : undefined)
+		if (!explicit(input.model)) {
+			if (sticky) input.model = sticky;
+			else if (cfg.roles[role]?.model) input.model = cfg.roles[role].model;
+		}
+		const thinking = (explicit(input.thinking) ? String(input.thinking) : undefined)
+			|| state.roleThinking?.[role]
 			|| cfg.roles[role]?.thinking;
 		if (thinking) {
 			input.thinking = thinking;
@@ -1880,6 +2042,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	let lastPersistedState: TeamState | null = null;
 	let agentToolUnavailable = false;
 	let lastChildGcAt = 0;
+	let lastWorktreeGcAt = 0;
 	const persist = () => {
 		const snap = structuredClone(state);
 		const json = JSON.stringify(snap);
@@ -1919,6 +2082,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		lastPersistedState = hasSavedState ? structuredClone(state) : null;
 		agentToolUnavailable = false;
 		lastChildGcAt = 0;
+		lastWorktreeGcAt = 0;
 	}
 
 	function board(): WorkLedger {
@@ -2801,6 +2965,11 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 		if (!isStaleAttempt) {
 			if (info.success) {
+				const completedRole = normalizeRole(info.role);
+				if (completedRole && state.unavailable?.[completedRole]) {
+					clearRoleQuotaLock(state, completedRole, false);
+					dirty = true;
+				}
 				syncLease(runId, sessionId, "completed");
 				if (observeTask(board(), runId, sessionId, "completed")) dirty = true;
 			} else {
@@ -2811,7 +2980,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				const errorText = info.error ?? `child ${info.status}`;
 				const kind = classifyAgentFailure(errorText);
 				if (kind === "quota" && role) {
-					const applied = applyQuotaFailure(state, role, cfg, `额度/限流不足（${errorText.trim().slice(0, 80)}）`);
+					const activeModel = state.roleModel?.[role] || cfg.roles[role]?.model;
+					const applied = applyQuotaFailure(state, role, cfg, `额度/限流不足（${errorText.trim().slice(0, 80)}）`, activeModel);
 					state = applied.state;
 					dirty = true;
 					const ui = ctxStore.current?.hasUI ? ctxStore.current.ui : undefined;
@@ -2955,6 +3125,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				// the meantime must win. markDispatched() still re-validates status/deps/scope atomically.
 				if (task.manualDispatch || programmaticDispatches.has(task.id)) continue;
 				const role = task.role as Role;
+				if (isRoleUnavailable(state, role)) continue;
 				const runId = `run-${task.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 				const prevAttempt = {
 					status: task.status,
@@ -3094,7 +3265,11 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		}
 	}
 
-	function runChildSessionGc(force = false, dryRun = false): ChildGcResult | null {
+	function runChildSessionGc(
+		force = false,
+		dryRun = false,
+		opts: { includeInactiveParents?: boolean; mode?: "archive" | "delete"; pruneOrphanSidecars?: boolean; workerCooldownMs?: number; reviewerCooldownMs?: number } = {},
+	): ChildGcResult | null {
 		if (!state.enabled || isSubagentSession || !parentSessionId) return null;
 		if (!force && !cfg.autoGcChildSessions) return null;
 		const now = Date.now();
@@ -3110,8 +3285,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			for (const call of activeCalls.values()) {
 				if (call.sessionId) activeLeaseSessionIds.add(call.sessionId);
 			}
-			const reviewerCooldownMs = (cfg.gcReviewerCooldownMinutes || 60) * 60_000 || DEFAULT_REVIEWER_GC_COOLDOWN_MS;
-			const workerCooldownMs = (cfg.gcWorkerCooldownMinutes || 1440) * 60_000 || DEFAULT_WORKER_GC_COOLDOWN_MS;
+			const reviewerCooldownMs = opts.reviewerCooldownMs ?? ((cfg.gcReviewerCooldownMinutes || 60) * 60_000 || DEFAULT_REVIEWER_GC_COOLDOWN_MS);
+			const workerCooldownMs = opts.workerCooldownMs ?? ((cfg.gcWorkerCooldownMinutes || 1440) * 60_000 || DEFAULT_WORKER_GC_COOLDOWN_MS);
 			const res = archiveStaleChildSessions({
 				agentDir: dir,
 				parentSessionId,
@@ -3121,9 +3296,48 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				nowMs: now,
 				reviewerCooldownMs,
 				workerCooldownMs,
+				includeInactiveParents: opts.includeInactiveParents,
+				mode: opts.mode,
+				pruneOrphanSidecars: opts.pruneOrphanSidecars,
 				dryRun,
 			});
-			if (!dryRun) lastChildGcAt = now;
+			if (!dryRun && !opts.includeInactiveParents && opts.mode !== "delete") lastChildGcAt = now;
+			return res;
+		} catch {
+			return null;
+		}
+	}
+
+	function runWorktreeGc(
+		repoCwd: string,
+		force = false,
+		dryRun = false,
+		opts: { deleteMergedBranches?: boolean } = {},
+	): WorktreeCleanupResult | null {
+		if (!state.enabled || isSubagentSession) return null;
+		if (!force && !cfg.autoGcChildSessions) return null;
+		const now = Date.now();
+		if (!force && (now - lastWorktreeGcAt) < 10 * 60_000) return null;
+		const tasks = state.ledger?.tasks ?? [];
+		const extraProtectedPaths: string[] = [];
+		for (const l of leases.values()) {
+			if (liveWork(l.status) && !isLeaseSettledOnBoard(l)) {
+				const wp = tasks.find(t => t.id === l.taskId)?.worktreePath;
+				if (wp) extraProtectedPaths.push(wp);
+			}
+		}
+		try {
+			const res = cleanupSafeWorktrees(repoCwd || process.cwd(), {
+				tasks,
+				extraProtectedPaths,
+				inactiveGraceMs: force ? 0 : DEFAULT_WORKTREE_GRACE_MS,
+				nowMs: now,
+				dryRun,
+				includeMerged: true,
+				includeSuperseded: true,
+				deleteMergedBranches: opts.deleteMergedBranches ?? true,
+			});
+			if (!dryRun) lastWorktreeGcAt = now;
 			return res;
 		} catch {
 			return null;
@@ -3553,6 +3767,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		if (state.enabled) {
 			ensureSchedulerDaemon(ctx);
 			runChildSessionGc(false, false);
+			runWorktreeGc(ctx?.cwd || process.cwd(), false, false);
 		}
 		if (event.reason === "startup" && state.enabled && ctx.hasUI) {
 			ctx.ui.notify(`团队工作流已就绪（${state.mode}）。/team status 查看状态。`, "info");
@@ -3849,7 +4064,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				return { block: true, reason: `${workId}: foreground dispatch (run_in_background=false) is disallowed while ${otherReady.length} other independent ready task(s) can run: ${sample}${extra}. Fix: retry Agent with run_in_background: true (or omit run_in_background; background is default), then check results with get_subagent_result(wait=false).` };
 			}
 		}
-		const decision = decideCall({ role, prompt, state, cfg, prices, activeCount: runningCount() });
+		const explicitModelArg = typeof input.model === "string" && input.model.trim() ? input.model.trim() : undefined;
+		const decision = decideCall({ role, prompt, state, cfg, prices, activeCount: runningCount(), explicitModel: explicitModelArg });
 		if (decision.block) {
 			// Only real role unavailability or the retained economy rationale gate blocks this optional call.
 			ctx.ui.notify(`已拦截 ${role} 调用：见返回原因`, "warning");
@@ -3860,6 +4076,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 		// 额度不足后自动改用备用模型（同一会话粘住，不再回退到已耗尽的模型）；显式传入的 model 优先于角色默认配置
 		if (!resumeId || !usesHostedTransport(resumeId)) applyRoleModelOverrides(input, role);
+		const dispatchedModel = typeof input.model === "string" && input.model.trim() ? input.model.trim() : undefined;
 		input.run_id = taskId;
 
 		if (workId) writeLease(markDispatched(board(), workId, role, taskId, resumeId));
@@ -3885,7 +4102,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		state.tasks += 1;
 		// cpCallsSinceAudit 仅为旧状态兼容保留；不再递增，也不作为 team_goal 授权条件。
 		state.reservedUSD += decision.reserveUSD;
-		activeCalls.set(event.toolCallId, { role, taskId, at: Date.now(), description, reserveUSD: decision.reserveUSD });
+		activeCalls.set(event.toolCallId, { role, taskId, at: Date.now(), description, reserveUSD: decision.reserveUSD, model: dispatchedModel });
 		persist();
 		const record: RunRecord = { taskId, role, description, status: "running", at: new Date().toISOString() };
 		runs.push(record);
@@ -4078,10 +4295,19 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		const quota = kind === "quota";
 		const interrupted = kind === "interrupted" || nativeInterrupted;
 		if (recovered) {
+			if (state.unavailable?.[tracked.role]) {
+				clearRoleQuotaLock(state, tracked.role, false);
+			}
 			// A recovered report is reported, not verified ok and not task acceptance. Keep failure state unchanged.
 			if (ctx.hasUI) ctx.ui.notify(`${ROLE_LABEL[tracked.role]} 报告已恢复（reported，待证据核验；不是任务验收）`, "info");
 		} else if (quota) {
-			const applied = applyQuotaFailure(state, tracked.role, cfg, `额度/限流不足（${errorText.trim().slice(0, 80)}）`);
+			const applied = applyQuotaFailure(
+				state,
+				tracked.role,
+				cfg,
+				`额度/限流不足（${errorText.trim().slice(0, 80)}）`,
+				tracked.model,
+			);
 			state = applied.state;
 			if (applied.nextModel) {
 				if (ctx.hasUI) ctx.ui.notify(`${ROLE_LABEL[tracked.role]} 额度不足，后续改用 ${applied.nextModel}`, "warning");
@@ -4095,6 +4321,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			// 后台/运行中受理不是完成：不记为 ok，也不清零失败计数。
 			if (ctx.hasUI) ctx.ui.notify(`${ROLE_LABEL[tracked.role]} 仍在运行（native ${observedNative}；不是完成）`, "info");
 		} else {
+			if (!failed && state.unavailable?.[tracked.role]) {
+				clearRoleQuotaLock(state, tracked.role, false);
+			}
 			state.failures[tracked.role] = failed ? (state.failures[tracked.role] ?? 0) + 1 : 0;
 		}
 
@@ -4149,7 +4378,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	// ── 命令 ──
 	// ── 目标循环：自动续跑与停止条件 ──
 	pi.on("agent_before_settle", async (event, ctx) => {
-		if (state.enabled && !isSubagentSession) runChildSessionGc(false, false);
+		if (state.enabled && !isSubagentSession) {
+			runChildSessionGc(false, false);
+			runWorktreeGc(ctx?.cwd || process.cwd(), false, false);
+		}
 		if (event && "outcome" in event && (event as { outcome?: unknown }).outcome !== undefined && (event as { outcome?: unknown }).outcome !== "completed") return;
 		if (!state.enabled || !state.goal || state.goal.status !== "active") return;
 		// Wait for arranged child notifications only when there is no other dispatchable work.
@@ -4599,7 +4831,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				return null;
 			}
 
-			const items = ["help", "on", "off", "new", "status", "check-update", "update", "model", "model list", "model help", "models", "tasks", "tasks archive", "tasks move", "dispatch", "solo delegated", "solo allow", "reconcile", "log", "reset", "goal", "goal status", "goal edit", "goal clear", "goal resume", "goal stop", "mode economy", "mode strict", "budget", "limits"]
+			const items = ["help", "on", "off", "new", "status", "check-update", "update", "model", "model list", "model help", "models", "tasks", "tasks archive", "tasks move", "dispatch", "solo delegated", "solo allow", "reconcile", "unpause", "gc", "gc --all", "gc --worktrees", "prune-reviews", "log", "reset", "goal", "goal status", "goal edit", "goal clear", "goal resume", "goal stop", "mode economy", "mode strict", "budget", "limits"]
 				.filter((v) => v.startsWith(prefix.trim()))
 				.map((v) => ({ value: v, label: v }));
 			return items.length > 0 ? items : null;
@@ -4676,7 +4908,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					"• /team dispatch        — 手动触发一次调度派发",
 					"• /team reconcile [ID]  — 对账恢复中断的子会话报告",
 					"• /team prune-reviews   — 清理过期的审核任务",
-					"• /team gc              — 归档清理已结束的历史子会话",
+					"• /team gc [选项]       — 清理历史子会话与安全可回收 worktree（--all / --worktrees / --delete / --dry-run）",
+					"• /team unpause [角色]  — 解除限流/配额暂停锁，立即恢复该角色调度",
 					"\n【目标与统计】",
 					"• /team goal <目标描述>  — 登记长期总目标并开始推进",
 					"• /team goal status     — 查看当前目标推进状态",
@@ -5044,19 +5277,88 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 			if (sub === "gc") {
 				const dryRun = rest.includes("--dry-run") || rest.includes("-n");
-				const res = runChildSessionGc(true, dryRun);
-				if (!res) {
-					ctx.ui.notify("当前未启用团队工作流或属于子会话，无需归档。", "info");
+				const worktreeOnly = rest.includes("--worktrees") || rest.includes("--wt");
+				const includeWorktrees = worktreeOnly || !rest.includes("--sessions-only");
+				const includeInactiveParents = rest.includes("--all");
+				const mode = rest.includes("--delete") ? "delete" : "archive";
+				let cooldownOverrideMs: number | undefined;
+				const cdIdx = rest.indexOf("--cooldown");
+				if (cdIdx >= 0 && rest[cdIdx + 1]) {
+					const mins = Number(rest[cdIdx + 1]);
+					if (Number.isFinite(mins) && mins > 0) cooldownOverrideMs = mins * 60_000;
+				}
+				const res = worktreeOnly
+					? null
+					: runChildSessionGc(true, dryRun, {
+						includeInactiveParents,
+						mode,
+						pruneOrphanSidecars: mode === "delete" || includeInactiveParents,
+						...(cooldownOverrideMs !== undefined
+							? {
+								workerCooldownMs: cooldownOverrideMs,
+								reviewerCooldownMs: Math.min(cooldownOverrideMs, (cfg.gcReviewerCooldownMinutes || 60) * 60_000),
+							}
+							: {}),
+					});
+				const wtRes = includeWorktrees ? runWorktreeGc(ctx?.cwd || process.cwd(), true, dryRun) : null;
+				if (!res && !wtRes) {
+					ctx.ui.notify("当前未启用团队工作流或属于子会话，无需清理。", "info");
 					return;
 				}
-				const mb = (res.totalBytesFreed / (1024 * 1024)).toFixed(2);
-				const orphanedCount = res.archived.filter(a => a.kind === "orphaned").length;
-				const reviewerCount = res.archived.filter(a => a.kind === "reviewer").length;
-				const prefix = dryRun ? "[预览 --dry-run] 可归档" : "已归档";
-				ctx.ui.notify(
-					`共识别本会话子会话 ${res.totalMatched} 个；${prefix} ${res.archived.length} 个（审查 ${reviewerCount}、历史孤立 ${orphanedCount}，释放活跃目录 ${mb} MB → ~/.pi/agent/sessions-archive/）；跳过：活跃 ${res.skippedActive}、冷静期内 ${res.skippedCooldown}、置顶 ${res.skippedPinned}${res.skippedUnverified ? `、未认证 ${res.skippedUnverified}` : ""}${res.errors.length ? `、错误 ${res.errors.length}` : ""}。`,
-					"info",
-				);
+				const lines: string[] = [];
+				if (res) {
+					const mb = (res.totalBytesFreed / (1024 * 1024)).toFixed(2);
+					const orphanedCount = res.archived.filter(a => a.kind === "orphaned").length;
+					const reviewerCount = res.archived.filter(a => a.kind === "reviewer").length;
+					const actionLabel = dryRun
+						? (mode === "delete" ? "[预览 --dry-run] 可永久删除" : "[预览 --dry-run] 可归档")
+						: (mode === "delete" ? "已永久删除" : "已归档");
+					const sidecarNote = res.orphanSidecarsRemoved ? `、清理孤立 sidecar ${res.orphanSidecarsRemoved} 个` : "";
+					lines.push(
+						`子会话${includeInactiveParents ? "（含历史父会话 --all）" : ""}共识别 ${res.totalMatched} 个；${actionLabel} ${res.archived.length} 个（审查 ${reviewerCount}、历史孤立 ${orphanedCount}${sidecarNote}，释放 ${mb} MB${mode === "delete" ? "" : " → ~/.pi/agent/sessions-archive/"}）；跳过：活跃 ${res.skippedActive}、冷静期内 ${res.skippedCooldown}、置顶 ${res.skippedPinned}${res.skippedUnverified ? `、未认证 ${res.skippedUnverified}` : ""}${res.errors.length ? `、错误 ${res.errors.length}` : ""}。`,
+					);
+				}
+				if (wtRes && wtRes.repoRoot) {
+					const wtMb = (wtRes.bytesFreed / (1024 * 1024)).toFixed(2);
+					const wtVerb = dryRun ? "[预览] 可安全回收" : "已安全回收";
+					lines.push(
+						`Worktree（${wtRes.repoRoot}）：${wtVerb} ${wtRes.removed.length} 个已合并/已替代 worktree（同步删已合并分支 ${wtRes.deletedBranches.length} 个，释放 ${wtMb} MB）；保护保留：脏工作区 ${wtRes.retainedDirty.length} 个、未合并分支 ${wtRes.retainedUnmerged.length} 个${wtRes.errors.length ? `、失败 ${wtRes.errors.length}` : ""}。`,
+					);
+				}
+				ctx.ui.notify(lines.join("\n"), "info");
+				return;
+			}
+
+			if (sub === "unpause") {
+				if (isSubagentSession) {
+					ctx.ui.notify("限流暂停锁只能由主会话解除。", "warning");
+					return;
+				}
+				const targetRole = rest[0] ? normalizeRole(rest[0]) : null;
+				if (rest[0] && !targetRole) {
+					ctx.ui.notify(`未知角色 "${rest[0]}"。用法：/team unpause [${ROLES.join("|")}]`, "warning");
+					return;
+				}
+				const targets: Role[] = targetRole ? [targetRole] : [...ROLES];
+				const unlocked: Role[] = [];
+				for (const r of targets) {
+					if (state.unavailable?.[r] || state.fallbackTried?.[r] || state.autoFallbackBase?.[r]) unlocked.push(r);
+					clearRoleQuotaLock(state, r, true);
+				}
+				persist();
+				setStatusText(ctx);
+				if (state.enabled) {
+					const pump = await schedulerPump(ctx as any);
+					const launchedMsg = pump.launched.length ? `；已调度启动 ${pump.launched.join(", ")}` : "";
+					ctx.ui.notify(
+						unlocked.length
+							? `✓ 已解除 ${unlocked.join(", ")} 的限流/配额暂停状态并重置回退计数${launchedMsg}。`
+							: `当前 ${targetRole ?? "全部角色"} 无生效中的限流暂停锁（已清空回退计数${launchedMsg}）。`,
+						"info",
+					);
+				} else {
+					ctx.ui.notify(`✓ 已清理 ${targets.join(", ")} 的限流暂停记录。`, "info");
+				}
 				return;
 			}
 
@@ -5096,11 +5398,12 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				yieldedBlockerWarnedDigest = "";
 				state.calls = { cp: 0, booker: 0, bridges: 0, ayton: 0, cameron: 0 };
 				state.failures = { cp: 0, booker: 0, bridges: 0, ayton: 0, cameron: 0 };
+				for (const r of ROLES) clearRoleQuotaLock(state, r, true);
 				state.spendUSD = 0;
 				state.reservedUSD = 0;
 				persist();
 				setStatusText(ctx);
-				ctx.ui.notify("本会话调用、失败与费用统计已清零；没有预算或失败熔断限制。", "info");
+				ctx.ui.notify("本会话调用、失败、费用统计与限流暂停锁已清零；没有预算或失败熔断限制。", "info");
 				return;
 			}
 
@@ -5243,6 +5546,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					newThinking = thinkInput;
 				}
 
+				const hadQuotaPause = Boolean(state.unavailable?.[targetRole]);
+				clearRoleQuotaLock(state, targetRole, true);
 				state.roleModel[targetRole] = finalModelRef;
 				cfg.roles[targetRole].model = finalModelRef;
 				if (newThinking) {
@@ -5257,12 +5562,13 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				setStatusText(ctx);
 
 				const thinkMsg = newThinking ? `，思考程度：${newThinking}` : "";
+				const unlockMsg = hadQuotaPause ? "；已解除先前的限流/配额暂停锁" : "";
 				const warningMsg = !matchedModel ? `\n⚠️ 提示：${finalModelRef} 不在当前 pi 的可用模型列表中（未配置认证或 ID 有误），子 Agent 可能无法启动。` : "";
-				ctx.ui.notify(`✓ 已将 ${ROLE_LABEL[targetRole]} (${targetRole}) 的模型设置为 ${finalModelRef}${thinkMsg}（已持久化保存）${warningMsg}`, "info");
+				ctx.ui.notify(`✓ 已将 ${ROLE_LABEL[targetRole]} (${targetRole}) 的模型设置为 ${finalModelRef}${thinkMsg}（已持久化保存${unlockMsg}）${warningMsg}`, "info");
 				return;
 			}
 
-			ctx.ui.notify("用法：/team [on|off|model|models|tasks|status|reconcile|mode|budget|log|goal|reset]", "warning");
+			ctx.ui.notify("用法：/team [on|off|model|models|tasks|status|reconcile|gc|unpause|prune-reviews|mode|budget|log|goal|reset]", "warning");
 		},
 	});
 

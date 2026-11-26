@@ -53,18 +53,21 @@ import {
 	readSync,
 	unlinkSync,
 } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { terminalWork, type WorkTask } from "./team-ledger.ts";
 
 export const DEFAULT_REVIEWER_GC_COOLDOWN_MS = 60 * 60_000; // 1 hour
 export const DEFAULT_WORKER_GC_COOLDOWN_MS = 24 * 60 * 60_000; // 24 hours
+export const DEFAULT_INACTIVE_PARENT_IDLE_MS = 2 * 60 * 60_000; // 2 hours
 export const MIN_SAFE_GC_COOLDOWN_MS = 30 * 60_000; // 30 min (> 3x pi-web 10m idleTimeoutMs)
 
 const SUBAGENT_META_TYPE = "pi-web:subagent";
+const HOSTED_SPAWN_META_TYPE = "pi-web.subsession.spawned";
 const SAFE_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
-/** pi-web writes the `pi-web:subagent` custom entry near the top of every child session. */
-const HEAD_SCAN_BYTES = 32 * 1024;
+/** pi-web writes subagent provenance (`pi-web:subagent` or `pi-web.subsession.spawned`) near the top of every child session. */
+const HEAD_SCAN_BYTES = 64 * 1024;
 const PIN_STATE_FILE = "pi-web-session-state.json";
+const PI_WEB_PINS_FILE = "session-pins.json";
 /**
  * Bounded discovery: a pathological `sessions/` tree must never turn a GC pass into an unbounded
  * scan. The budget is enforced while ENUMERATING (`opendirSync` streaming, so a single huge
@@ -102,9 +105,19 @@ export interface ChildGcOptions {
 	activeLeaseSessionIds: ReadonlySet<string>;
 	/** Optional historical leases (settled or old) used only to recognize historical reviewer children. */
 	historicalLeases?: Iterable<WorkTask>;
+	/** Optional directory containing pi-web's `session-pins.json` (defaults to `<home>/.pi-web` when `agentDir` is `<home>/.pi/agent`). */
+	piWebDataDir?: string;
 	nowMs?: number;
 	reviewerCooldownMs?: number;
 	workerCooldownMs?: number;
+	/** Sweep verified children belonging to inactive/historical parent sessions as well (`--all`). */
+	includeInactiveParents?: boolean;
+	/** Minimum parent-session idle time required before `--all` sweeps its children (clamped >= MIN_SAFE_GC_COOLDOWN_MS). */
+	inactiveParentIdleMs?: number;
+	/** `"archive"` (default) moves to `sessions-archive/`; `"delete"` permanently removes eligible files. */
+	mode?: "archive" | "delete";
+	/** When true (e.g. with `--delete` / `--all`), remove orphan `.acp.json` files whose sibling `.jsonl` is absent in both `sessions/` and `sessions-archive/`. */
+	pruneOrphanSidecars?: boolean;
 	dryRun?: boolean;
 	/**
 	 * TEST-ONLY fault seam (never set by production callers). `"fail"` simulates an I/O failure of
@@ -133,6 +146,8 @@ export interface ChildGcItem {
 	sourceFile: string;
 	archiveFile: string;
 	bytes: number;
+	/** True when `mode === "delete"` permanently deleted (or would delete) the session files. */
+	deleted?: boolean;
 	/** Archive path of the `.acp.json` sidecar, `null` when the session had no sidecar. */
 	acpArchiveFile?: string | null;
 	/** True when the sidecar slot already held an interrupted-pair remnant that this run completed. */
@@ -190,6 +205,9 @@ export interface ChildGcResult {
 	scannedFiles: number;
 	/** All directory entries encountered while enumerating (bounded; includes filtered-out names). */
 	scannedEntries: number;
+	/** Removed orphan `.acp.json` files whose `.jsonl` no longer exists (when `pruneOrphanSidecars` is enabled). */
+	orphanSidecarsRemoved?: number;
+	orphanSidecarBytesFreed?: number;
 }
 
 /** Result of reading pi-web's pin/archive UI state. `ok:false` means ownership is UNKNOWN. */
@@ -257,6 +275,16 @@ function sameInode(a: string, b: string): boolean {
 	}
 }
 
+function resolvePiWebPinsPath(agentDir: string, piWebDataDir?: string): string | null {
+	if (piWebDataDir && piWebDataDir.trim()) return join(piWebDataDir.trim(), PI_WEB_PINS_FILE);
+	// Only probe ~/.pi-web automatically for real <home>/.pi/agent installs so isolated temp-dir unit tests stay hermetic.
+	if (basename(agentDir) === "agent" && basename(dirname(agentDir)) === ".pi") {
+		const envDir = process.env.PI_WEB_DATA_DIR?.trim();
+		return join(envDir || join(dirname(dirname(agentDir)), ".pi-web"), PI_WEB_PINS_FILE);
+	}
+	return null;
+}
+
 /**
  * Read pi-web's session UI state to learn which sessions the user pinned.
  *
@@ -266,95 +294,159 @@ function sameInode(a: string, b: string): boolean {
  * therefore `ok:true`. Per-entry uncertainty is resolved conservatively: the session is reported as
  * BOTH pinned and uncertain, i.e. preserved.
  */
-export function loadPinnedSessionIds(agentDir: string): PinnedSessionIds {
+export function loadPinnedSessionIds(agentDir: string, options?: { piWebDataDir?: string }): PinnedSessionIds {
+	const pinned = new Set<string>();
+	const uncertain: string[] = [];
+
 	const uiStatePath = join(agentDir, PIN_STATE_FILE);
 	// Distinguish "no pin state was ever written" from "a pin state exists but cannot be read".
 	// A dangling/looping symlink at this path has a real directory entry, so an ENOENT raised by
 	// readFileSync must NOT be reported as a known-empty pin set (that would un-pin every session).
+	let legacyExists = true;
 	try {
 		lstatSync(uiStatePath);
 	} catch (err) {
-		if (errCode(err) === "ENOENT") return { ok: true, pinned: new Set(), uncertain: [] };
-		return { ok: false, reason: `pin state not stat-able (${errCode(err) ?? "unknown"}): ${errMessage(err)}` };
+		if (errCode(err) === "ENOENT") legacyExists = false;
+		else return { ok: false, reason: `pin state not stat-able (${errCode(err) ?? "unknown"}): ${errMessage(err)}` };
 	}
-	let raw: string;
-	try {
-		raw = readFileSync(uiStatePath, "utf8");
-	} catch (err) {
-		// The path exists (lstat succeeded) yet is unreadable: dangling symlink, directory,
-		// permissions, or a delete race. Pin ownership is UNKNOWN ⇒ fail closed.
-		return { ok: false, reason: `pin state unreadable (${errCode(err) ?? "unknown"}): ${errMessage(err)}` };
-	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(raw);
-	} catch (err) {
-		return { ok: false, reason: `pin state malformed JSON: ${errMessage(err)}` };
-	}
-	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-		return { ok: false, reason: "pin state root is not an object" };
-	}
-	const sessionsRaw = (parsed as { sessions?: unknown }).sessions;
-	if (sessionsRaw === undefined || sessionsRaw === null) {
-		return { ok: false, reason: "pin state has no `sessions` object: pin ownership unknown" };
-	}
-	if (typeof sessionsRaw !== "object" || Array.isArray(sessionsRaw)) {
-		return { ok: false, reason: "pin state `sessions` is not an object: pin ownership unknown" };
-	}
-	const pinned = new Set<string>();
-	const uncertain: string[] = [];
-	for (const [sid, meta] of Object.entries(sessionsRaw as Record<string, unknown>)) {
-		if (!sid) continue;
-		if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
-			// Cannot read this entry's metadata at all ⇒ assume the user owns it.
+	if (legacyExists) {
+		let raw: string;
+		try {
+			raw = readFileSync(uiStatePath, "utf8");
+		} catch (err) {
+			// The path exists (lstat succeeded) yet is unreadable: dangling symlink, directory,
+			// permissions, or a delete race. Pin ownership is UNKNOWN ⇒ fail closed.
+			return { ok: false, reason: `pin state unreadable (${errCode(err) ?? "unknown"}): ${errMessage(err)}` };
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch (err) {
+			return { ok: false, reason: `pin state malformed JSON: ${errMessage(err)}` };
+		}
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			return { ok: false, reason: "pin state root is not an object" };
+		}
+		const sessionsRaw = (parsed as { sessions?: unknown }).sessions;
+		if (sessionsRaw === undefined || sessionsRaw === null) {
+			return { ok: false, reason: "pin state has no `sessions` object: pin ownership unknown" };
+		}
+		if (typeof sessionsRaw !== "object" || Array.isArray(sessionsRaw)) {
+			return { ok: false, reason: "pin state `sessions` is not an object: pin ownership unknown" };
+		}
+		for (const [sid, meta] of Object.entries(sessionsRaw as Record<string, unknown>)) {
+			if (!sid) continue;
+			if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+				// Cannot read this entry's metadata at all ⇒ assume the user owns it.
+				pinned.add(sid);
+				uncertain.push(sid);
+				continue;
+			}
+			const rec = meta as { pinnedAt?: unknown };
+			if (!("pinnedAt" in rec)) continue;
+			if (typeof rec.pinnedAt === "number" && Number.isFinite(rec.pinnedAt)) {
+				pinned.add(sid);
+				continue;
+			}
 			pinned.add(sid);
 			uncertain.push(sid);
-			continue;
 		}
-		const rec = meta as { pinnedAt?: unknown };
-		if (!("pinnedAt" in rec)) continue;
-		if (typeof rec.pinnedAt === "number" && Number.isFinite(rec.pinnedAt)) {
-			pinned.add(sid);
-			continue;
-		}
-		pinned.add(sid);
-		uncertain.push(sid);
 	}
+
+	const piWebPinsPath = resolvePiWebPinsPath(agentDir, options?.piWebDataDir);
+	if (piWebPinsPath) {
+		let pinsExists = true;
+		try {
+			lstatSync(piWebPinsPath);
+		} catch (err) {
+			if (errCode(err) === "ENOENT") pinsExists = false;
+			else return { ok: false, reason: `pi-web pin state not stat-able (${errCode(err) ?? "unknown"}): ${errMessage(err)}` };
+		}
+		if (pinsExists) {
+			let raw: string;
+			try {
+				raw = readFileSync(piWebPinsPath, "utf8");
+			} catch (err) {
+				return { ok: false, reason: `pi-web pin state unreadable (${errCode(err) ?? "unknown"}): ${errMessage(err)}` };
+			}
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(raw);
+			} catch (err) {
+				return { ok: false, reason: `pi-web pin state malformed JSON: ${errMessage(err)}` };
+			}
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+				return { ok: false, reason: "pi-web pin state root is not an object" };
+			}
+			const entriesRaw = (parsed as { entries?: unknown }).entries;
+			if (!Array.isArray(entriesRaw)) {
+				return { ok: false, reason: "pi-web pin state has no `entries` array: pin ownership unknown" };
+			}
+			for (const entry of entriesRaw) {
+				if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+					return { ok: false, reason: "pi-web pin state contains non-object entry" };
+				}
+				const scope = (entry as { scope?: unknown }).scope as { kind?: unknown } | undefined;
+				if (!scope || scope.kind !== "session-pins") continue;
+				const ids = (entry as { ids?: unknown }).ids;
+				if (!Array.isArray(ids)) {
+					return { ok: false, reason: "pi-web pin state entry has non-array ids: pin ownership unknown" };
+				}
+				for (const id of ids) {
+					if (typeof id === "string" && id.trim()) pinned.add(id.trim());
+				}
+			}
+		}
+	}
+
 	return { ok: true, pinned, uncertain };
 }
 
-function isVerifiedChildOfParent(filePath: string, expectedParentId: string): boolean {
+/**
+ * Verify child session provenance from its bounded file head (`pi-web:subagent` or hosted
+ * `pi-web.subsession.spawned`). Returns the verified parent sessionId, or `null` when absent,
+ * malformed, or conflicting.
+ */
+function verifiedChildParentId(filePath: string, expectedSessionId: string): string | null {
 	let fd: number | undefined;
 	try {
 		fd = openSync(filePath, "r");
 		const buf = Buffer.allocUnsafe(HEAD_SCAN_BYTES);
 		const bytesRead = readSync(fd, buf, 0, buf.length, 0);
-		if (bytesRead <= 0) return false;
+		if (bytesRead <= 0) return null;
 		const head = buf.subarray(0, bytesRead).toString("utf8");
-		if (!head.includes(SUBAGENT_META_TYPE) || !head.includes(expectedParentId)) return false;
+		if (!head.includes(SUBAGENT_META_TYPE) && !head.includes(HOSTED_SPAWN_META_TYPE)) return null;
+		let verifiedParent: string | null = null;
 		for (const line of head.split("\n")) {
-			if (!line.includes(SUBAGENT_META_TYPE)) continue;
+			if (!line.includes(SUBAGENT_META_TYPE) && !line.includes(HOSTED_SPAWN_META_TYPE)) continue;
 			try {
 				const entry = JSON.parse(line) as {
 					type?: string;
 					customType?: string;
-					data?: { version?: unknown; parentSessionId?: unknown };
+					data?: { version?: unknown; parentSessionId?: unknown; spawnedBySessionId?: unknown; spawnedSessionId?: unknown };
 				};
-				if (
-					entry?.type === "custom"
-					&& entry.customType === SUBAGENT_META_TYPE
-					&& entry.data?.version === 1
-					&& entry.data?.parentSessionId === expectedParentId
+				if (entry?.type !== "custom" || entry.data?.version !== 1) continue;
+				let candidateParent: string | null = null;
+				if (entry.customType === SUBAGENT_META_TYPE && typeof entry.data.parentSessionId === "string" && isSafeId(entry.data.parentSessionId)) {
+					candidateParent = entry.data.parentSessionId;
+				} else if (
+					entry.customType === HOSTED_SPAWN_META_TYPE
+					&& typeof entry.data.spawnedBySessionId === "string"
+					&& isSafeId(entry.data.spawnedBySessionId)
+					&& (entry.data.spawnedSessionId === undefined || entry.data.spawnedSessionId === expectedSessionId)
 				) {
-					return true;
+					candidateParent = entry.data.spawnedBySessionId;
 				}
+				if (!candidateParent) continue;
+				if (verifiedParent && verifiedParent !== candidateParent) return null;
+				verifiedParent = candidateParent;
 			} catch {
 				// Partial trailing line in the head window; ignore
 			}
 		}
-		return false;
+		return verifiedParent;
 	} catch {
-		return false;
+		return null;
 	} finally {
 		if (fd !== undefined) {
 			try {
@@ -505,10 +597,21 @@ interface IndexedSessionFile {
 	filePath: string;
 	size: number;
 	mtimeMs: number;
+	verifiedParentId?: string | null;
+}
+
+interface OrphanSidecarFile {
+	subdir: string;
+	filePath: string;
+	baseJsonlName: string;
+	size: number;
+	mtimeMs: number;
 }
 
 interface SessionIndex {
 	verified: IndexedSessionFile[];
+	allVerifiedChildren: IndexedSessionFile[];
+	orphanSidecars: OrphanSidecarFile[];
 	/** EVERY `.jsonl` under sessions/ (verified child or not), keyed by parsed session id. */
 	bySessionId: Map<string, IndexedSessionFile[]>;
 	truncated: boolean;
@@ -575,6 +678,8 @@ function indexSessionTree(
 ): SessionIndex {
 	const index: SessionIndex = {
 		verified: [],
+		allVerifiedChildren: [],
+		orphanSidecars: [],
 		bySessionId: new Map(),
 		truncated: false,
 		scannedFiles: 0,
@@ -607,12 +712,34 @@ function indexSessionTree(
 			index.unreadableDirs++;
 			continue;
 		}
+		const fileSet = new Set(files);
 		for (const fn of files) {
+			if (fn.endsWith(".jsonl.acp.json")) {
+				const baseJsonlName = fn.slice(0, -".acp.json".length);
+				if (!fileSet.has(baseJsonlName)) {
+					const acpPath = join(dirPath, fn);
+					try {
+						const acpSt = lstatSync(acpPath);
+						if (acpSt.isFile() && !acpSt.isSymbolicLink()) {
+							index.orphanSidecars.push({
+								subdir,
+								filePath: acpPath,
+								baseJsonlName,
+								size: acpSt.size,
+								mtimeMs: acpSt.mtimeMs,
+							});
+						}
+					} catch {
+						// ignore
+					}
+				}
+				continue;
+			}
 			if (!fn.endsWith(".jsonl")) continue;
 			const underscore = fn.lastIndexOf("_");
 			if (underscore < 0) continue;
 			const sid = fn.slice(underscore + 1, -".jsonl".length);
-			if (!sid || sid === parentSessionId || !isSafeId(sid)) continue;
+			if (!sid || !isSafeId(sid)) continue;
 			const filePath = join(dirPath, fn);
 			let st;
 			try {
@@ -632,7 +759,13 @@ function indexSessionTree(
 			const known = index.bySessionId.get(sid);
 			if (known) known.push(info);
 			else index.bySessionId.set(sid, [info]);
-			if (isVerifiedChildOfParent(filePath, parentSessionId)) index.verified.push(info);
+			if (sid === parentSessionId) continue;
+			const verifiedParent = verifiedChildParentId(filePath, sid);
+			if (verifiedParent) {
+				info.verifiedParentId = verifiedParent;
+				index.allVerifiedChildren.push(info);
+				if (verifiedParent === parentSessionId) index.verified.push(info);
+			}
 		}
 	}
 	index.truncated = index.truncated || budget.truncated;
@@ -784,7 +917,18 @@ export function archiveStaleChildSessions(opts: ChildGcOptions): ChildGcResult {
 		scannedEntries: 0,
 	};
 
-	const { agentDir, parentSessionId, tasks, activeLeaseSessionIds, historicalLeases, dryRun = false } = opts;
+	const {
+		agentDir,
+		parentSessionId,
+		tasks,
+		activeLeaseSessionIds,
+		historicalLeases,
+		piWebDataDir,
+		includeInactiveParents = false,
+		mode = "archive",
+		pruneOrphanSidecars = false,
+		dryRun = false,
+	} = opts;
 	if (!agentDir || !parentSessionId || !isSafeId(parentSessionId)) {
 		return result;
 	}
@@ -792,6 +936,11 @@ export function archiveStaleChildSessions(opts: ChildGcOptions): ChildGcResult {
 	const nowMs = opts.nowMs ?? Date.now();
 	const reviewerCooldownMs = Math.max(MIN_SAFE_GC_COOLDOWN_MS, opts.reviewerCooldownMs ?? DEFAULT_REVIEWER_GC_COOLDOWN_MS);
 	const workerCooldownMs = Math.max(MIN_SAFE_GC_COOLDOWN_MS, opts.workerCooldownMs ?? DEFAULT_WORKER_GC_COOLDOWN_MS);
+	const inactiveParentIdleMs = Math.max(MIN_SAFE_GC_COOLDOWN_MS, opts.inactiveParentIdleMs ?? DEFAULT_INACTIVE_PARENT_IDLE_MS);
+	const inactiveParentChildCooldownMs = Math.max(
+		MIN_SAFE_GC_COOLDOWN_MS,
+		opts.workerCooldownMs !== undefined ? workerCooldownMs : Math.min(workerCooldownMs, DEFAULT_INACTIVE_PARENT_IDLE_MS),
+	);
 	const fault = opts.__moveFault;
 	const statFault = opts.__statFault;
 	/** Fail-closed probe bound to this run's TEST-ONLY stat seam: `"fail"` ⇒ a simulated non-ENOENT stat error. */
@@ -944,7 +1093,7 @@ export function archiveStaleChildSessions(opts: ChildGcOptions): ChildGcResult {
 	if (index.unreadableDirs > 0) {
 		result.warnings.push(`${index.unreadableDirs} workspace directory/ies could not be listed during discovery`);
 	}
-	const discovered = index.verified;
+	const discovered = includeInactiveParents ? index.allVerifiedChildren : index.verified;
 	const discoveredIds = new Set(discovered.map(d => d.sessionId));
 	result.totalMatched = discovered.length;
 
@@ -956,7 +1105,7 @@ export function archiveStaleChildSessions(opts: ChildGcOptions): ChildGcResult {
 	}
 
 	// FAIL CLOSED: unknown pin ownership means we cannot prove any candidate is unpinned.
-	const pinState = loadPinnedSessionIds(agentDir);
+	const pinState = loadPinnedSessionIds(agentDir, { piWebDataDir });
 	if (!pinState.ok) {
 		result.pinsUnknown = true;
 		result.errors.push(`pin state unknown (${pinState.reason}); archived nothing (fail-closed)`);
@@ -969,10 +1118,46 @@ export function archiveStaleChildSessions(opts: ChildGcOptions): ChildGcResult {
 		);
 	}
 
-	if (discovered.length === 0) return result;
+	const tryPruneOrphanSidecars = () => {
+		if (!pruneOrphanSidecars || index.orphanSidecars.length === 0) return;
+		let removed = 0;
+		let freed = 0;
+		for (const acp of index.orphanSidecars) {
+			if ((nowMs - acp.mtimeMs) < MIN_SAFE_GC_COOLDOWN_MS) continue;
+			const siblingJsonl = join(dirname(acp.filePath), acp.baseJsonlName);
+			const archivedJsonl = join(archiveRoot, acp.subdir, acp.baseJsonlName);
+			if (probe(siblingJsonl, "sidecar-detection") !== "absent") continue;
+			if (probe(archivedJsonl, "sidecar-detection") !== "absent") continue;
+			if (dryRun) {
+				removed++;
+				freed += acp.size;
+				continue;
+			}
+			try {
+				unlinkSync(acp.filePath);
+				if (probe(acp.filePath, "completion") === "absent") {
+					removed++;
+					freed += acp.size;
+				}
+			} catch (err) {
+				result.warnings.push(`${acp.filePath}: orphan sidecar removal failed: ${errMessage(err)}`);
+			}
+		}
+		if (removed > 0) {
+			result.orphanSidecarsRemoved = removed;
+			result.orphanSidecarBytesFreed = freed;
+			result.totalBytesFreed += freed;
+		}
+	};
+
+	if (discovered.length === 0) {
+		tryPruneOrphanSidecars();
+		return result;
+	}
 
 	for (const child of discovered) {
 		const sid = child.sessionId;
+		const isForeignParent = Boolean(child.verifiedParentId && child.verifiedParentId !== parentSessionId);
 
 		if (pinnedIds.has(sid)) {
 			result.skippedPinned++;
@@ -985,11 +1170,23 @@ export function archiveStaleChildSessions(opts: ChildGcOptions): ChildGcResult {
 			continue;
 		}
 
+		if (isForeignParent && child.verifiedParentId) {
+			if (pinnedIds.has(child.verifiedParentId) || activeLeaseSessionIds.has(child.verifiedParentId)) {
+				result.skippedActive++;
+				continue;
+			}
+			const parentFiles = index.bySessionId.get(child.verifiedParentId) ?? [];
+			if (parentFiles.some(pf => (nowMs - pf.mtimeMs) < inactiveParentIdleMs)) {
+				result.skippedActive++;
+				continue;
+			}
+		}
+
 		let kind: "reviewer" | "worker" | "orphaned";
 		let cooldownMs: number;
 		let taskIds: string[];
 
-		if (sidTasks.length > 0) {
+		if (!isForeignParent && sidTasks.length > 0) {
 			kind = sidTasks.every(isReviewerTask) ? "reviewer" : "worker";
 			cooldownMs = kind === "reviewer" ? reviewerCooldownMs : workerCooldownMs;
 			taskIds = sidTasks.map(t => t.id);
@@ -1006,12 +1203,16 @@ export function archiveStaleChildSessions(opts: ChildGcOptions): ChildGcResult {
 				result.skippedCooldown++;
 				continue;
 			}
-		} else {
+		} else if (!isForeignParent) {
 			const hist = histBySession.get(sid) ?? [];
 			const isHistReviewer = hist.length > 0 && hist.every(isReviewerTask);
 			kind = isHistReviewer ? "reviewer" : "orphaned";
 			cooldownMs = isHistReviewer ? reviewerCooldownMs : workerCooldownMs;
 			taskIds = hist.map(h => h.id);
+		} else {
+			kind = "orphaned";
+			cooldownMs = inactiveParentChildCooldownMs;
+			taskIds = [];
 		}
 
 		if ((nowMs - child.mtimeMs) < cooldownMs) {
@@ -1048,6 +1249,62 @@ export function archiveStaleChildSessions(opts: ChildGcOptions): ChildGcResult {
 				continue;
 			}
 			hasAcp = true;
+		}
+
+		if (mode === "delete") {
+			const totalBytes = child.size + sidecarBytes;
+			if (dryRun) {
+				result.archived.push({
+					sessionId: sid,
+					taskIds,
+					kind,
+					sourceFile: child.filePath,
+					archiveFile: "(delete)",
+					bytes: totalBytes,
+					deleted: true,
+					acpArchiveFile: null,
+				});
+				result.totalBytesFreed += totalBytes;
+				continue;
+			}
+			if (hasAcp) {
+				try {
+					unlinkSync(acpSrc);
+				} catch (err) {
+					result.errors.push(`${sid}.acp.json: delete failed: ${errMessage(err)}; pair intact`);
+					result.skippedMoveError++;
+					continue;
+				}
+				if (probe(acpSrc, "completion") !== "absent") {
+					result.errors.push(`${sid}.acp.json: delete could not be verified; jsonl retained`);
+					result.skippedMoveError++;
+					continue;
+				}
+			}
+			try {
+				unlinkSync(child.filePath);
+			} catch (err) {
+				result.errors.push(`${sid}: jsonl delete failed: ${errMessage(err)}`);
+				result.skippedMoveError++;
+				continue;
+			}
+			if (probe(child.filePath, "completion") !== "absent") {
+				result.errors.push(`${sid}: jsonl delete could not be verified`);
+				result.skippedMoveError++;
+				continue;
+			}
+			result.archived.push({
+				sessionId: sid,
+				taskIds,
+				kind,
+				sourceFile: child.filePath,
+				archiveFile: "(delete)",
+				bytes: totalBytes,
+				deleted: true,
+				acpArchiveFile: null,
+			});
+			result.totalBytesFreed += totalBytes;
+			continue;
 		}
 
 		const destDir = join(archiveRoot, child.subdir);
@@ -1392,5 +1649,6 @@ export function archiveStaleChildSessions(opts: ChildGcOptions): ChildGcResult {
 		result.totalBytesFreed += totalBytes;
 	}
 
+	tryPruneOrphanSidecars();
 	return result;
 }

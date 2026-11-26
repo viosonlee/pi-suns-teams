@@ -24,6 +24,10 @@ import {
 	enforceWaitTimeout,
 	handleQuotaFailure,
 	applyQuotaFailure,
+	clearRoleQuotaLock,
+	reconcileQuotaState,
+	isRoleUnavailable,
+	DEFAULT_UNAVAILABLE_COOLDOWN_MS,
 	effectiveMaxCalls,
 	effectiveBudgetUSD,
 	initialState,
@@ -565,6 +569,85 @@ test("所有模式与目标提示只声明已移除数值上限，不要求通�
 	for (const text of [buildPolicy("economy", cfg), buildPolicy("strict", cfg), buildGoalPolicy(cfg), goalContinuePrompt({ ...baseState, goal: newGoal("x", ["y"]) }, cfg)]) {
 		assert.doesNotMatch(text, /budget\/call\/fuse gates apply|Round cap \d|预算\/轮次耗尽|预算与额度由代码强制校验|\/team budget set/);
 	}
+});
+
+test("isQuotaError isolates real rate-limit/quota failures from file/line/port false positives", () => {
+	assert.equal(isQuotaError('magpie API error (429): {"eligible_promo":null,"limit_window_minutes":300}'), true);
+	assert.equal(isQuotaError("insufficient_quota: monthly credits exhausted"), true);
+	assert.equal(isQuotaError("HTTP 402 payment required / 额度不足"), true);
+	assert.equal(isQuotaError("MainMenu.razor(429,12): warning CS0168"), false);
+	assert.equal(isQuotaError("syntax error at line 429; port 402 already in use"), false);
+	assert.equal(isQuotaError("blocked: insufficient permissions and insufficient evidence"), false);
+});
+
+test("applyQuotaFailure / isRoleUnavailable / reconcileQuotaState unblock on model switch or cooldown", () => {
+	const customCfg = mergeConfig(cfg, {
+		roles: { ...cfg.roles, cp: { ...cfg.roles.cp, model: "model/primary" } },
+		fallbacks: { ...cfg.fallbacks, cp: ["model/fb1"] },
+	});
+	const t0 = 1_700_000_000_000;
+	const s1 = applyQuotaFailure(initialState(customCfg), "cp", customCfg, "429 rate limit", "model/primary", t0);
+	assert.equal(s1.paused, false);
+	assert.equal(s1.nextModel, "model/fb1");
+	assert.equal(s1.state.autoFallbackBase?.cp, "model/primary");
+
+	const s2 = applyQuotaFailure(s1.state, "cp", customCfg, "429 rate limit", "model/fb1", t0 + 1000);
+	assert.equal(s2.paused, true);
+	assert.equal(s2.state.unavailableModel?.cp, "model/fb1");
+	assert.equal(s2.state.unavailableAt?.cp, t0 + 1000);
+
+	// Same paused model within cooldown -> blocked
+	assert.equal(decideCall({ role: "cp", prompt: "review", state: s2.state, cfg: customCfg, prices, activeCount: 0, nowMs: t0 + 5000 }).block, true);
+	// Explicit different model in Agent call -> unblocked immediately
+	assert.equal(decideCall({ role: "cp", prompt: "review", state: s2.state, cfg: customCfg, prices, activeCount: 0, explicitModel: "model/swe-2-1", nowMs: t0 + 5000 }).block, false);
+	// Cooldown elapsed -> unblocked
+	assert.equal(decideCall({ role: "cp", prompt: "review", state: s2.state, cfg: customCfg, prices, activeCount: 0, nowMs: t0 + 1000 + DEFAULT_UNAVAILABLE_COOLDOWN_MS }).block, false);
+
+	// Reconciling after state.roleModel switch clears pause lock
+	const switched = structuredClone(s2.state);
+	switched.roleModel.cp = "model/swe-2-1";
+	reconcileQuotaState(switched, customCfg, {}, t0 + 5000);
+	assert.equal(switched.unavailable.cp, undefined);
+	assert.equal(switched.fallbackTried?.cp, undefined);
+	assert.equal(isRoleUnavailable(switched, "cp", undefined, t0 + 5000), null);
+});
+
+test("stateFromEntries automatically recovers legacy (01a2115e-style) stuck unavailable.cp after user model switch or expiry", () => {
+	const customCfg = mergeConfig(cfg, {
+		roles: { ...cfg.roles, cp: { ...cfg.roles.cp, model: "magpie/devin/swe-2-1" } },
+		fallbacks: { ...cfg.fallbacks, cp: ["magpie/devin/gpt-5-3-codex", "magpie/codex/gpt-6.1-terra"] },
+	});
+	const base = initialState(customCfg);
+	// Reproduce exact legacy bug state: unavailable.cp set without unavailableModel/unavailableAt,
+	// later user switched roleModel.cp to a non-fallback model, plus old timestamp
+	const pausedState: TeamState = {
+		...base,
+		enabled: true,
+		unavailable: { cp: "额度/限流不足（429）" },
+		fallbackTried: { cp: 4 },
+		roleModel: { cp: "magpie/devin/gpt-5-3-codex" },
+	};
+	const entries = [
+		{ type: "custom", customType: "team-state", timestamp: "2026-11-26T07:37:36.000Z", data: pausedState },
+		{
+			type: "custom",
+			customType: "team-state-delta",
+			timestamp: "2026-11-26T08:33:47.000Z",
+			data: { v: 1, top: { roleModel: { cp: "magpie/devin/swe-2-1" } } },
+		},
+	];
+	// Even immediately after the switch (nowMs = 08:34:00Z), user-switched non-fallback model unlocks cp!
+	const restoredImmediately = stateFromEntries(entries, customCfg, Date.parse("2026-11-26T08:34:00.000Z"));
+	assert.equal(restoredImmediately.state.unavailable.cp, undefined);
+	assert.equal(restoredImmediately.state.fallbackTried.cp, undefined);
+	assert.equal(decideCall({ role: "cp", prompt: "review", state: restoredImmediately.state, cfg: customCfg, prices, activeCount: 0 }).block, false);
+
+	// clearRoleQuotaLock preserves or resets autoFallbackBase as requested
+	const withFallback: TeamState = { ...base, roleModel: { cp: "fb" }, autoFallbackBase: { cp: "orig" }, unavailable: { cp: "429" }, fallbackTried: { cp: 1 } };
+	clearRoleQuotaLock(withFallback, "cp", true);
+	assert.equal(withFallback.roleModel.cp, undefined);
+	assert.equal(withFallback.autoFallbackBase?.cp, undefined);
+	assert.equal(withFallback.unavailable.cp, undefined);
 });
 
 console.log(`\n全部通过：${pass} 项`);

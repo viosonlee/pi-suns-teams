@@ -267,4 +267,33 @@ test('maxConcurrent launch cap is unchanged and independent work is not serializ
 	assert.equal(dispatchBatch(b).length, 5, 'all independent tasks are selected by the ledger; the host cap still bounds launches');
 });
 
+// ---------------------------------------------------------------- 10. anti-worktree-sprawl guards
+test('rejects pure doc/checklist worktree isolation without waiver, allows shared workspace or explicit waiver', () => {
+	const { b, add } = fixture();
+	assert.throws(
+		() => add([{ id: 'W-doc-wt', role: 'cameron', writePaths: ['docs/checklist.md'], isolation: 'worktree', worktreePath: '/repo-worktrees/doc-wt' }]),
+		/pure documentation\/checklist\/report/i,
+	);
+	assert.doesNotThrow(() => add([
+		{ id: 'W-doc-shared', role: 'cameron', writePaths: ['docs/checklist.md'] },
+		{ id: 'W-doc-waived', role: 'cameron', writePaths: ['docs/other.md'], isolation: 'worktree', worktreePath: '/repo-worktrees/doc-waived', splitWaiverReason: 'explicit branch snapshot requested' },
+	]));
+});
+
+test('caps active concurrent extra worktrees at 5 without blocking normal shared-workspace tasks', () => {
+	const { b, add } = fixture();
+	add(Array.from({ length: 5 }, (_, i) => ({
+		id: `W-wt-${i}`,
+		writePaths: [`src/f${i}.ts`],
+		isolation: 'worktree',
+		worktreePath: `/repo-worktrees/wt-${i}`,
+	})));
+	assert.throws(
+		() => add([{ id: 'W-wt-6', writePaths: ['src/f6.ts'], isolation: 'worktree', worktreePath: '/repo-worktrees/wt-6' }]),
+		/Too many concurrent isolated worktrees/i,
+	);
+	assert.doesNotThrow(() => add([{ id: 'W-shared-ok', writePaths: ['src/shared-ok.ts'] }]), 'normal shared-workspace tasks are unaffected by extra-worktree cap');
+	assert.doesNotThrow(() => add([{ id: 'W-wt-6-waived', writePaths: ['src/f6.ts'], isolation: 'worktree', worktreePath: '/repo-worktrees/wt-6', splitWaiverReason: 'unavoidable 6th collision' }]));
+});
+
 console.log(`\nW-120 scope granularity matrix: ${passed} passed`);

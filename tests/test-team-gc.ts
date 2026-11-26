@@ -144,6 +144,71 @@ try {
 	assert.strictEqual(res2.archived.length, 0);
 	console.log("✓ repeated GC run is idempotent (0 archived)");
 
+	// -----------------------------------------------------------------
+	// Hosted pi-web format (pi-web.subsession.spawned), ~/.pi-web/session-pins.json,
+	// --all (includeInactiveParents), --delete, and orphan sidecar cleanup.
+	const piWebDir = join(root, "pi-web-data");
+	mkdirSync(piWebDir, { recursive: true });
+	const inactiveParentId = "inactive-root-001";
+	const activeParentId = parentId;
+
+	const makeHostedChild = (sid: string, pId: string, mtime: Date, withAcp = true) => {
+		const fp = join(sessionsDir, `2026-11-16T01-00-00-000Z_${sid}.jsonl`);
+		const lines = [
+			JSON.stringify({ type: "session", version: 3, id: sid, cwd: "/tmp", timestamp: mtime.toISOString() }),
+			JSON.stringify({ type: "model_change", id: "m0", parentId: null, timestamp: mtime.toISOString() }),
+			JSON.stringify({ type: "custom", id: "m1", parentId: "m0", customType: "pi-web.subsession.spawned", data: { version: 1, spawnedBySessionId: pId, spawnedSessionId: sid }, timestamp: mtime.toISOString() }),
+			JSON.stringify({ type: "message", id: "m2", parentId: "m1", timestamp: mtime.toISOString(), message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] } }),
+		];
+		writeFileSync(fp, lines.join("\n") + "\n");
+		utimesSync(fp, mtime, mtime);
+		if (withAcp) {
+			writeFileSync(`${fp}.acp.json`, JSON.stringify({ hosted: true }));
+			utimesSync(`${fp}.acp.json`, mtime, mtime);
+		}
+		return fp;
+	};
+
+	// Inactive parent root itself (5h old) -> MUST NOT be deleted
+	const fInactiveRoot = makeChildFile(sessionsDir, inactiveParentId, null, new Date(now - 5 * 3600_000), false);
+	// Old hosted child of inactive parent (4h old > 2h idle) -> DELETE under --all --delete
+	const fHostedOld = makeHostedChild("hosted-old-child", inactiveParentId, new Date(now - 4 * 3600_000));
+	// Hosted child of inactive parent pinned in session-pins.json -> KEEP
+	const fHostedPinned = makeHostedChild("hosted-pinned-child", inactiveParentId, new Date(now - 4 * 3600_000));
+	// Recent hosted child (< 30m) -> KEEP even under --all --delete
+	const fHostedFresh = makeHostedChild("hosted-fresh-child", inactiveParentId, new Date(now - 10 * 60_000));
+	// Orphan .acp.json sidecar with missing .jsonl (3h old) -> PRUNE
+	const fOrphanSidecar = join(sessionsDir, "2026-11-15T00-00-00-000Z_missing-session.jsonl.acp.json");
+	writeFileSync(fOrphanSidecar, JSON.stringify({ orphan: true }));
+	utimesSync(fOrphanSidecar, t3hAgo, t3hAgo);
+	writeFileSync(join(piWebDir, "session-pins.json"), JSON.stringify({
+		version: 1,
+		entries: [{ scope: { kind: "session-pins", projectId: "proj-1", workspaceId: "ws-1" }, ids: ["hosted-pinned-child"], revision: 1 }],
+	}));
+
+	const delRes = archiveStaleChildSessions({
+		agentDir: root,
+		piWebDataDir: piWebDir,
+		parentSessionId: activeParentId,
+		tasks,
+		activeLeaseSessionIds: activeLeases,
+		historicalLeases,
+		nowMs: now,
+		includeInactiveParents: true,
+		inactiveParentIdleMs: 2 * 3600_000,
+		mode: "delete",
+		pruneOrphanSidecars: true,
+		dryRun: false,
+	});
+	assert.strictEqual(delRes.errors.length, 0, `Unexpected delete GC errors: ${delRes.errors.join("; ")}`);
+	assert.ok(!existsSync(fHostedOld) && !existsSync(`${fHostedOld}.acp.json`), "Hosted child of inactive parent deleted cleanly");
+	assert.ok(!existsSync(fOrphanSidecar), "Orphan .acp.json sidecar removed");
+	assert.strictEqual(delRes.orphanSidecarsRemoved, 1);
+	assert.ok(existsSync(fInactiveRoot), "Inactive root session MUST NEVER be deleted");
+	assert.ok(existsSync(fHostedPinned), "session-pins.json pinned child MUST be kept");
+	assert.ok(existsSync(fHostedFresh), "Recent <30m hosted child MUST be kept");
+	console.log("✓ hosted pi-web.subsession.spawned, session-pins.json, --all --delete, and orphan sidecar pruning verified");
+
 	console.log("\nAll team-gc tests passed!");
 } finally {
 	rmSync(root, { recursive: true, force: true });
