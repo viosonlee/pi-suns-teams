@@ -73,7 +73,7 @@ const TEAM_EXTENSION_PATH = (() => {
 })();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.2.1";
+export const PI_TEAMS_VERSION = "1.2.2";
 export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
@@ -594,10 +594,11 @@ export function extractEscalation(prompt: string, minChars: number): string | nu
 
 /** 本会话生效的金额上限；0 表示不设金额上限（调用次数与并发仍然有效）。 */
 /** 派活时附在任务后的契约（Agent 之间统一英文）。 */
-export function buildTaskContract(taskId: string, scope?: { role: string; readPaths: string[]; writePaths: string[]; reviewTier?: WorkTask["reviewTier"]; autoAccept?: boolean; reviewerRole?: string }): string {
+export function buildTaskContract(taskId: string, scope?: { role: string; title?: string; readPaths: string[]; writePaths: string[]; reviewTier?: WorkTask["reviewTier"]; autoAccept?: boolean; reviewerRole?: string; isolation?: WorkTask["isolation"] }): string {
 	const scopeLine = scope
 		? [`SCOPE: ${taskId} role=${scope.role} readPaths=${JSON.stringify(scope.readPaths)} writePaths=${JSON.stringify(scope.writePaths)}`]
 		: [];
+	const needsFullWorktreeBlock = !scope || scope.isolation === "worktree" || /\b(?:integrate|integration|merge)\b/i.test(`${taskId} ${scope.title ?? ""}`);
 	return [
 		...scopeLine,
 		`[TEAM CONTRACT ${taskId}] Your report must include:`,
@@ -611,6 +612,7 @@ export function buildTaskContract(taskId: string, scope?: { role: string; readPa
 		"Review policy: Ayton (QA/real-device verification) and Cameron (Release/Ops/Docs) with unset reviewTier default to CP-review exemption. Booker and Bridges (product code writers) default to independent CP review; explicit reviewTier:none waives review for bounded analysis or small/granular non-decision read or write tasks. reviewTier:llm, autoAccept:false or explicit reviewerRole requests independent review. Exemption only changes who reviews: an exempt delivery stays reported and the main CP accepts it after checking the evidence. Explicit deterministic + autoAccept:true still requires ALL acceptance criteria to be objective assertions (file:/artifact: existence, exit code 0); test-count prose is not auto-verified. That is the only route that settles without a reviewer or a parent acceptance call. Review tasks and parent/CP orchestration never auto-accept.",
 		...(scope ? [`Delivery review settings: reviewTier=${scope.reviewTier ?? "unset"} autoAccept=${scope.autoAccept ?? "unset"} reviewerRole=${scope.reviewerRole ?? "unset"}.`] : []),
 		"Exemption is not self-review or permission to skip evidence: report a clean terminal result with real file/command evidence. Do not claim completion for failures, aborted/unverified/incomplete output, integration or cleanup that is still pending, or outstanding dependencies. Existing reviewer holds and CP REWORK obligations remain binding.",
+		...(needsFullWorktreeBlock ? [
 		"Execution requirements:",
 		"- declare dependencies and owned paths/shared resources before touching files; do not write outside your owned paths or against another worker's live writes.",
 		"- for authorized writing tasks in Git, commit only your task-owned paths (never `git add .`); preserve unrelated dirty files in the target. Read-only roles must not edit or commit product code; non-git tasks do not need commits.",
@@ -624,6 +626,9 @@ export function buildTaskContract(taskId: string, scope?: { role: string; readPa
 		"- task-owned commit SHA(s)",
 		"- integration owner and integration status",
 		"- cleanup status",
+		] : [
+			"Execution & scope: stay strictly inside your owned read/write paths (non-worktree task — Worktree: WORKTREE_NOT_USED; skip worktree ceremony unless explicitly isolating a branch).",
+		]),
 		"Write the report in English. Conclusions without evidence are invalid.",
 	].join("\n");
 }
@@ -1407,7 +1412,7 @@ export function buildPolicy(mode: Mode, cfg: TeamConfig): string {
 		"Parent sideline discipline: delegate ALL code/filesystem investigation, editing (bridges/booker), testing (ayton), docs (cameron), and code review/deep technical audit (cp). Keep only intent analysis, task decomposition, DAG bookkeeping, Agent dispatch, arbitration, and final team_goal acceptance in the main session. Never get impatient while dispatched children are running and start doing their job yourself — wait for completion notices or do one join when no ready work remains.",
 		"Every dispatch brief must include: goal, scope, allowed/forbidden paths, acceptance evidence, and only necessary context (file/symbol/error). Do not transcribe the whole conversation.",
 		"Use team_tasks to maintain the persistent additive request/task ledger before dispatch. A new user request adds scope; it never implicitly cancels older requests, tasks, or acceptance conditions. Resolve each request with evidence (including answered/non-actionable messages); cancellation/supersession needs explicit user authority, reason and source evidence.",
-		"Decompose work into independently verifiable deliverables, not one large role-shaped bundle. Register request IDs, dependencies, concrete read/write scopes and acceptance. Include TEAM_TASK: W-id in each Agent prompt. Parent tasks may cover decisive analysis/acceptance; retain separate integration/regression/cleanup obligations where needed.",
+		"Decompose work into small, single-slice verifiable deliverables (1-3 ACs, 1-3 concrete files per task), NEVER one large multi-layer role bundle. Two-Phase Fan-Out: for unfamiliar or cross-file features/bugs, FIRST launch 1 fast read-only bridges scout (`declaredReadOnly: true`, `reviewTier: \"none\"`) to map exact `file:line` targets and parallel slices; THEN fan out narrow file-scoped tasks in parallel across bridges/booker plus separate concrete-file `ayton` test tasks (never lock generic `tests/` directory on feature tasks). Use `reviewTier: \"none\"` on narrow unambiguous single-file slices to eliminate review ceremony overhead, or integrate slices cleanly before one combined `cp` review + `ayton` regression. Register request IDs, dependencies, concrete read/write scopes and acceptance. Include TEAM_TASK: W-id in each Agent prompt. Parent tasks may cover decisive analysis/acceptance; retain separate integration/regression/cleanup obligations where needed.",
 		"Deterministic Scheduler & Concurrency Utilization: The deterministic Scheduler automatically manages subagent capacity up to 20 concurrency slots. Calling team_tasks or team_dispatch programmatically auto-dispatches all ready independent tasks in parallel and auto-backfills empty slots immediately as subtasks complete. Explicit deterministic + autoAccept:true deliverables with ALL objective assertions verified (file/artifact existence, exit code 0) auto-accept and unlock successors; declare test counts as `exit code 0` criteria instead, prose counts route to review. Review-exempt deliveries skip the reviewer child but still need one parent acceptance call; batch those acceptances with the next dispatch instead of reviewing trivia.",
 		"Scheduling is rolling, not wave/barrier based: proactively analyze ALL open user requests upfront and decompose independent items into fine file-scoped or worktree-isolated W-* tasks to keep up to 20 parallel slots filled—never trickle 1-3 tasks and yield while open backlog remains. As each child returns, immediately settle reported work, unlock successors, split write-scope bottlenecks into independent worktrees where appropriate, and refill free slots. NEVER use yield_to_subsessions to dodge a scope lock, blocked reviewer, or unresolved dependency: resolve/split/reconcile what you can now, OR explicitly escalate every concrete blocker and needed human decision directly to the user before stopping/yielding.",
 		"Prefer Agent resume for rework when the existing worker's role and cwd still fit the task; do not restart only to repeat background. Existing children retain their creation-time role snapshot. If an old child refuses an approved task because its role instructions are obsolete, confirm it has stopped, then start a fresh child with a concise evidence handoff; do not repeatedly resume the obsolete role or duplicate live writes.",
@@ -4202,9 +4207,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					requestIds: { type: "array", items: { type: "string" } }, dependsOn: { type: "array", items: { type: "string" } },
 					readPaths: { type: "array", items: { type: "string" } }, writePaths: { type: "array", items: { type: "string" } },
 					acceptance: { type: "array", items: { type: "string" } },
-					reviewTier: { type: "string", enum: ["deterministic", "llm", "none"], description: "Unset: Ayton (QA/real-device) & Cameron (Release/Ops/Docs) default review-exempt; Booker & Bridges default CP review. none: explicit waiver for bounded analysis or small non-decision tasks. llm: independent CP review. deterministic: existing ALL machine assertions gate with autoAccept:true (the only automatic settlement route). Exemption skips the reviewer child but the parent still accepts the reported delivery. Existing reviewer obligations are preserved." },
+					reviewTier: { type: "string", enum: ["deterministic", "llm", "none"], description: "Unset: Ayton (QA/real-device) & Cameron (Release/Ops/Docs) default review-exempt; Booker & Bridges default CP review. none: explicit waiver for bounded analysis or small single-file/non-decision tasks. llm: independent CP review. deterministic: existing ALL machine assertions gate with autoAccept:true (the only automatic settlement route). Exemption skips the reviewer child but the parent still accepts the reported delivery. Existing reviewer obligations are preserved." },
 					autoAccept: { type: "boolean", description: "false requests review even for exempt roles; true is required for deterministic machine acceptance, but not for Ayton/Cameron defaults or reviewTier:none. Never bypasses evidence or existing CP holds." },
 					reviewerRole: { type: "string", description: "Explicit independent reviewer request disables role-based review exemption; defaults do not populate this field. Reviewer must remain independent of implementer." },
+					splitWaiverReason: { type: "string", description: "Optional brief justification ONLY when a task genuinely cannot be split into <= 3 ACs, <= 5 writePaths, or concrete non-directory slices." },
 				}, required: ["title", "role", "requestIds", "dependsOn", "readPaths", "writePaths", "acceptance"] } },
 				updates: { type: "array", items: { type: "object", properties: {
 					id: { type: "string" }, status: { type: "string", enum: ["ready", "queued", "done", "blocked", "cancelled", "superseded", "reviewing", "failed"] },

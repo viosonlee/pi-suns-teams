@@ -256,6 +256,8 @@ try {
 		}
 		const contract = buildTaskContract(f.task.id, f.task);
 		assert.match(contract, /exempt delivery stays reported and the main CP accepts it/i);
+		assert.match(contract, /WORKTREE_NOT_USED/);
+		assert.doesNotMatch(contract, /git worktree remove/);
 	});
 
 	test("only file/artifact/exit criteria are machine assertions; prose and test counts are not", () => {

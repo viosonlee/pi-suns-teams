@@ -66,6 +66,13 @@ test('DAG cycle, unknown dependencies, duplicate IDs, read-only role writes reje
  const {b,q}=fixture();
  addTasks(b,[spec(q.id,'W-ayton-tests',{role:'ayton',writePaths:['tests/W-a.test.ts']})],'/repo');
  assert.deepEqual(b.tasks[0].writePaths,['/repo/tests/W-a.test.ts']);
+ // Granularity guardrails: reject >3 ACs, multi-dir/code+tests/ bundling, >=6 writePaths unless splitWaiverReason
+ assert.throws(()=>addTasks(b,[spec(q.id,'W-fat-ac',{acceptance:['a1','a2','a3','a4']})],'/repo'),/too coarse/);
+ assert.throws(()=>addTasks(b,[spec(q.id,'W-fat-dirs',{writePaths:['src/a.ts','tests/']})],'/repo'),/generic tests\//);
+ assert.throws(()=>addTasks(b,[spec(q.id,'W-fat-multi-dir',{writePaths:['src/','pkg/']})],'/repo'),/multi-directory locks/);
+ assert.throws(()=>addTasks(b,[spec(q.id,'W-fat-files',{writePaths:['a.ts','b.ts','c.ts','d.ts','e.ts','f.ts']})],'/repo'),/too many writePaths/);
+ addTasks(b,[spec(q.id,'W-waived',{acceptance:['a1','a2','a3','a4'],splitWaiverReason:'atomic single migration'})],'/repo');
+ assert.equal(b.tasks.at(-1)!.splitWaiverReason,'atomic single migration');
 });
 test('reported is not done; verified return unlocks successors while unrelated child still runs',()=>{
  const {b,q}=fixture(); addTasks(b,[spec(q.id,'W-a'),spec(q.id,'W-b'),spec(q.id,'W-c',{dependsOn:['W-a']})],'/repo');

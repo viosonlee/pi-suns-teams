@@ -39,6 +39,12 @@
 - **手动与自动派发协调**：`team_tasks add/update` 的 `autoDispatch:false` 为受影响任务持久保留手动派发权，不影响其他自动任务；用 `Agent` 提供完整任务说明/旧子会话 `resume`，或用 `team_dispatch` 显式释放给自动调度器。同一任务、同一角色的重复派发返回已有运行会话，不新增执行。重新排队的已执行任务默认保留手动恢复权，明确 `autoDispatch:true` 才授权后台重新派发。
 - **内置在线检查与自动更新**：支持一键 `/team check-update` 与 `/team update`。
 
+### v1.2.2：微任务细拆并行提速、防巨无霸工单护栏与契约降税
+
+- **`team_tasks add` 颗粒度硬护栏（[team-ledger.ts](file:///home/lifeng/workspace/pi-teams/team-ledger.ts)）**：拦截普通实施单一次塞入 `> 3` 条 AC、`>= 6` 个写路径、跨多个整目录写锁，或 `booker`/`bridges` 将业务代码与泛目录 `tests/` 混写占锁的行为（特殊不可拆任务需显式填写 `splitWaiverReason`）；明确引导拆成 `1~3` 文件、`1~3` 条 AC 的可并行微任务，测试另拆给 `ayton` 指定具体测试文件名。
+- **「先探后扇出（Two-Phase Fan-Out）」拆分规范**：复杂或跨模块需求先派 1 个只读 `bridges` 快速摸出精确 `file:line` 清单与并行切分方案，再批量并发派发多个窄域小单，大幅降低单个大单多次 `REWORK` 的返工成本。
+- **非 Worktree 小单契约精简（[team.ts](file:///home/lifeng/workspace/pi-teams/extensions/team.ts) `buildTaskContract`）**：对普通只读/非隔离小任务省略冗长的 12 条 Git worktree 合并清理模板废话，减少子会话提示噪声与无效 token 消耗。
+
 ### v1.2.1：彻底整治主会话消极 `yield`、僵尸 `running` 卡锁与阻塞静默不上报
 
 - **`yield_to_subsessions` 防躺平与阻塞唤醒门禁**：当账本仍有可直接派发的 `ready` 任务、可由主会话验收/处理的 `reported` 交付、或新暴露且未处理/上报的 `blocked` / `uncertain` / `failed` 阻塞项时，拦截静默挂起，强制主会话先拆解派满可用槽位、结算已完成结果或将具体阻塞点明确上报给用户。
