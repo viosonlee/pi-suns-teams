@@ -526,6 +526,9 @@ export function addTasks(board: WorkLedger, values: unknown, cwd: string, option
 		if (missingDeps.length) {
 			throw new Error(`${task.id}: unknown dependency (${missingDeps.join(", ")}). Fix: register dependency tasks first or remove non-existent IDs from dependsOn.`);
 		}
+		// Batch 3 §1c: destructive-op evidence gate at registration (fail the whole add).
+		const destructiveProblem = destructiveOpEvidenceProblem(task);
+		if (destructiveProblem) throw new Error(destructiveProblem);
 	}
 	const visiting = new Set<string>(), visited = new Set<string>();
 	const visit = (id: string) => {
@@ -919,6 +922,10 @@ export function markDispatched(board: WorkLedger, id: string, role: string, runI
 	const ownershipProblem = task ? reviewDispatchOwnershipProblem(board, task) : undefined;
 	if (ownershipProblem) throw new Error(ownershipProblem);
 	if (!task || !readyTasks(board).includes(task)) throw new Error(`${id}: task is not ready (status, dependency, or scope conflict).`);
+	// Batch 3 §1c: fail-closed dispatch-time re-check. Amendments before this batch landed predate the
+	// registration gate, so the destructive evidence contract is re-verified at the dispatch boundary.
+	const dispatchDestructiveProblem = destructiveOpEvidenceProblem(task);
+	if (dispatchDestructiveProblem) throw new Error(dispatchDestructiveProblem);
 	if (task.role !== role) throw new Error(`${id}: expected role ${task.role}, received ${role}.`);
 	if (resume && task.sessionId && task.sessionId !== resume) throw new Error(`${id}: resume does not match the task's existing child.`);
 	if (resume && board.tasks.some(other => other.id !== id && liveWork(other.status) && other.sessionId === resume)) throw new Error(`${id}: child is already owned by live work.`);
@@ -2868,6 +2875,15 @@ export function amendTask(board: WorkLedger, input: AmendInput): WorkTask {
 	if (!guard.ok) throw new Error(`${task.id}: ${guard.reason}`);
 	if (!input.reason?.trim()) throw new Error(`${task.id}: amend requires a non-empty reason (audit trail).`);
 	if (!Array.isArray(input.evidence) || !input.evidence.length) throw new Error(`${task.id}: amend requires evidence entries (authority reference).`);
+	// Batch 3 §1c: amendments can introduce destructive operations post-registration — validate the
+	// PROSPECTIVE merged state before any mutation, with the same evidence gate as addTasks.
+	const destructiveProblem = destructiveOpEvidenceProblem({
+		id: task.id,
+		title: input.title !== undefined ? input.title : task.title,
+		brief: input.brief !== undefined ? input.brief : task.brief,
+		acceptance: input.acceptance !== undefined ? input.acceptance : task.acceptance,
+	});
+	if (destructiveProblem) throw new Error(destructiveProblem);
 	// Batch 1 review M2 (validated BEFORE any mutation): the in-flight child enforces the scope baked into
 	// its dispatch prompt, not the ledger — amending read/write paths on a live leased task cannot rebind
 	// it, so the ledger would believe a scope the child never honors. Refuse unless retryAsRework
@@ -2987,6 +3003,300 @@ export function amendTask(board: WorkLedger, input: AmendInput): WorkTask {
 }
 
 // --------------------------------------------------------------------------
+// Batch 3 §1c — destructive-operation verification-evidence gate
+//
+// A heuristic guard rail, NOT a sandbox. Detection is a pure regex scan over the
+// task's own declared text (title/brief/acceptance); no git is ever executed here.
+// When destructive operations are detected, the task's acceptance array must carry
+// a READ-ONLY verification step (rev-list / branch --merged / status --porcelain /
+// worktree list) that runs BEFORE the destructive step — never dispatch destructive
+// ops on a scout's subjective say-so alone. Opt-out for benign regenerable overwrites:
+// include the literal token [destructive-ok] in title/brief/acceptance.
+// --------------------------------------------------------------------------
+
+/** Patterns that mark an operation destructive for git/data state. */
+const DESTRUCTIVE_OP_PATTERNS: Array<{ re: RegExp; label: string }> = [
+	{ re: /git\s+branch\s+-[a-zA-Z]*D\b/, label: "git branch -D" },
+	{ re: /git\s+worktree\s+remove\b[^\n]*--force/i, label: "git worktree remove --force" },
+	{ re: /git\s+push\b[^\n]*(?:--force|-f\b)/i, label: "git push --force" },
+	{ re: /git\s+reset\s+--hard/i, label: "git reset --hard" },
+	{ re: /\brm\s+-[a-zA-Z]*r[a-zA-Z]*f|\brm\s+-[a-zA-Z]*f[a-zA-Z]*r/i, label: "rm -rf" },
+	{ re: /force[- ]overwrite/i, label: "force-overwrite" },
+	{ re: /git\s+clean\s+-[a-zA-Z]*f/i, label: "git clean -f" },
+];
+/** Read-only verification commands that prove a destructive op is safe (merge state, clean tree). */
+const READONLY_VERIFICATION_RE = /git\s+rev-list\b|git\s+branch\s+--merged|git\s+status\s+--porcelain|git\s+worktree\s+list\b|--left-right/i;
+/** Explicit operator opt-out for benign regenerable-artifact overwrites. */
+export const DESTRUCTIVE_OP_OPTOUT_TOKEN = "[destructive-ok]";
+
+export interface DestructiveOpHit {
+	label: string;
+	/** Which surface carried the marker: title, brief, or acceptance (with index). */
+	surface: string;
+}
+
+/**
+ * Scan a task-shaped record (title/brief/acceptance) for destructive-operation markers.
+ * Pure; never inspects the filesystem or runs git. Returns [] when the opt-out token is present.
+ */
+export function detectDestructiveOperation(task: { title?: string; brief?: string; acceptance?: string[] }): DestructiveOpHit[] {
+	const surfaces: Array<[string, string]> = [];
+	if (typeof task.title === "string") surfaces.push(["title", task.title]);
+	if (typeof task.brief === "string") surfaces.push(["brief", task.brief]);
+	if (Array.isArray(task.acceptance)) task.acceptance.forEach((a, i) => surfaces.push([`acceptance[${i}]`, String(a)]));
+	if (surfaces.some(([, body]) => body.includes(DESTRUCTIVE_OP_OPTOUT_TOKEN))) return [];
+	const hits: DestructiveOpHit[] = [];
+	for (const [surface, body] of surfaces) {
+		for (const { re, label } of DESTRUCTIVE_OP_PATTERNS) {
+			if (re.test(body) && !hits.some(h => h.label === label && h.surface === surface)) hits.push({ label, surface });
+		}
+	}
+	return hits;
+}
+
+/**
+ * Validate that a task carrying destructive operations also carries read-only verification
+ * evidence requirements in acceptance. Returns an error string when the gate fails, else null.
+ * The verification is part of the TASK's own execution contract (re-checked by the child at
+ * execution time), not a one-time add-time snapshot — evidence captured at registration goes
+ * stale as branches gain commits.
+ */
+export function destructiveOpEvidenceProblem(task: { id?: string; title?: string; brief?: string; acceptance?: string[] }): string | null {
+	const hits = detectDestructiveOperation(task);
+	if (!hits.length) return null;
+	const acceptance = Array.isArray(task.acceptance) ? task.acceptance : [];
+	const verificationSteps = acceptance.filter(a => READONLY_VERIFICATION_RE.test(String(a)));
+	if (verificationSteps.length === 0) {
+		const labels = [...new Set(hits.map(h => h.label))].join(", ");
+		return `${task.id ?? "(task)"}: destructive operation(s) detected (${labels}) but acceptance carries NO read-only verification step. Destructive ops must never execute on a scout's subjective say-so alone. Fix: add an acceptance entry requiring the child to FIRST capture read-only verification output — e.g. \`git rev-list --left-right --count target...branch\` (0 left-only commits), \`git branch --merged\`, \`git status --porcelain\` (clean), or \`git worktree list\` — and attach that output as evidence BEFORE running the destructive step. For benign regenerable-artifact overwrites only, opt out explicitly with the token ${DESTRUCTIVE_OP_OPTOUT_TOKEN} in title/brief/acceptance.`;
+	}
+	return null;
+}
+
+// --------------------------------------------------------------------------
+// Batch 3 §1a — atomic add + dispatch: honest preflight/rollback design
+//
+// What is genuinely atomic (already, since Batch 1/2): the ledger mutation itself.
+// team_tasks operates on a structuredClone and only commits when validation passes —
+// validateTaskAddition is all-or-nothing, so a malformed batch never lands partially.
+//
+// What is NOT atomic and cannot be: dispatch. The scheduler pump launches children in a
+// separate asynchronous pass AFTER the ledger write, and runtime failure modes
+// (host tool unavailability, launch exceptions, concurrency saturation) cannot be known
+// at add time. Worktree tasks cannot even be preflighted — they materialize inside the
+// pump. manualDispatch tasks are intentionally undispatched, never failures. Reviewer
+// fanout can split batches deliberately. We do NOT fake atomicity over any of this.
+//
+// What we add instead: rollback-to-draft for the ONLY true waste case — a batch whose
+// own tasks were ACTUALLY attempted by the pump and ALL failed (nothing in the batch
+// launched). Such rows would otherwise sit ready/failed with a retry hold or burned
+// terminal state, and their IDs could never be reused. Rolling them back to
+// planned/draft (the existing publishTasks machinery re-publishes them later) preserves
+// the failure evidence on the task rows and returns the batch to a re-publishable state.
+// Never rolled back: partial launches (some launched), manualDispatch tasks, draft
+// tasks, dependency-blocked rows, and rows the pump never attempted (a daemon retry or
+// host-tool wait may still launch them — they are recoverable, not waste).
+// --------------------------------------------------------------------------
+
+export interface DispatchRollbackAssessment {
+	rollback: boolean;
+	reason: string;
+	/** Newly added task ids that were attempted-and-failed (rollback candidates). */
+	candidates: string[];
+}
+
+/**
+ * Pure assessment. `pumpErrors` entries are strings shaped "W-id: <error>"; launch
+ * rollback inside the pump only pushes an error for tasks it actually attempted.
+ */
+export function assessFullDispatchFailure(opts: {
+	newIds: string[];
+	board: WorkLedger;
+	launched: string[];
+	pumpErrors: string[];
+	autoDispatch: boolean;
+	stage?: string;
+}): DispatchRollbackAssessment {
+	const none = { rollback: false, reason: "", candidates: [] as string[] };
+	if (!opts.newIds.length) return none;
+	if (opts.autoDispatch === false || opts.stage === "draft") {
+		return { ...none, reason: "manualDispatch/draft additions are intentionally undispatched, not failures" };
+	}
+	if (opts.launched.length > 0) {
+		return { ...none, reason: "partial launch — never roll back a batch that produced running children" };
+	}
+	if (!opts.pumpErrors.length) {
+		return { ...none, reason: "no dispatch attempted (concurrency saturation, dependency gates, or host-tool wait) — queued rows are recoverable, not waste" };
+	}
+	if (opts.pumpErrors.some(e => /pump_in_progress|draining since/.test(e))) {
+		return { ...none, reason: "pump re-entry/drain is transient — the next pump retries these rows" };
+	}
+	// Identify which NEW ids the pump actually attempted (an error entry carries their id prefix).
+	const attempted = opts.newIds.filter(id => opts.pumpErrors.some(e => e.startsWith(`${id}:`) || e.startsWith(`${id} `)));
+	const newTasks = opts.board.tasks.filter(t => opts.newIds.includes(t.id));
+	const autoDispatchable = newTasks.filter(t => !t.manualDispatch && t.status !== "planned");
+	if (!autoDispatchable.length) return { ...none, reason: "every new task is manual or draft — nothing was expected to dispatch" };
+	if (attempted.length === 0) return { ...none, reason: "pump errors do not name any new task — the failure is not attributable to this batch" };
+	return {
+		rollback: true,
+		reason: `auto-dispatch fully failed for ${attempted.length} attempted new task(s): ${opts.pumpErrors.filter(e => attempted.some(id => e.startsWith(id))).join("; ").slice(0, 300)}`,
+		candidates: attempted,
+	};
+}
+
+/**
+ * Apply rollback-to-draft in place: attempted-and-failed new tasks return to
+ * planned/draft with the failure recorded in evidence. Attempt lineage (sessionId/runId)
+ * of any PRIOR child is preserved by the pump's own rollback; rollback-to-draft never
+ * erases evidence — it only resets the lifecycle position so publishTasks can retry the
+ * batch cleanly. Returns the ids actually rolled back.
+ */
+export function rollbackDispatchedBatchToDraft(board: WorkLedger, ids: string[]): string[] {
+	const rolledBack: string[] = [];
+	for (const id of ids) {
+		const task = board.tasks.find(t => t.id === id);
+		if (!task || !["ready", "queued", "failed", "blocked"].includes(task.status)) continue;
+		if ((task as { dispatchAttempts?: number }).dispatchAttempts ?? 0) {
+			// Attempted rows only; a row the pump never touched stays queued for retry.
+		} else if (task.status !== "failed") continue;
+		task.status = "planned";
+		task.stage = "draft";
+		delete (task as { nextRetryAt?: number }).nextRetryAt;
+		delete (task as { dispatchAttempts?: number }).dispatchAttempts;
+		if (task.manualDispatch) {
+			delete task.manualDispatch;
+			delete task.manualDispatchReason;
+			delete task.manualDispatchAt;
+		}
+		task.evidence = [...(task.evidence ?? []), `[ROLLBACK-TO-DRAFT] ${new Date().toISOString()} auto-dispatch fully failed; task returned to draft — review the failure, fix the cause, then re-publish (team_tasks action "publish").`];
+		rolledBack.push(id);
+	}
+	if (rolledBack.length) board.revision++;
+	return rolledBack;
+}
+
+// --------------------------------------------------------------------------
+// Batch 3 §2b — unified read-only child lifecycle view
+//
+// One call joins what used to be scattered across the ledger, the lease map and
+// recovery helpers so the parent can judge whether a child is truly stopped-stable
+// and safe to settle. PURE: all liveness is injected as a probe, so unit tests need
+// no host, and the view itself never mutates state, never triggers the scheduler pump.
+// HONESTY CONTRACT: writesCommitted is a heuristic — the ledger has never tracked
+// byte-level write commits; it means "this attempt no longer writes" (non-live status
+// with delivery evidence or terminal settlement). terminated is null when the probe
+// cannot decide (hosted children without a terminal snapshot, children of another
+// host process) — unknown confidence is surfaced, never guessed.
+// --------------------------------------------------------------------------
+
+export interface ChildLifecycleProbe {
+	/** true = proven live; false = proven terminated; null/undefined = cannot tell. */
+	(sessionId: string, task: WorkTask): boolean | null | undefined;
+}
+
+export interface ChildLifecycleEntry {
+	id: string;
+	role: string;
+	status: WorkStatus;
+	sessionId?: string;
+	runId?: string;
+	dispatchedAt?: string;
+	executionTransport?: string;
+	/** true = proven terminated; false = possibly still running; null = unknown confidence. */
+	terminated: boolean | null;
+	/** "yes" the attempt no longer writes; "no" it is live; "unknown" when evidence is absent. */
+	writesCommitted: "yes" | "no" | "unknown";
+	/** Lease ownership: live lease held by this task's current attempt. */
+	leaseLive: boolean;
+	/** Live tasks/leases whose scope conflicts with this task (or hold its own scope). */
+	liveConflictHolders: string[];
+	/** Conservative settle judgement with reasons; unknown-confidence never reads as safe. */
+	safeToSettle: boolean;
+	safeToSettleReasons: string[];
+}
+
+export function buildChildLifecycleView(
+	board: WorkLedger,
+	leaseList: Array<WorkTask>,
+	probe?: ChildLifecycleProbe,
+	filterIds?: string[],
+	now = Date.now(),
+): ChildLifecycleEntry[] {
+	// Mirror of the extension's isLeaseSettledOnBoard: a lease is settled when the board copy of the
+	// same task is no longer live at the lease's run/session identity.
+	const leaseSettled = (lease: WorkTask): boolean => {
+		const boardTask = board.tasks.find(t => t.id === lease.id);
+		if (!boardTask || liveWork(boardTask.status)) return false;
+		if (lease.runId && boardTask.runId === lease.runId) return true;
+		if (terminalWork(boardTask.status) && lease.sessionId && boardTask.sessionId === lease.sessionId) return true;
+		return false;
+	};
+	const liveLeases = leaseList.filter(l => liveWork(l.status) && !leaseSettled(l));
+	const targets = board.tasks.filter(t => !filterIds || filterIds.includes(t.id));
+	return targets.map(task => {
+		// terminated: probe-injected, with explicit unknown confidence. Never infer termination
+		// from a non-live ledger status alone — a branch rollback can leave status non-live while
+		// the child still runs (the same fail-closed argument as the cancel path).
+		let terminated: boolean | null = null;
+		if (task.sessionId && probe) {
+			const verdict = probe(task.sessionId, task);
+			if (verdict === true) terminated = false;
+			else if (verdict === false) terminated = true;
+		}
+		// Never-dispatched tasks have no child to terminate.
+		if (!task.sessionId && !task.runId && !task.dispatchedAt) terminated = true;
+		const ownLease = liveLeases.find(l => l.id === task.id);
+		const conflictHolders = new Set<string>();
+		for (const other of liveLeases) {
+			if (other.id !== task.id && !taskConflict(task, other)) continue;
+			if (other.id !== task.id && reviewingReadAllowed(task, other)) continue;
+			conflictHolders.add(other.id);
+		}
+		for (const other of board.tasks) {
+			if (other.id === task.id) continue;
+			if (!scopeBlockingLive(board, other, now)) continue;
+			if (!taskConflict(task, other) || reviewingReadAllowed(task, other)) continue;
+			conflictHolders.add(other.id);
+		}
+		const leaseLive = Boolean(ownLease);
+		const hasDeliveryEvidence = (task.evidence ?? []).length > 0;
+		const writesCommitted: ChildLifecycleEntry["writesCommitted"] =
+			liveWork(task.status) ? "no"
+			: terminalWork(task.status) || task.status === "reported" || hasDeliveryEvidence ? "yes"
+			: "unknown";
+		const reasons: string[] = [];
+		if (liveWork(task.status)) reasons.push(`ledger status ${task.status} is live`);
+		if (leaseLive) reasons.push(`live lease held (${ownLease!.status}${ownLease!.sessionId ? `, session ${ownLease!.sessionId}` : ""})`);
+		if (terminated === false) reasons.push("liveness probe says the child may still be running");
+		if (terminated === null && (task.sessionId || task.runId || task.dispatchedAt)) reasons.push("termination UNKNOWN — probe cannot confirm the child stopped (hosted or cross-process child); verify before settling");
+		if (writesCommitted !== "yes") reasons.push(writesCommitted === "no" ? "attempt may still write" : "writes committed unknown — no delivery evidence recorded");
+		const safeToSettle = reasons.length === 0 && terminalWork(task.status);
+		if (!terminalWork(task.status) && !liveWork(task.status)) {
+			// Non-live, non-terminal (blocked/failed/reported...): settle only with all-clear signals.
+			const settleable = !leaseLive && terminated === true && writesCommitted !== "no";
+			return {
+				id: task.id, role: task.role, status: task.status,
+				sessionId: task.sessionId, runId: task.runId, dispatchedAt: task.dispatchedAt,
+				executionTransport: task.executionTransport,
+				terminated, writesCommitted, leaseLive,
+				liveConflictHolders: [...conflictHolders],
+				safeToSettle: settleable && reasons.filter(r => !r.includes("UNKNOWN")).length === 0,
+				safeToSettleReasons: reasons.length ? reasons : ["stopped-stable: no live lease, termination confirmed, writes no longer in flight"],
+			};
+		}
+		return {
+			id: task.id, role: task.role, status: task.status,
+			sessionId: task.sessionId, runId: task.runId, dispatchedAt: task.dispatchedAt,
+			executionTransport: task.executionTransport,
+			terminated, writesCommitted, leaseLive,
+			liveConflictHolders: [...conflictHolders],
+			safeToSettle,
+			safeToSettleReasons: reasons.length ? reasons : ["terminal and stable"],
+		};
+	});
+}
+
+// --------------------------------------------------------------------------
 // Error message helpers (Batch 1 §1.1) — actionable lock/scope rejections
 // --------------------------------------------------------------------------
 
@@ -3005,6 +3315,16 @@ export function formatHolderRejection(opts: {
 		`  2. Cancel the holder: team_tasks action "cancel" with updates [{ id: "<holder-id>", reason: "...", evidence: ["<user authority>"] }], or`,
 		`  3. If the holder is stuck: verify the child actually stopped, then team_tasks update with childStopped:true + status "blocked".`,
 	];
+	// Batch 3 §1b: same-file contention is usually a decomposition artifact. When writers collide on the
+	// same core file, the actionable plan is auto worktree fanout + a serial integration task — demand a
+	// splitWaiverReason only when the contention is genuinely indivisible.
+	if (opts.kind === "write-write" || opts.kind === "write-read") {
+		lines.push(
+			`Fanout alternative (preferred for same-core-file contention):`,
+			`  4. Split the contending work into per-file/per-slice tasks each writing in its own git worktree (isolation:"worktree" per task, or enable autoWorktreeOnConflict so the scheduler provisions clones automatically), then register a SERIAL integration task — title containing "integrate"/"merge" is exempt from the granularity gate — with dependsOn covering every fanout task, which merges each task-owned branch into the shared workspace one at a time AFTER all fanout tasks terminate. The integration task must depend on completion, never widen its writePaths while fanout writers are live.`,
+			`  Notes: fanout requires a git repository and native transport (hosted spawn_subsession cannot set cwd — hosted tasks stay serial); never fan out pure documentation/checklist/report files. Use splitWaiverReason only when the same-file contention is strictly indivisible.`,
+		);
+	}
 	if (opts.extra) lines.push(opts.extra);
 	return lines.join("\n");
 }

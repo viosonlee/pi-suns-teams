@@ -22,6 +22,7 @@ import {
 	taskConflict, reviewingReadAllowed, autoWorktreeEligible, parseTeamTaskId, isDeterministic, isReviewExempt, isReviewTask, autoAcceptTask, createReviewerTask, nextDispatchableTasks,
 	reviewerTaskId, completeReviewTask, publishTasks, overlap, recordReview, deliveryVersionOf, reviewRecordsOf,
 	reclaimStaleReviews, isActiveReviewHold, scopeBlockingLive, REVIEW_STALE_MS, pruneStaleReviews,
+	buildChildLifecycleView, assessFullDispatchFailure, rollbackDispatchedBatchToDraft,
 	reviewDispatchOwnershipProblem, setManualDispatchHold, releaseManualDispatchHold,
 	isMetadataSettlementTransition, decideCancelAction, validateSteerTarget, amendTask, formatHolderRejection, preserveManualDispatchOnReadyReturn, decideReviewPolicy,
 	extractStructuredEvidence, mergeStructuredEvidence, prunableReportArtifacts, drainSettlementAllowed, REPORT_INLINE_CLIP,
@@ -4624,6 +4625,14 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			})();
 		const outcomes: ReconcileOutcome[] = [];
 		for (const id of targetIds) {
+			// Batch 3 regression fix: a ledger-hosted child's completion is owned EXCLUSIVELY by the
+			// hosted pipeline (refreshHostedNotifications harvest → disk terminal snapshot → restart
+			// re-probe). With §2a hosted children are no longer misclassified foreign-parent, so
+			// recoverChildReport now returns "recovered" for them — if reconciliation consumed that
+			// report it would race the inline pi-web:subagent-notification delivery and double-publish
+			// the same delivery through two surfaces. The hosted pipeline is authoritative across
+			// restarts too: the parent-side harvest re-establishes attempts from the disk snapshot.
+			if (usesHostedTransport(id)) continue;
 			const observation = known.get(id);
 			const receipt = missingReceiptBySession.get(id)
 				?? [...recoveredReceipts.values()].reverse().find((item) => item.sessionId === id);
@@ -5692,10 +5701,11 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			try {
 				const candidate = structuredClone(board());
 				let pruneSummary = "";
-				if (params.action === "add") addTasks(candidate, params.tasks, ctx.cwd, {
+				let addedIds: string[] = [];
+				if (params.action === "add") addedIds = addTasks(candidate, params.tasks, ctx.cwd, {
 					manualDispatch: params.autoDispatch === false,
 					manualDispatchReason: params.autoDispatch === false ? "team_tasks add with autoDispatch:false; explicit dispatch requested." : undefined,
-				});
+				}).map(t => t.id);
 				else if (params.action === "update") {
 					if (!Array.isArray(params.updates) || !params.updates.length) throw new Error("updates must be nonempty.");
 					for (const update of params.updates) {
@@ -5976,16 +5986,57 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				}
 				ensureSchedulerDaemon(ctx);
 				let autoDispatched: string[] = [];
+				let rolledBackToDraft: string[] = [];
 				if (params.action === "add" || params.action === "update" || params.action === "dispatch" || params.action === "publish") {
 					if (params.autoDispatch !== false && params.stage !== "draft" && typeof (ctx as any)?.executeTool === "function") {
 						const pumpResult = await schedulerPump(ctx);
 						autoDispatched = pumpResult.launched;
+						// Batch 3 §1a: rollback-to-draft for a batch whose own tasks were actually attempted
+						// by the pump and ALL failed. This is NOT fake atomicity — validation atomicity is
+						// already guaranteed by clone-then-commit; this covers the one true waste case
+						// (burned IDs in failed/retry-hold rows). Partial launches, manual/draft opt-outs,
+						// pump re-entry and drain transients are NEVER rolled back (see assessFullDispatchFailure).
+						if (params.action === "add" && addedIds.length) {
+							const assessment = assessFullDispatchFailure({
+								newIds: addedIds,
+								board: board(),
+								launched: pumpResult.launched,
+								pumpErrors: pumpResult.errors,
+								autoDispatch: params.autoDispatch !== false,
+								stage: typeof params.stage === "string" ? params.stage : undefined,
+							});
+							if (assessment.rollback) {
+								rolledBackToDraft = rollbackDispatchedBatchToDraft(board(), assessment.candidates);
+								if (rolledBackToDraft.length) {
+									persist();
+									console.error(`[ADD_DISPATCH_ROLLBACK]`, rolledBackToDraft.join(","), assessment.reason);
+								}
+							}
+						}
 					}
 				}
 				const responseText = params.action === "archive" ? archivePrompt(board()) : currentLedgerPrompt();
 				const drainNote = state.draining ? `\n\n[DRAIN MODE ACTIVE since ${state.draining.at}] No new tasks will launch (auto-dispatch and team_dispatch gated); in-flight children settle normally. /team resume or clear draining to continue.` : "";
-				const extra = (autoDispatched.length > 0 ? `\n\n[TEAM SCHEDULER] Auto-dispatched ${autoDispatched.length} subagents: ${autoDispatched.join(", ")}.` : "") + drainNote;
+				const extra = (autoDispatched.length > 0 ? `\n\n[TEAM SCHEDULER] Auto-dispatched ${autoDispatched.length} subagents: ${autoDispatched.join(", ")}.` : "") + (rolledBackToDraft.length ? `\n\n[ROLLBACK-TO-DRAFT] Auto-dispatch fully failed for ${rolledBackToDraft.join(", ")} — the batch returned to draft (no IDs burned into failed/retry rows). Fix the cause, then team_tasks action "publish" to retry.` : "") + drainNote;
 				const curBoard = board();
+				// Batch 3 §2b: unified read-only lifecycle view, injected with this host's honest
+				// liveness probe. Pure assembly (buildChildLifecycleView) never mutates state and never
+				// triggers the pump; terminated stays null (unknown confidence) when neither native
+				// activity nor a hosted terminal disk snapshot can decide.
+				const baseOpts = hostedOptions(ctx);
+				const lifecycleProbe = (sessionId: string, task: WorkTask): boolean | null => {
+					try {
+						if (task.executionTransport === "hosted") {
+							return hasHostedTerminalSnapshotOnDisk(sessionId, {
+								agentDir: baseOpts.agentDir, parentSessionId: baseOpts.parentSessionId,
+								parentSessionFile: baseOpts.parentSessionFile,
+								reportNotBefore: task.dispatchedAt, runId: task.runId,
+							}) ? false : null;
+						}
+						return isSubagentActive(sessionId) ? true : null;
+					} catch { return null; }
+				};
+				const lifecycleView = buildChildLifecycleView(curBoard, [...leases.values()].map(l => structuredClone(l)), lifecycleProbe);
 				const boardBytes = curBoard.tasks.length > 60 ? Infinity : Buffer.byteLength(JSON.stringify(curBoard));
 				const compactDetails = curBoard.tasks.length > 60
 					|| boardBytes > 16_384
@@ -6001,8 +6052,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 						dispatchable: schedulableBatch().map(t => t.id),
 						autoDispatched,
 						draining: state.draining ?? null,
+						lifecycle: lifecycleView,
 					}
-					: { ledger: structuredClone(curBoard), dispatchable: schedulableBatch().map(t => t.id), autoDispatched, draining: state.draining ?? null };
+					: { ledger: structuredClone(curBoard), dispatchable: schedulableBatch().map(t => t.id), autoDispatched, draining: state.draining ?? null, lifecycle: lifecycleView };
 				return { content: [{ type: "text" as const, text: `${responseText}${pruneSummary}${extra}` }], details: detailsPayload };
 			} catch (error) {
 				return { content: [{ type: "text" as const, text: `team_tasks rejected; ledger unchanged: ${error instanceof Error ? error.message : String(error)}` }], isError: true, details: {} };
@@ -6417,6 +6469,36 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					}
 				}
 				ctx.ui.notify(rest[0] === "archive" ? archivePrompt(board()) : currentLedgerPrompt(), "info");
+				return;
+			}
+
+			if (sub === "lifecycle") {
+				// Batch 3 §2b: read-only unified child lifecycle view. Pure assembly; no state mutation,
+				// no pump. terminated=null means UNKNOWN confidence — surfaced, never guessed.
+				if (isSubagentSession) { ctx.ui.notify("生命周期视图属于主会话 CP。", "warning"); return; }
+				if (!state.enabled) { ctx.ui.notify("先 /team on 再查询生命周期。", "warning"); return; }
+				const ids = rest.length ? rest : undefined;
+				const baseOpts = hostedOptions(ctx as any);
+				const probe = (sessionId: string, task: WorkTask): boolean | null => {
+					try {
+						if (task.executionTransport === "hosted") {
+							return hasHostedTerminalSnapshotOnDisk(sessionId, {
+								agentDir: baseOpts.agentDir, parentSessionId: baseOpts.parentSessionId,
+								parentSessionFile: baseOpts.parentSessionFile,
+								reportNotBefore: task.dispatchedAt, runId: task.runId,
+							}) ? false : null;
+						}
+						return isSubagentActive(sessionId) ? true : null;
+					} catch { return null; }
+				};
+				const view = buildChildLifecycleView(board(), [...leases.values()].map(l => structuredClone(l)), probe, ids);
+				if (!view.length) { ctx.ui.notify(ids ? `无匹配任务：${ids.join(", ")}` : "账本为空。", "info"); return; }
+				const fmtTerm = (t: boolean | null) => t === true ? "terminated" : t === false ? "POSSIBLY-RUNNING" : "UNKNOWN";
+				const lines = view.map(v =>
+					`${v.id} [${v.role}] status=${v.status} terminated=${fmtTerm(v.terminated)} writesCommitted=${v.writesCommitted} lease=${v.leaseLive ? "LIVE" : "none"}${v.liveConflictHolders.length ? ` conflicts=${v.liveConflictHolders.join("+")}` : ""}
+` +
+					`  ${v.safeToSettle ? "✓ safe to settle" : "✗ NOT safe to settle"} — ${v.safeToSettleReasons.join("; ")}`);
+				ctx.ui.notify(`子任务生命周期视图（只读）:\n${lines.join("\n")}`, "info");
 				return;
 			}
 

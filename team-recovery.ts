@@ -1409,6 +1409,52 @@ function validateSubagentMetadata(
 	return { ok: true };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Batch 3 §2a: unified child-provenance classification.
+// Both the RECOVERY read path (recoverChildReport) and the destructive-op cancel path
+// (verifyHostedChildProvenance) MUST classify a child identically, or a hosted child is
+// recoverable in one flow and misreported "foreign-parent" in the other. This is the
+// single source of truth; the wrappers below are thin adapters and can never diverge.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type ChildProvenanceClass = "ours-subagent" | "ours-hosted" | "foreign" | "malformed" | "unproven";
+export interface ChildProvenanceClassification {
+	class: ChildProvenanceClass;
+	reason?: string;
+}
+
+/**
+ * Classify session entries against a parent. Pure: entries are already parsed.
+ *   - pi-web:subagent metadata present → strict validation decides (ours-subagent, or
+ *     malformed/foreign; a foreign metadata binding NEVER falls through to spawn links).
+ *   - no metadata → pi-web.subsession.spawned link with data.spawnedBySessionId === parent
+ *     and data.spawnedSessionId === sessionId proves hosted provenance (ours-hosted).
+ *   - links present but binding another parent/session → foreign; no links at all → unproven.
+ */
+export function classifyChildProvenance(
+	entries: SessionEntryLike[],
+	parentSessionId: string,
+	sessionId: string,
+): ChildProvenanceClassification {
+	const metas = entries.filter((entry) => entry.type === "custom" && entry.customType === SUBAGENT_META_TYPE);
+	if (metas.length) {
+		const check = validateSubagentMetadata(entries, parentSessionId);
+		if (check.ok) return { class: "ours-subagent" };
+		return { class: check.status === "malformed" ? "malformed" : "foreign", reason: check.reason };
+	}
+	const spawnLinks = entries.filter((entry) => entry.type === "custom" && entry.customType === HOSTED_CHILD_LINK_TYPE);
+	for (const link of spawnLinks) {
+		if (!isObject(link.data)) continue;
+		if (asString(link.data.spawnedBySessionId) === parentSessionId && asString(link.data.spawnedSessionId) === sessionId) {
+			return { class: "ours-hosted" };
+		}
+	}
+	if (spawnLinks.length) {
+		return { class: "foreign", reason: `hosted spawn link binds a different parent/session (${spawnLinks.map(l => isObject(l.data) ? `${asString(l.data.spawnedBySessionId) ?? "?"}->${asString(l.data.spawnedSessionId) ?? "?"}` : "malformed").join(", ")}); this session is not ours` };
+	}
+	return { class: "unproven", reason: "session carries neither pi-web:subagent metadata nor a pi-web.subsession.spawned link binding this parent; provenance unproven" };
+}
+
 /** Read and validate a child session by exact ID. Fresh read; bypasses host caches. */
 export function recoverChildReport(sessionId: string, options: RecoverChildOptions): RecoveryReadResult {
 	const parentSessionId = asString(options.parentSessionId);
@@ -1456,9 +1502,18 @@ export function recoverChildReport(sessionId: string, options: RecoverChildOptio
 			byteLength: read.byteLength,
 		};
 	}
-	const metadata = validateSubagentMetadata(entries, parentSessionId);
-	if (!metadata.ok) {
-		return { status: metadata.status, reason: metadata.reason, sessionId, file: resolved.file, uncertain: true, byteLength: read.byteLength };
+	// Batch 3 §2a: unified classification — hosted children (no pi-web:subagent metadata) are
+	// recognized through their spawn link exactly as in the cancel-path provenance check, so a
+	// genuinely-ours hosted child is never misreported foreign-parent during reconciliation.
+	const provenance = classifyChildProvenance(entries, parentSessionId, sessionId);
+	if (provenance.class === "malformed") {
+		return { status: "malformed", reason: provenance.reason ?? "malformed provenance", sessionId, file: resolved.file, uncertain: true, byteLength: read.byteLength };
+	}
+	if (provenance.class !== "ours-subagent" && provenance.class !== "ours-hosted") {
+		const reason = provenance.class === "unproven"
+			? `${provenance.reason ?? "provenance unproven"} (not a pi-web subagent session)`
+			: provenance.reason ?? "foreign parent";
+		return { status: "foreign-parent", reason, sessionId, file: resolved.file, uncertain: true, byteLength: read.byteLength };
 	}
 
 	const derived = deriveRecoveredReport(entries, {
@@ -1691,25 +1746,17 @@ export function verifyHostedChildProvenance(
 	if (header.id !== sessionId) {
 		return { ok: false, status: "malformed", reason: `session header id ${header.id} does not match ${sessionId}`, file: resolved.file };
 	}
-	// (a) native/ledger subagent metadata — reuse the exact same strict validation as recovery.
-	const metas = entries.filter((entry) => entry.type === "custom" && entry.customType === SUBAGENT_META_TYPE);
-	if (metas.length) {
-		const check = validateSubagentMetadata(entries, parentSessionId);
-		if (check.ok) return { ok: true, via: "subagent-meta", file: resolved.file };
-		return { ok: false, status: check.status === "malformed" ? "malformed" : "foreign", reason: `subagent metadata present but does not bind this parent: ${check.reason}`, file: resolved.file };
+	// Batch 3 §2a: single classification source shared with the recovery read path.
+	const provenance = classifyChildProvenance(entries, parentSessionId, sessionId);
+	if (provenance.class === "ours-subagent") return { ok: true, via: "subagent-meta", file: resolved.file };
+	if (provenance.class === "ours-hosted") return { ok: true, via: "hosted-spawn-link", file: resolved.file };
+	if (provenance.class === "malformed") return { ok: false, status: "malformed", reason: provenance.reason ?? "malformed provenance", file: resolved.file };
+	if (provenance.class === "foreign") {
+		const metas = entries.filter((entry) => entry.type === "custom" && entry.customType === SUBAGENT_META_TYPE);
+		const reason = metas.length
+			? `subagent metadata present but does not bind this parent: ${provenance.reason}`
+			: provenance.reason ?? "foreign session";
+		return { ok: false, status: "foreign", reason, file: resolved.file };
 	}
-	// (b) hosted spawn link.
-	const spawnLinks = entries.filter((entry) => entry.type === "custom" && entry.customType === HOSTED_CHILD_LINK_TYPE);
-	for (const link of spawnLinks) {
-		if (!isObject(link.data)) continue;
-		const spawnedBy = asString(link.data.spawnedBySessionId);
-		const spawned = asString(link.data.spawnedSessionId);
-		if (spawnedBy === parentSessionId && spawned === sessionId) {
-			return { ok: true, via: "hosted-spawn-link", file: resolved.file };
-		}
-	}
-	if (spawnLinks.length) {
-		return { ok: false, status: "foreign", reason: `hosted spawn link binds a different parent/session (${spawnLinks.map(l => isObject(l.data) ? `${asString(l.data.spawnedBySessionId) ?? "?"}->${asString(l.data.spawnedSessionId) ?? "?"}` : "malformed").join(", ")}); this session is not ours`, file: resolved.file };
-	}
-	return { ok: false, status: "foreign", reason: "session carries neither pi-web:subagent metadata nor a pi-web.subsession.spawned link binding this parent; provenance unproven — never act on it", file: resolved.file };
+	return { ok: false, status: "foreign", reason: `${provenance.reason ?? "provenance unproven"} — never act on it`, file: resolved.file };
 }
