@@ -52,8 +52,8 @@ test('read/read parallel, exact write/write and write/read serialize; a bare dir
  // W-c writes the same file W-b reads, so the same-file rule still keeps it out of the batch.
  assert.deepEqual(dispatchBatch(b,3).map(t=>t.id),['W-a','W-b']); assert.equal(dispatchBatch(b,1).length,2, 'legacy batch limit cannot serialize independent readers');
 });
-test('an explicit directory scope reserves the entry only, never dot-prefixed descendants',()=>{
- const {b,q}=fixture(); addTasks(b,[spec(q.id,'W-a',{writePaths:['src/']}),spec(q.id,'W-b',{readPaths:['src/..config/a'],writePaths:[]})],'/repo'); assert.equal(taskConflict(b.tasks[0],b.tasks[1]),false,'W-120: W-a owns src/ only, W-b reads a distinct path under it');
+test('an explicit directory write scope conflicts fail-closed with descendants, never sibling prefixes',()=>{
+ const {b,q}=fixture(); addTasks(b,[spec(q.id,'W-a',{writePaths:['src/']}),spec(q.id,'W-b',{readPaths:['src/..config/a'],writePaths:[]}),spec(q.id,'W-c',{writePaths:['src2/a']})],'/repo'); assert.equal(taskConflict(b.tasks[0],b.tasks[1]),true,'directory-wide write src/ covers nested reads under src/'); assert.equal(taskConflict(b.tasks[0],b.tasks[2]),false,'src/ must not cover sibling src2/a');
 });
 test('relative scopes normalize and globs reject atomically',()=>{
  const {b,q}=fixture(); addTasks(b,[spec(q.id,'W-a',{writePaths:['src/../src/a']})],'/repo'); assert.deepEqual(b.tasks[0].writePaths,['/repo/src/a']); const before=structuredClone(b);

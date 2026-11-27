@@ -25,17 +25,29 @@ for arg in "$@"; do
   esac
 done
 
-# Returns 0 when $1 > $2 (numeric dotted versions; pre-release suffixes ignored).
+# Returns 0 when $1 > $2 (SemVer-aware numeric core + pre-release comparison).
 version_gt() {
+  local core1="${1%%-*}" core2="${2%%-*}"
+  local pre1="" pre2=""
+  [[ "$1" == *-* ]] && pre1="${1#*-}"
+  [[ "$2" == *-* ]] && pre2="${2#*-}"
   local a b i
-  IFS=. read -r -a a <<< "${1%%-*}"
-  IFS=. read -r -a b <<< "${2%%-*}"
+  IFS=. read -r -a a <<< "${core1}"
+  IFS=. read -r -a b <<< "${core2}"
   for i in 0 1 2; do
     local x="${a[$i]:-0}" y="${b[$i]:-0}"
     x="${x//[^0-9]/}"; y="${y//[^0-9]/}"
     if (( ${x:-0} > ${y:-0} )); then return 0; fi
     if (( ${x:-0} < ${y:-0} )); then return 1; fi
   done
+  # Numeric cores are equal: stable release > pre-release; otherwise compare pre-release tags.
+  if [ -z "${pre1}" ] && [ -n "${pre2}" ]; then return 0; fi
+  if [ -n "${pre1}" ] && [ -z "${pre2}" ]; then return 1; fi
+  if [ -n "${pre1}" ] && [ -n "${pre2}" ] && [ "${pre1}" != "${pre2}" ]; then
+    local highest
+    highest="$(printf '%s\n%s\n' "${pre1}" "${pre2}" | sort -V | tail -n1)"
+    [ "${highest}" = "${pre1}" ] && return 0
+  fi
   return 1
 }
 

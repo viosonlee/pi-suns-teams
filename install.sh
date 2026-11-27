@@ -153,18 +153,18 @@ try {
     const thinking = clean(r.thinking);
     if (!model && !thinking) continue;
     const raw = fs.readFileSync(mdPath, "utf8");
-    const parts = raw.split("---");
-    if (parts.length < 3) continue;
-    let fm = parts[1];
+    const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---(\r?\n[\s\S]*)?$/);
+    if (!m) continue;
+    let fm = m[1];
+    const body = m[2] ?? "";
     if (model) {
-      fm = /^model:\s*.*$/m.test(fm) ? fm.replace(/^model:\s*.*$/m, `model: ${model}`) : `${fm.trimEnd()}\nmodel: ${model}\n`;
+      fm = /^model:\s*.*$/m.test(fm) ? fm.replace(/^model:\s*.*$/m, `model: ${model}`) : `${fm.trimEnd()}\nmodel: ${model}`;
     }
     if (thinking) {
-      fm = /^thinking:\s*.*$/m.test(fm) ? fm.replace(/^thinking:\s*.*$/m, `thinking: ${thinking}`) : `${fm.trimEnd()}\nthinking: ${thinking}\n`;
+      fm = /^thinking:\s*.*$/m.test(fm) ? fm.replace(/^thinking:\s*.*$/m, `thinking: ${thinking}`) : `${fm.trimEnd()}\nthinking: ${thinking}`;
     }
-    if (fm !== parts[1]) {
-      parts[1] = fm;
-      fs.writeFileSync(mdPath, parts.join("---"), "utf8");
+    if (fm !== m[1]) {
+      fs.writeFileSync(mdPath, `---\n${fm}\n---${body}`, "utf8");
     }
   }
 } catch {}

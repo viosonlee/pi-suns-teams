@@ -35,14 +35,14 @@ function fixture(cwd = '/repo') {
 console.log('W-120 file-granularity conflict matrix');
 
 // ---------------------------------------------------------------- 1. directory vs descendant file
-test('BEFORE-bug: directory writePath no longer conflicts with a distinct descendant file', () => {
+test('directory writePath conflicts fail-closed with a descendant file while identity overlap stays exact', () => {
 	assert.equal(overlap('/repo/team-tests/', '/repo/team-tests/foo.ts'), false);
 	assert.equal(overlap('/repo/team-tests', '/repo/team-tests/foo.ts'), false, 'bare directory-looking path is not an ancestor scope');
 	const { b, add } = fixture();
 	add([{ id: 'W-120-dir', writePaths: ['team-tests/'] }, { id: 'W-120-file', writePaths: ['team-tests/foo.ts'] }]);
-	assert.equal(taskConflict(b.tasks[0], b.tasks[1]), false);
-	assert.equal(taskConflict(b.tasks[1], b.tasks[0]), false);
-	assert.deepEqual(dispatchBatch(b).map(t => t.id), ['W-120-dir', 'W-120-file'], 'dir writer and descendant-file writer dispatch together');
+	assert.equal(taskConflict(b.tasks[0], b.tasks[1]), true);
+	assert.equal(taskConflict(b.tasks[1], b.tasks[0]), true);
+	assert.deepEqual(dispatchBatch(b).map(t => t.id), ['W-120-dir'], 'dir writer serializes descendant-file writer');
 });
 
 // ---------------------------------------------------------------- 2. same concrete file

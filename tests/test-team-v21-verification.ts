@@ -13,7 +13,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
@@ -577,6 +577,14 @@ async function runVerification() {
 			'git reset --hard HEAD~1',
 			'npm install malicious-pkg',
 			'yarn add bad-dep',
+			'mkdir /tmp/x',
+			'ln -s a b',
+			'tar -xf a.tar',
+			'unzip a.zip',
+			'scp local remote:',
+			'python3 -c "open(\'x\',\'w\')"',
+			'node -e "require(\'fs\').writeFileSync(\'x\',\'1\')"',
+			'curl -o out.txt https://example.com/a',
 		];
 		for (const cmd of dangerousCommands) {
 			const check = isBashWriteCommand(cmd);
@@ -630,6 +638,14 @@ async function runVerification() {
 			const readCmd = wrapInBwrapSandbox(`ls ${tempTestDir}`, tempTestDir);
 			const readOut = execSync(readCmd, { stdio: "pipe", encoding: "utf8" });
 			assert.equal(typeof readOut, "string");
+
+			// Outer-shell $(...) / backtick expansion must NOT run outside bwrap
+			const canaryPath = join(tempTestDir, "outer-expand-canary");
+			const quotedCmd = wrapInBwrapSandbox(`echo $(touch ${canaryPath}) \`touch ${canaryPath}2\``, tempTestDir);
+			assert.ok(!quotedCmd.includes('bash -c "'), "bwrap command must not use double quotes");
+			try { execSync(quotedCmd, { stdio: "pipe" }); } catch {}
+			assert.equal(existsSync(canaryPath), false, "$(...) must not execute outside bwrap");
+			assert.equal(existsSync(`${canaryPath}2`), false, "backticks must not execute outside bwrap");
 
 			rmSync(tempTestDir, { recursive: true, force: true });
 		}

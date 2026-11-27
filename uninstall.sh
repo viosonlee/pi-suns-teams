@@ -33,7 +33,9 @@ rm -f "${PI_AGENT_DIR}/update.sh" "${PI_AGENT_DIR}/pi-teams-update.sh" "${PI_AGE
 if [ "${PURGE}" = true ]; then
   echo -e "${RED}⚠️  [--purge] 删除 team.json、team-pending.json 与 pi-teams 备份${NC}"
   rm -f "${PI_AGENT_DIR}/team.json" "${PI_AGENT_DIR}/team-pending.json"
-  rm -rf "${PI_AGENT_DIR}"/backups/pi-teams-*
+  if [ -n "${PI_AGENT_DIR}" ] && [ "${PI_AGENT_DIR}" != "/" ] && [ -d "${PI_AGENT_DIR}/backups" ]; then
+    find "${PI_AGENT_DIR}/backups" -maxdepth 1 -name 'pi-teams-*' -exec rm -rf -- {} +
+  fi
 else
   echo -e "${GREEN}✅ 已保留配置 ${PI_AGENT_DIR}/team.json（--purge 可一并删除）${NC}"
 fi

@@ -26,7 +26,7 @@ import {
 	type WorkTask, type WorkLedger,
 } from "../team-ledger.ts";
 import { parseReviewReport } from "../team-review.ts";
-import { scopeAllowsWrite } from "../team-scope.ts";
+import { conflictPathBetweenScopes, scopeAllowsWrite, writeConflicts } from "../team-scope.ts";
 import { collectEvidenceRefs, mergeAudits, verifyEvidenceRefs, type EvidenceRef } from "../team-review-evidence.ts";
 import {
 	collectKnownChildSessionIds,
@@ -1765,35 +1765,52 @@ export function isBashWriteCommand(cmd: string): { isWrite: boolean; reason?: st
 	if (!cmd || typeof cmd !== "string") return { isWrite: false };
 	const trimmed = cmd.trim();
 
-	// 1. Redirection checks (excluding 2>/dev/null, >/dev/null, 2>&1, 1>/dev/null, &>/dev/null)
+	// 1. Redirection checks (excluding /dev/null and fd dups like 2>&1, 1>&2)
 	const sanitized = trimmed
-		.replace(/2>&1/g, "")
-		.replace(/&>\s*\/dev\/null/g, "")
-		.replace(/>\s*\/dev\/null/g, "")
-		.replace(/1>\s*\/dev\/null/g, "")
-		.replace(/2>\s*\/dev\/null/g, "");
+		.replace(/\b[012]?>&\s*[012]\b/g, "")
+		.replace(/(?:&|[012])?>\s*\/dev\/null/g, "");
 
-	if (/(?:^|[^<])>{1,2}(?!\/dev\/null)/.test(sanitized)) {
-		return { isWrite: true, reason: "Output redirection (>, >>) writes to files." };
+	if (/(?:^|[^<])(?:&?>>?|<>|\|>)(?!\s*\/dev\/null)/.test(sanitized)) {
+		return { isWrite: true, reason: "Output redirection (>, >>, &>, <>) writes to files." };
 	}
 
-	// 2. In-place file editing or streaming write utility
-	if (/\b(?:sed\s+-[a-zA-Z]*i|truncate\b|dd\s+.*of=|tee\b)/i.test(trimmed)) {
-		return { isWrite: true, reason: "In-place file editing or streaming write utility (sed -i, truncate, dd, tee)." };
+	// 2. In-place file editing, streaming write utilities, or awk file redirection
+	if (/\b(?:sed\s+(?:-[a-zA-Z]*i|--in-place\b)|truncate\b|dd\s+.*of=|tee\b)/i.test(trimmed)
+		|| /\bawk\b[^;\n]*>\s*['"/a-zA-Z0-9_.-]/i.test(trimmed)) {
+		return { isWrite: true, reason: "In-place file editing or streaming write utility (sed -i, truncate, dd, tee, awk >)." };
 	}
 
-	// 3. Destructive and filesystem modification commands
-	if (/\b(?:rm|rmdir|mv|cp|touch|chmod|chown)\s+/i.test(trimmed)) {
-		return { isWrite: true, reason: "File mutation or deletion command (rm, mv, cp, touch, chmod, chown)." };
+	// 3. Destructive, filesystem mutation, symlink, and archive extraction commands
+	if (/\b(?:rm|rmdir|mv|cp|touch|chmod|chown|chgrp|mkdir|mkfifo|mknod|mktemp|ln|install|patch|cpio|unzip|unrar|7z)\b/i.test(trimmed)
+		|| /\btar\s+(?:-[a-zA-Z]*[xruc]|--(?:extract|get|append|update|create|delete)\b|[a-zA-Z]*[xruc][a-zA-Z]*\b)/i.test(trimmed)
+		|| /\b(?:gunzip|bunzip2|unxz)\b(?![^\n]*(?:\s-c\b|--stdout\b))/i.test(trimmed)
+		|| /\bfind\b[^\n]*(?:-delete\b|-exec(?:dir)?\b[^\n]*\b(?:rm|mv|cp|chmod|chown|sed\s+-i|tee)\b)/i.test(trimmed)) {
+		return { isWrite: true, reason: "Filesystem mutation, link, or archive extraction command." };
 	}
 
-	// 4. Git state mutating commands
-	if (/\bgit\s+(?:commit|checkout|reset|rebase|merge|push|add|tag|apply|stash|clean)\b/i.test(trimmed)) {
+	// 4. Network transfer / file upload / file download commands
+	if (/\b(?:scp|rsync|sftp)\s+/i.test(trimmed)
+		|| /\bcurl\b[^\n]*(?:\s-(?:o|O|T|d|F)\b|--(?:output|remote-name|upload-file|data|data-raw|data-binary|form)\b)/i.test(trimmed)
+		|| /\bwget\b(?![^\n]*-O\s*-)/i.test(trimmed)) {
+		return { isWrite: true, reason: "Network file transfer or output download command." };
+	}
+
+	// 5. Inline arbitrary code execution / nested shells / editors
+	if (/\bpython[0-9.]*\s+(?:-[a-zA-Z]*c\b|-m\s+(?:pip|venv|ensurepip)\b)/i.test(trimmed)
+		|| /\bnode\s+(?:--?e(?:val)?\b|-p\b|--print\b)/i.test(trimmed)
+		|| /\b(?:perl\s+-[a-zA-Z]*[ei]|ruby\s+-[a-zA-Z]*e|php\s+-[a-zA-Z]*r)\b/i.test(trimmed)
+		|| /(?:^|[;&|]\s*)(?:bash|sh|zsh|dash|ksh)\s+-[a-zA-Z]*c\b/i.test(trimmed)
+		|| /(?:^|[;&|]\s*)(?:eval|vi|vim|nvim|nano|ed|ex)\s+/i.test(trimmed)) {
+		return { isWrite: true, reason: "Inline script execution, nested shell, or interactive editor." };
+	}
+
+	// 6. Git state mutating commands
+	if (/\bgit\s+(?:commit|checkout|reset|rebase|merge|push|add|tag|apply|stash|clean|cherry-pick|revert|am|fetch|pull|switch|restore|rm|mv|gc|init|clone|worktree\s+(?:add|remove|prune|move)|branch\s+-[dDmM])\b/i.test(trimmed)) {
 		return { isWrite: true, reason: "Git repository state modification." };
 	}
 
-	// 5. Package managers write commands
-	if (/\b(?:npm\s+(?:i|install|ci|update|uninstall)|yarn\s+(?:add|remove)|pnpm\s+(?:add|remove)|pip\s+install|cargo\s+install)\b/i.test(trimmed)) {
+	// 7. Package managers write commands
+	if (/\b(?:npm\s+(?:i|install|ci|update|uninstall|publish)|yarn\s+(?:add|remove)|pnpm\s+(?:add|remove|install)|pip[0-9.]*\s+install|cargo\s+install)\b/i.test(trimmed)) {
 		return { isWrite: true, reason: "Package manager installation/modification command." };
 	}
 
@@ -1814,10 +1831,14 @@ export function isPathInWriteScope(targetPath: string, writePaths: string[], cwd
 	return false;
 }
 
+export function shellSingleQuote(arg: string): string {
+	return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
 export function wrapInBwrapSandbox(command: string, cwd: string = process.cwd()): string {
 	if (!HAS_BWRAP) return command;
-	// Use bubblewrap to enforce Linux kernel VFS read-only filesystem mount
-	return `/usr/bin/bwrap --ro-bind / / --dev /dev --proc /proc --chdir ${JSON.stringify(cwd)} bash -c ${JSON.stringify(command)}`;
+	// Single-quote both cwd and command so the outer shell performs zero $() / backtick / $VAR expansion outside bwrap.
+	return `/usr/bin/bwrap --ro-bind / / --dev /dev --proc /proc --chdir ${shellSingleQuote(cwd)} -- bash -c ${shellSingleQuote(command)}`;
 }
 
 export function detectSubagentTaskAssignment(entries: any[]): { id: string; writePaths: string[]; isReadOnly: boolean } | null {
@@ -1837,10 +1858,10 @@ export function detectSubagentTaskAssignment(entries: any[]): { id: string; writ
 		} else if (entry?.type === "custom_message" || entry?.role === "user") {
 			if (typeof entry.content === "string") text = entry.content;
 		}
-		if (text.includes("TEAM_TASK:")) {
-			const taskIdMatch = text.match(/TEAM_TASK:\s*([^\s\n]+)/);
-			const id = taskIdMatch ? taskIdMatch[1].trim() : "";
-			const scopeMatch = text.match(/SCOPE:\s*[^\s]+\s+role=(\S+)\s+readPaths=(\[[^\]]*\])\s+writePaths=(\[[^\]]*\])/);
+		const taskIdMatch = text.match(/^TEAM_TASK:\s*([^\s\n]+)/m);
+		if (taskIdMatch) {
+			const id = taskIdMatch[1].trim();
+			const scopeMatch = text.match(/^SCOPE:\s*[^\s]+\s+role=(\S+)\s+readPaths=(\[[^\]]*\])\s+writePaths=(\[[^\]]*\])/m);
 			const roleMatch = text.match(/^Role:\s*([^\s\n]+)/m);
 			const role = (scopeMatch?.[1] || roleMatch?.[1] || "").trim().toLowerCase();
 			if (isCpProfile || role === "cp") {
@@ -1854,7 +1875,7 @@ export function detectSubagentTaskAssignment(entries: any[]): { id: string; writ
 					return [];
 				}
 			};
-			const writePathsMatch = text.match(/Write Paths:\s*([^\n]+)/);
+			const writePathsMatch = text.match(/^Write Paths:\s*([^\n]+)/m);
 			const rawWritePaths = writePathsMatch ? writePathsMatch[1].trim() : "";
 			// The contract line wins; the legacy text fallback only applies when it is absent.
 			const writePaths = scopeMatch
@@ -1966,25 +1987,25 @@ export function updateAgentFileConfig(role: Role, updates: { model?: string; thi
 	if (!existsSync(filePath)) return false;
 	try {
 		const raw = readFileSync(filePath, "utf8");
-		const parts = raw.split("---");
-		if (parts.length < 3) return false;
-		let fm = parts[1];
+		const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---(\r?\n[\s\S]*)?$/);
+		if (!m) return false;
+		let fm = m[1];
+		const body = m[2] ?? "";
 		if (updates.model) {
 			if (/^model:\s*.*$/m.test(fm)) {
 				fm = fm.replace(/^model:\s*.*$/m, `model: ${updates.model}`);
 			} else {
-				fm = fm.trimEnd() + `\nmodel: ${updates.model}\n`;
+				fm = fm.trimEnd() + `\nmodel: ${updates.model}`;
 			}
 		}
 		if (updates.thinking) {
 			if (/^thinking:\s*.*$/m.test(fm)) {
 				fm = fm.replace(/^thinking:\s*.*$/m, `thinking: ${updates.thinking}`);
 			} else {
-				fm = fm.trimEnd() + `\nthinking: ${updates.thinking}\n`;
+				fm = fm.trimEnd() + `\nthinking: ${updates.thinking}`;
 			}
 		}
-		parts[1] = fm;
-		writeFileSync(filePath, parts.join("---"), "utf8");
+		writeFileSync(filePath, `---\n${fm}\n---${body}`, "utf8");
 		return true;
 	} catch {
 		return false;
@@ -1996,9 +2017,9 @@ export function readAgentFileConfig(role: Role, dir: string = agentDir()): { mod
 	if (!existsSync(filePath)) return {};
 	try {
 		const raw = readFileSync(filePath, "utf8");
-		const parts = raw.split("---");
-		if (parts.length < 3) return {};
-		const fm = parts[1];
+		const m = raw.match(/^---\r?\n([\s\S]*?)\r?\n---(\r?\n[\s\S]*)?$/);
+		if (!m) return {};
+		const fm = m[1];
 		const modelMatch = fm.match(/^model:\s*(.+)$/m);
 		const thinkingMatch = fm.match(/^thinking:\s*(.+)$/m);
 		return {
@@ -2102,6 +2123,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	const duplicateAgentCalls = new Map<string, { taskId: string; role: string; sessionId: string }>();
 	const duplicateAgentResults = new Set<string>();
 	let subagentAssignedTask: { id: string; writePaths: string[]; isReadOnly: boolean } | null = null;
+	let warnedMissingBwrap = false;
 	const ctxStore: { current: ExtensionContext | null } = { current: null };
 	let toolLauncher: ((name: string, args: Record<string, unknown>, options?: any) => Promise<any>) | null = null;
 
@@ -2420,11 +2442,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		return reclaimed;
 	}
 	function sharedConflictPath(a: WorkTask, b: WorkTask): string {
-		const candidates = [...a.writePaths, ...a.readPaths];
-		for (const path of [...b.writePaths, ...b.readPaths]) {
-			if (candidates.some(other => overlap(path, other) || overlap(other, path))) return path;
-		}
-		return b.writePaths[0] || a.writePaths[0] || "(unspecified path)";
+		return conflictPathBetweenScopes(a, b) || b.writePaths[0] || a.writePaths[0] || "(unspecified path)";
 	}
 	function nextActionForScopeHold(holder: WorkTask): string {
 		if (holder.status === "reviewing") {
@@ -2445,7 +2463,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	}
 	function describeConflictMode(task: WorkTask, holder: WorkTask): string {
 		if (holder.id === task.id) return "same-task lock on";
-		const wVsW = task.writePaths.some(a => holder.writePaths.some(b => overlap(a, b) || overlap(b, a)));
+		const wVsW = task.writePaths.some(a => holder.writePaths.some(b => writeConflicts(a, b) || writeConflicts(b, a)));
 		if (wVsW) return "write-vs-write lock on";
 		return "write-vs-read lock on";
 	}
@@ -4368,43 +4386,52 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				const input = event.input as Record<string, unknown>;
 				enforceBashTimeout(input, cfg.bashTimeoutSeconds, cfg.bashMaxTimeoutSeconds);
 
-				if (subagentAssignedTask?.isReadOnly) {
+				// Fail-closed: if task assignment could not be parsed, treat subagent bash as read-only too.
+				if (!subagentAssignedTask || subagentAssignedTask.isReadOnly) {
 					const rawCmd = typeof input.command === "string" ? input.command : (typeof input.cmd === "string" ? input.cmd : "");
 					const writeCheck = isBashWriteCommand(rawCmd);
 					if (writeCheck.isWrite) {
+						const scopeId = subagentAssignedTask?.id ?? "unverified-scope";
 						return {
 							block: true,
-							reason: `Write operation rejected: Task ${subagentAssignedTask.id} was declared read-only (writePaths=[]). Bash command "${rawCmd.slice(0, 60)}" was blocked: ${writeCheck.reason}`,
+							reason: `Write operation rejected: Task ${scopeId} is read-only or lacks a verified write scope. Bash command "${rawCmd.slice(0, 60)}" was blocked: ${writeCheck.reason}`,
 						};
 					}
 					// Kernel-level read-only VFS sandbox via bwrap
 					const cwd = (ctx as any)?.cwd || process.cwd();
 					if (HAS_BWRAP && rawCmd) {
 						input.command = wrapInBwrapSandbox(rawCmd, cwd);
+					} else if (!HAS_BWRAP && rawCmd && !warnedMissingBwrap) {
+						warnedMissingBwrap = true;
+						ctx?.ui?.notify?.("⚠️ /usr/bin/bwrap 未安装或非 Linux 环境：只读子会话已降级为命令静态拦截（无内核只读挂载隔离）。", "warning");
 					}
 				}
 				return;
 			}
 
-			// 2. File edit/write tools in subagent session:
+			// 2. File edit/write tools in subagent session (fail-closed if task scope is missing/unverified):
 			if (["edit", "write", "file_edit", "file_write"].includes(toolName)) {
-				if (subagentAssignedTask?.isReadOnly) {
+				if (!subagentAssignedTask) {
+					return {
+						block: true,
+						reason: `Write operation rejected: subagent task scope could not be verified (missing TEAM_TASK/SCOPE contract). Writing or editing files using "${toolName}" is prohibited.`,
+					};
+				}
+				if (subagentAssignedTask.isReadOnly) {
 					return {
 						block: true,
 						reason: `Write operation rejected: Task ${subagentAssignedTask.id} was declared read-only (writePaths=[]). Writing or editing files using "${toolName}" is prohibited.`,
 					};
 				}
 
-				if (subagentAssignedTask && !subagentAssignedTask.isReadOnly) {
-					const input = event.input as Record<string, unknown>;
-					const targetPath = (typeof input.path === "string" ? input.path : (typeof input.file_path === "string" ? input.file_path : "")) || "";
-					const cwd = (ctx as any)?.cwd || process.cwd();
-					if (targetPath && !isPathInWriteScope(targetPath, subagentAssignedTask.writePaths, cwd)) {
-						return {
-							block: true,
-							reason: `Write operation rejected: Task ${subagentAssignedTask.id} is authorized to write only to [${subagentAssignedTask.writePaths.join(", ")}]. Target "${targetPath}" is outside the authorized write scope.`,
-						};
-					}
+				const input = event.input as Record<string, unknown>;
+				const targetPath = (typeof input.path === "string" ? input.path : (typeof input.file_path === "string" ? input.file_path : "")) || "";
+				const cwd = (ctx as any)?.cwd || process.cwd();
+				if (targetPath && !isPathInWriteScope(targetPath, subagentAssignedTask.writePaths, cwd)) {
+					return {
+						block: true,
+						reason: `Write operation rejected: Task ${subagentAssignedTask.id} is authorized to write only to [${subagentAssignedTask.writePaths.join(", ")}]. Target "${targetPath}" is outside the authorized write scope.`,
+					};
 				}
 			}
 			return;

@@ -41,8 +41,8 @@ import {
 
 let passed = 0;
 let blocked = 0;
-/** Set W120_LEDGER_WIRED=1 once team-ledger.ts taskConflict delegates to scopePathsConflict. */
-const LEDGER_WIRED = process.env.W120_LEDGER_WIRED === '1';
+/** Live ledger taskConflict delegates to scopePathsConflict by default. */
+const LEDGER_WIRED = process.env.W120_LEDGER_WIRED !== '0';
 const test = (name: string, fn: () => void) => { fn(); passed++; console.log(`✓ ${name}`); };
 
 function fixture(cwd = '/repo') {

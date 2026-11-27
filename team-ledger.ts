@@ -1,6 +1,6 @@
 /** Persistent additive work ledger. No model calls or host lifecycle rewrites. */
 import { resolve, isAbsolute } from "node:path";
-import { normalizeScopePath, scopeBase, overlap as scopeOverlap } from "./team-scope.ts";
+import { normalizeScopePath, scopeBase, overlap as scopeOverlap, scopePathsConflict } from "./team-scope.ts";
 import { existsSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 
@@ -728,8 +728,6 @@ export function taskConflict(a: WorkTask, b: WorkTask): boolean {
 	// 2. Reviewer relationship is exempt from filesystem conflict (reviewer inspects worker's output files)
 	if (a.parentTaskId === b.id || a.id === reviewerTaskId(b.id) || b.parentTaskId === a.id || b.id === reviewerTaskId(a.id)) return false;
 
-	const intersects = (xs: string[], ys: string[]) => xs.some(x => ys.some(y => overlap(x, y) || overlap(y, x)));
-
 	// 3. Worktree isolation validation:
 	const aClaimsWt = a.isolation === "worktree";
 	const bClaimsWt = b.isolation === "worktree";
@@ -749,8 +747,8 @@ export function taskConflict(a: WorkTask, b: WorkTask): boolean {
 	// 4. Both tasks have verified distinct worktree isolation:
 	if (aValidWt && bValidWt) {
 		if (a.worktreePath === b.worktreePath) {
-			// Shared same worktree directory -> check path intersections
-			return intersects(a.writePaths, [...b.writePaths, ...b.readPaths]) || intersects(b.writePaths, a.readPaths);
+			// Shared same worktree directory -> check write/write and write/read scope conflicts (including dir/ subtrees)
+			return scopePathsConflict(a, b);
 		}
 		// Verified distinct worktree directories do not conflict on filesystem operations
 		return false;
@@ -761,7 +759,7 @@ export function taskConflict(a: WorkTask, b: WorkTask): boolean {
 		const wt = aValidWt ? a : b;
 		const main = aValidWt ? b : a;
 		if (main.worktreePath && wt.worktreePath === main.worktreePath) {
-			return intersects(a.writePaths, [...b.writePaths, ...b.readPaths]) || intersects(b.writePaths, a.readPaths);
+			return scopePathsConflict(a, b);
 		}
 		// Distinct verified worktree does not conflict with main workspace files
 		return false;
@@ -771,8 +769,8 @@ export function taskConflict(a: WorkTask, b: WorkTask): boolean {
 	// Pure read-read operations never conflict
 	if (a.writePaths.length === 0 && b.writePaths.length === 0 && !isWriterTask(a) && !isWriterTask(b)) return false;
 
-	// Write-write and write-read path overlap conflicts
-	return intersects(a.writePaths, [...b.writePaths, ...b.readPaths]) || intersects(b.writePaths, a.readPaths);
+	// Write-write and write-read scope conflicts (including directory-wide dir/ write coverage)
+	return scopePathsConflict(a, b);
 }
 export function readyTasks(board: WorkLedger, now = Date.now()): WorkTask[] {
 	return board.tasks.filter(task => (task.status === "ready" || task.status === "queued")
