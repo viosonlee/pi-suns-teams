@@ -30,8 +30,30 @@
 
 ### Commit / push
 
-本阶段提交、push 尚待执行；实际 commit 范围将在下一次报告更新中记录。任何后续阶段必须等本阶段全量通过并成功 push 后才开始。
+`feat(scheduler): provision isolated worktrees for conflicted writers`，commit `b854bcec067c4f2b832918361001ef63c876342e`。
+`git push origin main` → exit 0，实际目标 `github.com:viosonlee/pi-suns-teams.git`，范围 **`0f55201..b854bce main -> main`**。
 
-## 改造 2 / Batch 1–3
+## 改造 2：reviewing 下严格只读放行
 
-尚未在主工作区实现或验收；不得从另一 worktree 的旧测试报告推定已通过。后续按顺序记录每阶段完整测试、审查、commit 与 `origin main` push 结果。
+### 文件与设计
+
+`team-ledger.ts`、`extensions/team.ts`、`tests/test-team-reviewing-readers.ts`、`tests/test-team-audit-regression.ts`。
+
+- 纯函数 `reviewingReadAllowed` 只允许 `writePaths=[]` 且无 writer 能力、无共享资源交集的候选绕过已停写的 reviewing 持有者；`scopeBlockingLive` / `isActiveReviewHold` 不改。
+- `readyTasks`、`heldConflict`、两种持锁提示同用该判断；同任务 lease 不绕过。不同 worktree 分支也显式保留共享资源互斥。
+- reviewing writer 候选仍受待审交付保护；真正 running/uncertain writer 对严格读者仍互斥。
+- 改造 1 中有一项刻意保留的旧严格读者期望，在本阶段按明确新语义更新并注释；没有删掉 writer/共享资源/live writer 反例。
+
+### 实测
+
+- `LC_ALL=C node tests/test-team-reviewing-readers.ts` → **6 passed / 0 failed**（纯函数 + 实际 extension/Agent/lease hooks）；`artifacts/batch-report/stage2-target.txt`。开发时初版 fixture 未初始化 ledger，修正后通过，没有产品失败被伪报通过。
+- `LC_ALL=C npm test` → 初次 **36/37 test files passed / 1 failed**，改造 1 旧测试期望 `ready`、实际正确为 `running`；独立 reviewer 也指出同一项 REWORK。原日志 `artifacts/batch-report/stage2-full.txt`。
+- 更新该明确要求改变的期望，`LC_ALL=C npm test` → **37/37 test files passed / 0 failed**，exit 0；`artifacts/batch-report/stage2-full-final.txt`。既有 review 生命周期与 lease-release 套件均包含在全量回归中。
+
+### Commit / push
+
+待最终只读复核后提交并 push；下阶段开始前将确认成功。实际范围随后写回报告。
+
+## Batch 1–3
+
+尚未在主工作区实现或验收；不得从另一 worktree 的旧测试报告推定已通过。

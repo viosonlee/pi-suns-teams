@@ -19,7 +19,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import {
 	newLedger, addRequest, addTasks, addBacklog, updateTask, resolveRequest, terminalWork, liveWork, occupiesSlot,
 	readyTasks, dispatchBatch, markDispatched, observeTask, completionBlockers, ledgerPrompt, moveTask, archivePrompt,
-	taskConflict, autoWorktreeEligible, parseTeamTaskId, isDeterministic, isReviewExempt, isReviewTask, autoAcceptTask, createReviewerTask, nextDispatchableTasks,
+	taskConflict, reviewingReadAllowed, autoWorktreeEligible, parseTeamTaskId, isDeterministic, isReviewExempt, isReviewTask, autoAcceptTask, createReviewerTask, nextDispatchableTasks,
 	reviewerTaskId, completeReviewTask, publishTasks, overlap, recordReview, deliveryVersionOf, reviewRecordsOf,
 	reclaimStaleReviews, isActiveReviewHold, scopeBlockingLive, REVIEW_STALE_MS, pruneStaleReviews,
 	reviewDispatchOwnershipProblem, setManualDispatchHold, releaseManualDispatchHold,
@@ -2876,6 +2876,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		return [...leases.values()].some(other => liveWork(other.status)
 			&& !isLeaseSettledOnBoard(other)
 			&& (other.id === task.id || taskConflict(task, other))
+			&& !(other.id !== task.id && reviewingReadAllowed(task, other))
 			&& !(allowCurrentLiveAttempt && liveWork(task.status) && other.runId === task.runId));
 	}
 	/** Observable reclaim: settle zombie reviewing → reported and drop their finished leases. No timer. */
@@ -2915,6 +2916,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		for (const other of leases.values()) {
 			if (!liveWork(other.status) || isLeaseSettledOnBoard(other)) continue;
 			if (!(other.id === task.id || taskConflict(task, other))) continue;
+			if (other.id !== task.id && reviewingReadAllowed(task, other)) continue;
 			const path = other.id === task.id ? (task.writePaths[0] || other.writePaths[0] || "(same task)") : sharedConflictPath(task, other);
 			const since = other.dispatchedAt ?? "unknown";
 			return `${other.id} (${other.status}, since ${since}) holds ${describeConflictMode(task, other)} ${path}. ${nextActionForScopeHold(other)}`;
@@ -2922,7 +2924,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		for (const other of board().tasks) {
 			if (other.id === task.id) continue;
 			if (!scopeBlockingLive(board(), other)) continue;
-			if (!taskConflict(task, other)) continue;
+			if (!taskConflict(task, other) || reviewingReadAllowed(task, other)) continue;
 			const path = sharedConflictPath(task, other);
 			const since = other.dispatchedAt ?? "unknown";
 			return `${other.id} (${other.status}, since ${since}) holds ${describeConflictMode(task, other)} ${path}. ${nextActionForScopeHold(other)}`;

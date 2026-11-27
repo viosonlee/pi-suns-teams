@@ -806,6 +806,13 @@ export function taskConflict(a: WorkTask, b: WorkTask): boolean {
 	// Write-write and write-read scope conflicts (including directory-wide dir/ write coverage)
 	return scopePathsConflict(a, b);
 }
+/** A reviewing worker has stopped writing; strict read-only candidates may inspect its delivery.
+ * External resources and candidates with writer capability are never relaxed by this rule.
+ */
+export function reviewingReadAllowed(candidate: WorkTask, holder: WorkTask): boolean {
+	return holder.status === "reviewing" && candidate.writePaths.length === 0
+		&& !isWriterTask(candidate) && !sharedResourcesConflict(candidate, holder);
+}
 export function readyTasks(board: WorkLedger, now = Date.now()): WorkTask[] {
 	return board.tasks.filter(task => (task.status === "ready" || task.status === "queued")
 		&& !reviewDispatchOwnershipProblem(board, task)
@@ -823,7 +830,8 @@ export function readyTasks(board: WorkLedger, now = Date.now()): WorkTask[] {
 			&& taskConflict(task, other)
 			// Reviewing workers have stopped writing: allow ready tasks with DIFFERENT verified worktree to proceed.
 			&& !(other.status === "reviewing" && hasValidWorktree(task) && hasValidWorktree(other)
-				&& task.worktreePath !== other.worktreePath)));
+				&& task.worktreePath !== other.worktreePath && !sharedResourcesConflict(task, other))
+			&& !reviewingReadAllowed(task, other)));
 }
 /** Legacy slots argument is ignored: select all eligible independent work, never a numeric batch cap. */
 export function dispatchBatch(board: WorkLedger, _slots = Infinity, eligible: (task: WorkTask) => boolean = () => true): WorkTask[] {

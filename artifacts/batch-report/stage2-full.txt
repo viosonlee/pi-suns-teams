@@ -1,0 +1,74 @@
+
+> pi-teams@1.2.7 test
+> node tests/run-all.mjs
+
+✓ test-review-gate.ts (197ms)
+✓ test-review-independence.ts (402ms)
+✓ test-review-protocol.ts (141ms)
+✗ test-team-audit-regression.ts (1293ms)
+✓ automatic provisioning preserves the five-extra-worktree admission cap
+✓ native manual Agent actually launches in the auto-worktree with its remapped scope
+✓ hosted cwd limitation fails closed: no prompt-only worktree isolation
+✓ persisted auto-owned worktree cannot dispatch through hosted scheduler or manual Agent
+✓ tracked absolute symlink keeps writer and strict reader locks intact
+✓ subdirectory parent provisions beside repository root, never inside main checkout
+✓ dependencies still gate provisioning and dispatch
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+
+'running' !== 'ready'
+
+    at file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-audit-regression.ts:450:10
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async withHarness (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-audit-regression.ts:276:3)
+    at async runAsync (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-audit-regression.ts:241:66)
+    at async file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-audit-regression.ts:448:2 {
+  generatedMessage: true,
+  code: 'ERR_ASSERTION',
+  actual: 'running',
+  expected: 'ready',
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v22.23.2
+
+✓ test-team-cp-parent-hooks.ts (695ms)
+✓ test-team-cp-parent.ts (269ms)
+✓ test-team-dispatch-coordination.ts (353ms)
+✓ test-team-doctor.ts (453ms)
+✓ test-team-gc-safety.ts (382ms)
+✓ test-team-gc.ts (210ms)
+✓ test-team-goal-edit.ts (440ms)
+✓ test-team-host-hooks.ts (523ms)
+✓ test-team-host-probe.ts (324ms)
+✓ test-team-host-runner.ts (227ms)
+✓ test-team-ledger-hooks.ts (804ms)
+✓ test-team-ledger.ts (303ms)
+✓ test-team-model-list.ts (310ms)
+✓ test-team-native-hooks.ts (1226ms)
+✓ test-team-native-runner.ts (1216ms)
+✓ test-team-parallel.ts (515ms)
+✓ test-team-prune-and-review-contract.ts (620ms)
+✓ test-team-recovery-hooks.ts (891ms)
+✓ test-team-recovery-safety.ts (1262ms)
+✓ test-team-recovery.ts (492ms)
+✓ test-team-refactor-scheduler.ts (657ms)
+✓ test-team-review-lease-release.ts (715ms)
+✓ test-team-review-lifecycle-safety.ts (809ms)
+✓ test-team-reviewing-readers.ts (617ms)
+✓ test-team-rework-complete.ts (826ms)
+✓ test-team-role-review.ts (576ms)
+✓ test-team-scope-granularity.ts (342ms)
+✓ test-team-scope-precision.ts (214ms)
+✓ test-team-state-delta.ts (1708ms)
+✓ test-team-v21-verification.ts (562ms)
+✓ test-team-version.ts (300ms)
+✓ test-team-worktree.ts (616ms)
+✓ test-team.ts (313ms)
+
+36/37 test files passed
+Failed: test-team-audit-regression.ts

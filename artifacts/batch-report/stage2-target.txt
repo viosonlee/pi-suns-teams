@@ -1,0 +1,8 @@
+✓ reviewing hold remains active; strict readers admitted, writers and resources blocked
+✓ running/uncertain writers still block strict readers and writers
+✓ writer capability cannot be disguised as empty writePaths
+✓ real Agent hook and persisted reviewing lease agree with readyTasks
+✓ hook rejection guidance still names reviewing holder for writers/resources
+✓ hook keeps live running writer/strict reader mutual exclusion
+
+6 passed / 0 failed

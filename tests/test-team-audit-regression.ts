@@ -445,11 +445,13 @@ try {
 		assert.equal(h.task().worktreePath, undefined);
 		assert.equal(h.launches.length, 0);
 	}));
-	await runAsync("strict same-main-tree reader remains blocked by a reviewing hold (not stage 2)", () => withHarness({ status: "reviewing", candidate: { role: "ayton", declaredReadOnly: true, writePaths: [] } }, async h => {
+	// Stage 2 explicitly permits a strict reader of a stopped reviewing delivery, without moving it.
+	// The live writer/strict reader and shared-resource counterexamples above remain unchanged.
+	await runAsync("strict same-main-tree reader is admitted under reviewing hold without worktree", () => withHarness({ status: "reviewing", candidate: { role: "ayton", declaredReadOnly: true, writePaths: [] } }, async h => {
 		await h.pump();
-		assert.equal(h.task().status, "ready");
+		assert.equal(h.task().status, "running");
 		assert.equal(h.task().worktreePath, undefined);
-		assert.equal(h.launches.length, 0);
+		assert.equal(h.launches.length, 1);
 	}));
 } finally {
 	globalThis.setInterval = realInterval; globalThis.clearInterval = realClearInterval;
