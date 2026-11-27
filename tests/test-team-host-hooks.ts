@@ -19,16 +19,16 @@ let sequence = 0;
 let passed = 0;
 const cleanup: Array<() => Promise<void>> = [];
 
-function harness(options: { child?: boolean; entries?: any[]; noExecutor?: boolean; uncertain?: boolean } = {}) {
+function harness(options: { child?: boolean; entries?: any[]; children?: Map<string, { status: string; text: string; file: string; lines: any[] }>; parentId?: string; parentFile?: string; noExecutor?: boolean; uncertain?: boolean } = {}) {
  const cwd = join(root, "work"); mkdirSync(cwd, { recursive: true });
- const parentId = randomUUID(), parentFile = join(root, `parent-${parentId}.jsonl`);
+ const parentId = options.parentId ?? randomUUID(), parentFile = options.parentFile ?? join(root, `parent-${parentId}.jsonl`);
  const seed = initialState(defaultConfig()); seed.enabled = true; seed.startedAt = new Date().toISOString();
  const entries: any[] = options.entries ?? [{ type: "custom", customType: "team-state", data: seed }];
  if (options.child) entries.push({ type: "custom", customType: "pi-web.subsession.spawned", data: { spawnedSessionId: parentId, spawnedBySessionId: "another-parent" } });
  writeFileSync(parentFile, JSON.stringify({ type: "session", version: 3, id: parentId, timestamp: new Date().toISOString(), cwd }) + "\n");
  const hooks = new Map<string, Function[]>(), tools = new Map<string, any>();
  const calls: Array<{ name: string; args: any }> = [], messages: any[] = [], activeTools: string[][] = [];
- const children = new Map<string, { status: string; text: string; file: string; lines: any[] }>();
+ const children = options.children ?? new Map<string, { status: string; text: string; file: string; lines: any[] }>();
  const manager = { getEntries: () => entries, getBranch: () => entries, getSessionId: () => parentId, getSessionFile: () => parentFile };
  const ctx: any = { cwd, hasUI: false, isIdle: () => true, sessionManager: manager, ui: { notify() {}, setStatus() {} }, modelRegistry: { find() {} } };
  const eventCtx = { ...ctx };
@@ -89,7 +89,7 @@ function harness(options: { child?: boolean; entries?: any[]; noExecutor?: boole
  const state = () => [...entries].reverse().find(e => e.customType === "team-state")?.data;
  const task = (id: string) => state().ledger.tasks.find((t: any) => t.id === id);
  cleanup.push(() => emit("session_shutdown"));
- return { ctx, eventCtx, emit, tools, calls, children, messages, activeTools, state, task, append,
+ return { ctx, eventCtx, emit, tools, calls, children, messages, activeTools, entries, parentId, parentFile, state, task, append,
   async start() { await emit("session_start"); if (!options.child) await emit("input", { text: "Authorized fixture request", source: "rpc" }); },
   async ledger(params: any) { return tools.get("team_tasks").execute(`ledger-${++sequence}`, params, undefined, undefined, ctx); },
   async agent(params: any) { return ctx.executeTool("Agent", params); },
@@ -366,6 +366,77 @@ try {
   const yieldAfterWarn = await h.emit("tool_call", { toolName: "yield_to_subsessions", toolCallId: "y-blk2", input: {} });
   assert.notEqual(yieldAfterWarn.block, true, "second yield for same already-surfaced blocker set does not trap loop");
   await h.emit("session_shutdown");
+ });
+ await test("reported hosted task never re-harvests or duplicates notifications after session reload/restart; rework resume notifies once for new runId", async () => {
+  const h1 = harness(); await h1.start();
+  await h1.ledger({ action: "add", autoDispatch: false, tasks: [{ ...h1.spec("W-reload-nodup", "ayton"), acceptance: ["Verified pass"] }] });
+  const started = await h1.agent({ subagent_type: "ayton", prompt: "TEAM_TASK: W-reload-nodup\nRun checks" });
+  const childId = started.result.details.sessionId;
+  const firstRunId = h1.task("W-reload-nodup").runId;
+  const child = h1.children.get(childId)!;
+  child.status = "idle";
+  child.text = "Conclusion: PASS\nVerification: exit code 0";
+  h1.append(childId, { role: "assistant", content: [{ type: "text", text: child.text }], stopReason: "stop" });
+  // Parent observes host completion, delivers inline once via before_agent_start (NOT delayed followUp!)
+  const startEvent = await h1.emit("before_agent_start", { systemPrompt: "sys", prompt: "" });
+  assert.equal(startEvent.message?.customType, "pi-web:subagent-notification", "before_agent_start delivers hosted report inline for the current turn");
+  assert.equal(h1.messages.filter(m => m.customType === "pi-web:subagent-notification").length, 0, "before_agent_start must not enqueue delayed followUp notification");
+  assert.equal(h1.task("W-reload-nodup").status, "reported");
+  assert.equal(h1.task("W-reload-nodup").completedNotifiedRunId, firstRunId);
+  await h1.emit("session_shutdown");
+
+  // Reload/restart a brand-new extension instance over the persisted entries + shared child files (wiping all in-memory Sets)
+  const h2 = harness({ entries: h1.entries, children: h1.children, parentId: h1.parentId, parentFile: h1.parentFile });
+  await h2.emit("session_start");
+  const checksBeforeReload = h2.calls.filter(c => c.name === "check_subsession").length;
+  const reloadStart = await h2.emit("before_agent_start", { systemPrompt: "sys", prompt: "" });
+  await tick();
+  assert.equal(reloadStart.message, undefined, "reloaded session must not re-deliver already-notified reported task inline");
+  assert.equal(h2.calls.filter(c => c.name === "check_subsession").length, checksBeforeReload, "reloaded session must not re-poll already-notified reported task");
+  assert.equal(h2.messages.filter(m => m.customType === "pi-web:subagent-notification").length, 0, "reloaded session must not re-send followUp notice");
+
+  // Rework via explicit resume mints a new runId -> eligible to notify once when the new attempt finishes
+  const requeued = await h2.ledger({ action: "update", autoDispatch: false, updates: [{ id: "W-reload-nodup", status: "ready", evidence: ["Rework round 2"], reason: "Run additional assertion" }] });
+  assert.notEqual(requeued.isError, true);
+  const resumed = await h2.agent({ subagent_type: "ayton", resume: childId, prompt: "TEAM_TASK: W-reload-nodup\nRound 2" });
+  assert.equal(resumed.isError, false, JSON.stringify(resumed));
+  const secondRunId = h2.task("W-reload-nodup").runId;
+  assert.notEqual(secondRunId, firstRunId);
+  assert.equal(h2.task("W-reload-nodup").completedNotifiedRunId, undefined, "new dispatch clears old completedNotifiedRunId");
+  child.status = "idle";
+  child.text = "Conclusion: PASS (round 2)\nVerification: exit code 0";
+  h2.append(childId, { role: "assistant", content: [{ type: "text", text: child.text }], stopReason: "stop" });
+  const round2Start = await h2.emit("before_agent_start", { systemPrompt: "sys", prompt: "" });
+  assert.equal(round2Start.message?.customType, "pi-web:subagent-notification");
+  assert.match(round2Start.message.content, /round 2/);
+  assert.equal(h2.task("W-reload-nodup").completedNotifiedRunId, secondRunId);
+  await h2.emit("session_shutdown");
+ });
+ await test("parallel get_subagent_result calls suppress sibling notifications and persist across reload", async () => {
+  const h1 = harness(); await h1.start();
+  await h1.ledger({ action: "add", autoDispatch: false, tasks: [
+   { ...h1.spec("W-par-a", "ayton"), acceptance: ["a ok"] },
+   { ...h1.spec("W-par-b", "cameron"), acceptance: ["b ok"] },
+  ] });
+  const sa = await h1.agent({ subagent_type: "ayton", prompt: "TEAM_TASK: W-par-a\nRun A" });
+  const sb = await h1.agent({ subagent_type: "cameron", prompt: "TEAM_TASK: W-par-b\nRun B" });
+  const idA = sa.result.details.sessionId, idB = sb.result.details.sessionId;
+  for (const [id, txt] of [[idA, "Report A: exit 0"], [idB, "Report B: exit 0"]] as const) {
+   const ch = h1.children.get(id)!;
+   ch.status = "idle"; ch.text = txt;
+   h1.append(id, { role: "assistant", content: [{ type: "text", text: txt }], stopReason: "stop" });
+  }
+  const ra = await h1.result(idA);
+  assert.equal(ra.details.status, "completed");
+  assert.equal(h1.messages.filter(m => m.customType === "pi-web:subagent-notification").length, 0, "get_subagent_result(A) must not trigger premature followUp notification for sibling B");
+  const rb = await h1.result(idB);
+  assert.equal(rb.details.status, "completed");
+  assert.equal(h1.messages.filter(m => m.customType === "pi-web:subagent-notification").length, 0);
+  await tick();
+  const afterStart = await h1.emit("before_agent_start", { systemPrompt: "sys", prompt: "" });
+  assert.equal(afterStart.message, undefined);
+  assert.equal(h1.messages.filter(m => m.customType === "pi-web:subagent-notification").length, 0);
+  await h1.emit("session_shutdown");
  });
  console.log(`\nTeam host hook tests passed: ${passed}`);
 } finally {

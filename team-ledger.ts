@@ -39,6 +39,8 @@ export interface WorkTask {
 	sessionId?: string; runId?: string; dispatchedAt?: string; archivedAt?: string; queueNote?: string;
 	/** Persisted transport: new pi-web children are host-managed; legacy process children stay native. */
 	executionTransport?: "hosted" | "native";
+	/** Last attempt runId whose completion notice or synchronous retrieval has already been consumed by parent. */
+	completedNotifiedRunId?: string;
 	/**
 	 * Per-task manual-dispatch hold. A held task stays in readyTasks() so an explicit Agent launch still
 	 * validates dependencies/scope, but the automatic scheduler (daemon, completion pump, reload) must not
@@ -823,6 +825,7 @@ export function markDispatched(board: WorkLedger, id: string, role: string, runI
 	if (resume && task.sessionId && task.sessionId !== resume) throw new Error(`${id}: resume does not match the task's existing child.`);
 	if (resume && board.tasks.some(other => other.id !== id && liveWork(other.status) && other.sessionId === resume)) throw new Error(`${id}: child is already owned by live work.`);
 	task.status = "running"; task.runId = runId; task.dispatchedAt = new Date().toISOString();
+	delete task.completedNotifiedRunId;
 	// An explicit dispatch consumes the manual hold atomically with the reservation; nothing about the
 	// reservation is left for the daemon to re-launch.
 	releaseManualDispatchHold(task);

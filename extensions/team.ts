@@ -79,7 +79,7 @@ const TEAM_EXTENSION_PATH = (() => {
 })();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.2.3";
+export const PI_TEAMS_VERSION = "1.2.4";
 export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
@@ -2290,11 +2290,79 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		}
 		return `${workId}: missing, not ready, wrong role, unfinished dependency or live scope conflict. Inspect team_tasks; do not duplicate live work.`;
 	}
-	async function refreshHostedNotifications(ctx: any): Promise<void> {
+	type InlineSubagentNotice = { customType: "pi-web:subagent-notification"; content: string; details: Record<string, unknown> };
+	let activeInlineNoticeSink: InlineSubagentNotice[] | null = null;
+
+	function markCompletionNotified(task: WorkTask | undefined, runId: string | undefined): boolean {
+		if (!task) return false;
+		const targetRunId = runId || task.runId;
+		if (!targetRunId || task.completedNotifiedRunId === targetRunId) return false;
+		task.completedNotifiedRunId = targetRunId;
+		board().revision++;
+		return true;
+	}
+
+	function hasDurableCompletionNotice(
+		task: WorkTask | undefined,
+		sessionId: string,
+		runId: string | undefined,
+		explicitEntries?: unknown[],
+	): boolean {
+		if (task) {
+			const targetRunId = runId || task.runId;
+			if (targetRunId && task.completedNotifiedRunId === targetRunId) return true;
+		}
+		const entries = explicitEntries
+			?? ((ctxStore.current?.sessionManager as { getEntries?: () => unknown[] } | undefined)?.getEntries?.() ?? []);
+		const dispatchedMs = task?.dispatchedAt ? Date.parse(task.dispatchedAt) : NaN;
+		for (const raw of entries) {
+			const e = raw as {
+				type?: string;
+				customType?: string;
+				timestamp?: string;
+				details?: Record<string, unknown>;
+				message?: { role?: string; toolName?: string; details?: Record<string, unknown>; timestamp?: number };
+			};
+			if (e?.type === "custom_message" && e.customType === "pi-web:subagent-notification") {
+				const det = e.details;
+				if (!det || det.sessionId !== sessionId) continue;
+				if (runId && typeof det.runId === "string" && det.runId) {
+					if (det.runId === runId) return true;
+					continue;
+				}
+				const entryMs = typeof e.timestamp === "string" ? Date.parse(e.timestamp) : NaN;
+				if (!Number.isFinite(dispatchedMs) || (Number.isFinite(entryMs) && entryMs >= dispatchedMs)) return true;
+			} else if (e?.type === "message" && e.message?.role === "toolResult" && e.message.toolName === "get_subagent_result") {
+				const det = e.message.details;
+				if (!det || det.sessionId !== sessionId) continue;
+				if (det.status === "running" || det.status === "queued" || det.status === "unknown") continue;
+				const msgMs = typeof e.message.timestamp === "number"
+					? e.message.timestamp
+					: (typeof e.timestamp === "string" ? Date.parse(e.timestamp) : NaN);
+				if (Number.isFinite(dispatchedMs) && Number.isFinite(msgMs) && msgMs >= dispatchedMs) return true;
+			}
+		}
+		return false;
+	}
+
+	async function refreshHostedNotifications(ctx: any, options: { inlineNotices?: InlineSubagentNotice[] } = {}): Promise<void> {
 		if (!toolLauncher || hostedHarvestActive || disposed || isSubagentSession) return;
 		hostedHarvestActive = true;
+		const prevSink = activeInlineNoticeSink;
+		if (options.inlineNotices) activeInlineNoticeSink = options.inlineNotices;
 		try {
-			const tasks = board().tasks.filter(t => t.executionTransport === "hosted" && t.sessionId && ["running", "reported", "uncertain"].includes(t.status));
+			const tasks = board().tasks.filter(t => {
+				if (t.executionTransport !== "hosted" || !t.sessionId) return false;
+				if (t.status === "running" || t.status === "uncertain") return true;
+				if (t.status !== "reported") return false;
+				// Already delivered/retrieved for this attempt: never re-poll across reloads or after review INCOMPLETE.
+				if (t.runId && t.completedNotifiedRunId === t.runId) return false;
+				const needsEvidence = !(t.evidence && t.evidence.length > 0);
+				const cpBriefExempt = t.role === "cp" && !isReviewTask(t) && t.autoAccept !== false && !t.reviewerRole?.trim() && t.reviewTier !== "llm";
+				const needsReviewer = !isReviewTask(t) && !isReviewExempt(t) && !cpBriefExempt
+					&& !board().tasks.some(r => r.id === reviewerTaskId(t.id) && r.reviewedDeliveryVersion === deliveryVersionOf(t));
+				return needsEvidence || needsReviewer;
+			});
 			if (tasks.length === 0) return;
 			const entries = (ctx?.sessionManager?.getEntries?.() ?? []) as Array<{ id?: string; type?: string; customType?: string; timestamp?: string; details?: Record<string, unknown> }>;
 			const baseOpts = hostedOptions(ctx);
@@ -2327,7 +2395,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				});
 				if (!res.completion && (res.isError || res.error)) hostedProbedStamps.delete(stamp);
 			}));
-		} finally { hostedHarvestActive = false; }
+		} finally {
+			activeInlineNoticeSink = prevSink;
+			hostedHarvestActive = false;
+		}
 	}
 
 	function refreshNativeNotifications(ctx: ExtensionContext): void {
@@ -2963,6 +3034,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		);
 		const isStaleAttempt = staleRunId || alreadyTerminal;
 
+		const activeRunId = runId || relatedTask?.runId;
+		const durableDup = hasDurableCompletionNotice(relatedTask, sessionId, activeRunId);
+
 		if (!isStaleAttempt) {
 			if (info.success) {
 				const completedRole = normalizeRole(info.role);
@@ -3018,27 +3092,44 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 		const noticeKey = `${sessionId}:${info.runId ?? ""}`;
 		const consumedSync = syncConsumedCompletions.has(noticeKey) || syncConsumedCompletions.has(`${sessionId}:*`);
-		const duplicateNotice = sentCompletionNotices.has(noticeKey);
+		const duplicateNotice = sentCompletionNotices.has(noticeKey) || durableDup;
 		if (!isStaleAttempt && !consumedSync && !duplicateNotice) {
 			sentCompletionNotices.add(noticeKey);
 			const statusWord = info.success ? "completed" : info.status;
 			let report = info.reportText ?? "";
 			if (report.length > NOTIFY_REPORT_LIMIT) report = `${report.slice(0, NOTIFY_REPORT_LIMIT)}\n…(truncated; call get_subagent_result for the full report)`;
 			const errorLine = info.success ? "" : `\nError: ${(info.error ?? "unknown").slice(0, 500)}${info.logFile ? `\nLog: ${info.logFile}` : ""}`;
-			try {
-				pi.sendMessage(
-					{
-						customType: "pi-web:subagent-notification",
-						content: `Subagent ${info.role} (${sessionId.slice(0, 8)}${info.taskId ? `, ${info.taskId}` : ""}) ${statusWord}.${failureNote ? ` ${failureNote}` : ""}${errorLine}${report ? `\n\n${report}` : ""}`,
-						display: true,
-						details: { sessionId, status: statusWord, role: info.role, taskId: info.taskId, completedAt: new Date().toISOString() },
-					},
-					// Wake an idle CP parent (or queue after the current turn) so it can review/accept and continue.
-					{ triggerTurn: true, deliverAs: "followUp" },
-				);
-			} catch {
-				// best-effort notification
+			const msgDetails: Record<string, unknown> = {
+				sessionId,
+				status: statusWord,
+				role: info.role,
+				taskId: info.taskId,
+				...(activeRunId ? { runId: activeRunId } : {}),
+				completedAt: new Date().toISOString(),
+			};
+			const msgContent = `Subagent ${info.role} (${sessionId.slice(0, 8)}${info.taskId ? `, ${info.taskId}` : ""}) ${statusWord}.${failureNote ? ` ${failureNote}` : ""}${errorLine}${report ? `\n\n${report}` : ""}`;
+			if (activeInlineNoticeSink) {
+				activeInlineNoticeSink.push({ customType: "pi-web:subagent-notification", content: msgContent, details: msgDetails });
+				if (markCompletionNotified(relatedTask, activeRunId)) persist();
+			} else {
+				try {
+					pi.sendMessage(
+						{
+							customType: "pi-web:subagent-notification",
+							content: msgContent,
+							display: true,
+							details: msgDetails,
+						},
+						// Wake an idle CP parent (or queue after the current turn) so it can review/accept and continue.
+						{ triggerTurn: true, deliverAs: "followUp" },
+					);
+					if (markCompletionNotified(relatedTask, activeRunId)) persist();
+				} catch {
+					// best-effort notification
+				}
 			}
+		} else if (!isStaleAttempt && (consumedSync || duplicateNotice)) {
+			if (markCompletionNotified(relatedTask, activeRunId)) persist();
 		}
 
 		if (info.taskId && (info.taskId.startsWith("W-rev-") || board().tasks.find(t => t.id === info.taskId)?.parentTaskId)) {
@@ -3806,7 +3897,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			else addRequest(ledger, event.prompt, `prompt:Q-${ledger.nextRequest}`);
 			persist();
 		}
-		await refreshHostedNotifications(ctx);
+		const inlineNotices: InlineSubagentNotice[] = [];
+		await refreshHostedNotifications(ctx, { inlineNotices });
 		refreshNativeNotifications(ctx);
 		const branchEntries = activeEntries(ctx);
 		const deliverable = reconcileSessions(ctx)
@@ -3823,7 +3915,31 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		}
 		const goalPart = state.goal && state.goal.status === "active" ? `\n\n${buildGoalPolicy(cfg)}` : "";
 		const systemPrompt = `${event.systemPrompt}\n\n${buildPolicy(state.mode, cfg)}${goalPart}`;
-		if (recovered.length === 0) return { systemPrompt };
+		if (recovered.length === 0 && inlineNotices.length === 0) return { systemPrompt };
+		if (recovered.length === 0) {
+			const message = inlineNotices.length === 1
+				? { ...inlineNotices[0], display: true }
+				: {
+					customType: "pi-web:subagent-notification" as const,
+					content: inlineNotices.map((n) => n.content).join("\n\n---\n\n"),
+					display: true,
+					details: {
+						sessionId: inlineNotices[0].details.sessionId,
+						sessionIds: inlineNotices.map((n) => n.details.sessionId),
+						taskIds: inlineNotices.map((n) => n.details.taskId).filter(Boolean),
+						status: "completed",
+						completedAt: inlineNotices[0].details.completedAt,
+					},
+				};
+			return { systemPrompt, message };
+		}
+		for (const notice of inlineNotices) {
+			try {
+				pi.sendMessage({ ...notice, display: true }, { triggerTurn: false, deliverAs: "followUp" });
+			} catch {
+				// best-effort notification
+			}
+		}
 		return {
 			systemPrompt,
 			message: {
@@ -4759,8 +4875,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		if (res.status === "running") {
 			syncConsumedCompletions.delete(syncKey);
 			syncConsumedCompletions.delete(syncAnyKey);
+		} else if (task) {
+			const rn = task.runId || expectedRunId;
+			if (rn && markCompletionNotified(task, rn)) persist();
 		}
-		if (hosted) await refreshHostedNotifications(ctx);
 		refreshNativeNotifications(ctx);
 		if (res.status === "running") {
 			const errDetail = "error" in res && typeof res.error === "string" && res.error.trim() ? res.error.trim() : "";
