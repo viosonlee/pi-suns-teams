@@ -1761,57 +1761,310 @@ export function buildReviewContract(revTask: WorkTask, workerTask: WorkTask): st
 
 export const HAS_BWRAP = existsSync("/usr/bin/bwrap");
 
+function splitShellSegmentsAndInspectSubcmds(cmd: string): {
+	segments: string[][];
+	hasUnsafeRedirection: boolean;
+	subcommands: string[];
+} {
+	const segments: string[][] = [];
+	const subcommands: string[] = [];
+	let currentTokens: string[] = [];
+	let currentTok = "";
+	let hasToken = false;
+	let inSingle = false;
+	let inDouble = false;
+	let hasUnsafeRedirection = false;
+
+	const pushTok = () => {
+		if (hasToken || currentTok.length > 0) {
+			currentTokens.push(currentTok);
+			currentTok = "";
+			hasToken = false;
+		}
+	};
+	const pushSeg = () => {
+		pushTok();
+		if (currentTokens.length > 0) {
+			segments.push(currentTokens);
+			currentTokens = [];
+		}
+	};
+
+	for (let i = 0; i < cmd.length; i++) {
+		const ch = cmd[i];
+		if (inSingle) {
+			if (ch === "'") inSingle = false;
+			else currentTok += ch;
+			hasToken = true;
+			continue;
+		}
+		if (ch === "\\" && !inSingle && i + 1 < cmd.length) {
+			currentTok += cmd[++i];
+			hasToken = true;
+			continue;
+		}
+		if (inDouble) {
+			if (ch === '"') {
+				inDouble = false;
+				hasToken = true;
+				continue;
+			}
+			if (ch === "$" && cmd[i + 1] === "(") {
+				let depth = 1;
+				let j = i + 2;
+				while (j < cmd.length && depth > 0) {
+					if (cmd[j] === "\\" && j + 1 < cmd.length) { j += 2; continue; }
+					if (cmd[j] === "(") depth++;
+					else if (cmd[j] === ")") depth--;
+					j++;
+				}
+				const inner = cmd.slice(i + 2, depth === 0 ? j - 1 : j);
+				subcommands.push(inner);
+				currentTok += cmd.slice(i, j);
+				i = j - 1;
+				hasToken = true;
+				continue;
+			}
+			if (ch === "`") {
+				const end = cmd.indexOf("`", i + 1);
+				const inner = end > i ? cmd.slice(i + 1, end) : cmd.slice(i + 1);
+				subcommands.push(inner);
+				currentTok += cmd.slice(i, end > i ? end + 1 : cmd.length);
+				i = end > i ? end : cmd.length - 1;
+				hasToken = true;
+				continue;
+			}
+			currentTok += ch;
+			hasToken = true;
+			continue;
+		}
+
+		// Unquoted context
+		if (ch === "'") { inSingle = true; hasToken = true; continue; }
+		if (ch === '"') { inDouble = true; hasToken = true; continue; }
+		if (ch === "$" && cmd[i + 1] === "(") {
+			let depth = 1;
+			let j = i + 2;
+			while (j < cmd.length && depth > 0) {
+				if (cmd[j] === "\\" && j + 1 < cmd.length) { j += 2; continue; }
+				if (cmd[j] === "(") depth++;
+				else if (cmd[j] === ")") depth--;
+				j++;
+			}
+			const inner = cmd.slice(i + 2, depth === 0 ? j - 1 : j);
+			subcommands.push(inner);
+			currentTok += cmd.slice(i, j);
+			i = j - 1;
+			hasToken = true;
+			continue;
+		}
+		if (ch === "`") {
+			const end = cmd.indexOf("`", i + 1);
+			const inner = end > i ? cmd.slice(i + 1, end) : cmd.slice(i + 1);
+			subcommands.push(inner);
+			currentTok += cmd.slice(i, end > i ? end + 1 : cmd.length);
+			i = end > i ? end : cmd.length - 1;
+			hasToken = true;
+			continue;
+		}
+		if (/\s/.test(ch)) {
+			if (ch === "\n") pushSeg();
+			else pushTok();
+			continue;
+		}
+		if (ch === ";" || ch === "(" || ch === ")" || ch === "{" || ch === "}") {
+			pushSeg();
+			continue;
+		}
+		if (ch === "&" || ch === "|") {
+			if (ch === "&" && cmd[i + 1] === ">") {
+				const rest = cmd.slice(i + 2).trimStart();
+				if (!rest.startsWith("/dev/null")) hasUnsafeRedirection = true;
+				i++;
+				pushTok();
+				continue;
+			}
+			if (ch === "|" && cmd[i + 1] === ">") {
+				hasUnsafeRedirection = true;
+				i++;
+				pushTok();
+				continue;
+			}
+			if ((ch === "&" && cmd[i + 1] === "&") || (ch === "|" && cmd[i + 1] === "|")) i++;
+			pushSeg();
+			continue;
+		}
+		if (ch === ">") {
+			const prevFd = currentTok;
+			const nextCh = cmd[i + 1];
+			if (nextCh === "&" && /^[012]?$/.test(prevFd)) {
+				const targetDigit = cmd[i + 2];
+				if (targetDigit === "0" || targetDigit === "1" || targetDigit === "2") {
+					i += 2;
+					currentTok = "";
+					hasToken = false;
+					continue;
+				}
+			}
+			const adv = nextCh === ">" ? 2 : 1;
+			const rest = cmd.slice(i + adv).trimStart();
+			if (!rest.startsWith("/dev/null")) hasUnsafeRedirection = true;
+			i += adv - 1;
+			currentTok = "";
+			hasToken = false;
+			continue;
+		}
+		if (ch === "<" && cmd[i + 1] === ">") {
+			hasUnsafeRedirection = true;
+			i++;
+			continue;
+		}
+		currentTok += ch;
+		hasToken = true;
+	}
+	pushSeg();
+	return { segments, hasUnsafeRedirection, subcommands };
+}
+
+const ALWAYS_WRITE_VERBS = new Set([
+	"rm", "rmdir", "mv", "cp", "touch", "chmod", "chown", "chgrp",
+	"mkdir", "mkfifo", "mknod", "mktemp", "ln", "install", "patch", "cpio",
+	"unzip", "unrar", "7z", "truncate", "dd", "tee",
+	"make", "cmake", "ninja",
+	"vi", "vim", "nvim", "nano", "ed", "ex",
+	"scp", "rsync", "sftp", "eval", "exec",
+]);
+
+function extractCommandVerbAndArgs(tokens: string[]): { verb: string; args: string[] } | null {
+	let idx = 0;
+	while (idx < tokens.length) {
+		const tok = tokens[idx];
+		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) { idx++; continue; }
+		const base = tok.split("/").pop()?.toLowerCase() ?? "";
+		if (base === "command" || base === "env" || base === "time" || base === "nice" || base === "nohup" || base === "sudo" || base === "doas") {
+			idx++;
+			while (idx < tokens.length && tokens[idx].startsWith("-")) idx++;
+			continue;
+		}
+		if (base === "xargs") {
+			idx++;
+			while (idx < tokens.length && tokens[idx].startsWith("-")) {
+				const fl = tokens[idx];
+				idx++;
+				if (/^-[nILPdE]$/.test(fl) && idx < tokens.length) idx++;
+			}
+			continue;
+		}
+		return { verb: base, args: tokens.slice(idx + 1) };
+	}
+	return null;
+}
+
 export function isBashWriteCommand(cmd: string): { isWrite: boolean; reason?: string } {
 	if (!cmd || typeof cmd !== "string") return { isWrite: false };
-	const trimmed = cmd.trim();
+	const { segments, hasUnsafeRedirection, subcommands } = splitShellSegmentsAndInspectSubcmds(cmd);
 
-	// 1. Redirection checks (excluding /dev/null and fd dups like 2>&1, 1>&2)
-	const sanitized = trimmed
-		.replace(/\b[012]?>&\s*[012]\b/g, "")
-		.replace(/(?:&|[012])?>\s*\/dev\/null/g, "");
-
-	if (/(?:^|[^<])(?:&?>>?|<>|\|>)(?!\s*\/dev\/null)/.test(sanitized)) {
+	if (hasUnsafeRedirection) {
 		return { isWrite: true, reason: "Output redirection (>, >>, &>, <>) writes to files." };
 	}
-
-	// 2. In-place file editing, streaming write utilities, or awk file redirection
-	if (/\b(?:sed\s+(?:-[a-zA-Z]*i|--in-place\b)|truncate\b|dd\s+.*of=|tee\b)/i.test(trimmed)
-		|| /\bawk\b[^;\n]*>\s*['"/a-zA-Z0-9_.-]/i.test(trimmed)) {
-		return { isWrite: true, reason: "In-place file editing or streaming write utility (sed -i, truncate, dd, tee, awk >)." };
+	for (const sub of subcommands) {
+		const subRes = isBashWriteCommand(sub);
+		if (subRes.isWrite) return subRes;
 	}
 
-	// 3. Destructive, filesystem mutation, symlink, and archive extraction commands
-	if (/\b(?:rm|rmdir|mv|cp|touch|chmod|chown|chgrp|mkdir|mkfifo|mknod|mktemp|ln|install|patch|cpio|unzip|unrar|7z)\b/i.test(trimmed)
-		|| /\btar\s+(?:-[a-zA-Z]*[xruc]|--(?:extract|get|append|update|create|delete)\b|[a-zA-Z]*[xruc][a-zA-Z]*\b)/i.test(trimmed)
-		|| /\b(?:gunzip|bunzip2|unxz)\b(?![^\n]*(?:\s-c\b|--stdout\b))/i.test(trimmed)
-		|| /\bfind\b[^\n]*(?:-delete\b|-exec(?:dir)?\b[^\n]*\b(?:rm|mv|cp|chmod|chown|sed\s+-i|tee)\b)/i.test(trimmed)) {
-		return { isWrite: true, reason: "Filesystem mutation, link, or archive extraction command." };
-	}
+	for (const seg of segments) {
+		const parsed = extractCommandVerbAndArgs(seg);
+		if (!parsed) continue;
+		const { verb, args } = parsed;
+		const argLine = args.join(" ");
 
-	// 4. Network transfer / file upload / file download commands
-	if (/\b(?:scp|rsync|sftp)\s+/i.test(trimmed)
-		|| /\bcurl\b[^\n]*(?:\s-(?:o|O|T|d|F)\b|--(?:output|remote-name|upload-file|data|data-raw|data-binary|form)\b)/i.test(trimmed)
-		|| /\bwget\b(?![^\n]*-O\s*-)/i.test(trimmed)) {
-		return { isWrite: true, reason: "Network file transfer or output download command." };
-	}
-
-	// 5. Inline arbitrary code execution / nested shells / editors
-	if (/\bpython[0-9.]*\s+(?:-[a-zA-Z]*c\b|-m\s+(?:pip|venv|ensurepip)\b)/i.test(trimmed)
-		|| /\bnode\s+(?:--?e(?:val)?\b|-p\b|--print\b)/i.test(trimmed)
-		|| /\b(?:perl\s+-[a-zA-Z]*[ei]|ruby\s+-[a-zA-Z]*e|php\s+-[a-zA-Z]*r)\b/i.test(trimmed)
-		|| /(?:^|[;&|]\s*)(?:bash|sh|zsh|dash|ksh)\s+-[a-zA-Z]*c\b/i.test(trimmed)
-		|| /(?:^|[;&|]\s*)(?:eval|vi|vim|nvim|nano|ed|ex)\s+/i.test(trimmed)) {
-		return { isWrite: true, reason: "Inline script execution, nested shell, or interactive editor." };
-	}
-
-	// 6. Git state mutating commands
-	if (/\bgit\s+(?:commit|checkout|reset|rebase|merge|push|add|tag|apply|stash|clean|cherry-pick|revert|am|fetch|pull|switch|restore|rm|mv|gc|init|clone|worktree\s+(?:add|remove|prune|move)|branch\s+-[dDmM])\b/i.test(trimmed)) {
-		return { isWrite: true, reason: "Git repository state modification." };
-	}
-
-	// 7. Package managers write commands
-	if (/\b(?:npm\s+(?:i|install|ci|update|uninstall|publish)|yarn\s+(?:add|remove)|pnpm\s+(?:add|remove|install)|pip[0-9.]*\s+install|cargo\s+install)\b/i.test(trimmed)) {
-		return { isWrite: true, reason: "Package manager installation/modification command." };
+		if (ALWAYS_WRITE_VERBS.has(verb)) {
+			return { isWrite: true, reason: `File/build/transfer mutation command (${verb}).` };
+		}
+		if (verb === "sed" && args.some(a => /^-[a-zA-Z]*i/.test(a) || a === "--in-place" || a.startsWith("--in-place="))) {
+			return { isWrite: true, reason: "In-place file editing (sed -i)." };
+		}
+		if ((verb === "awk" || verb === "gawk") && />\s*['"/a-zA-Z0-9_.-]/.test(argLine.replace(/>\s*\/dev\/(?:null|stderr)/g, ""))) {
+			return { isWrite: true, reason: "awk file redirection (>)." };
+		}
+		if (verb === "tar" && args.some(a => /^-[a-zA-Z]*[xruc]/.test(a) || /^--(?:extract|get|append|update|create|delete)$/.test(a) || (/^[a-zA-Z]+$/.test(a) && /[xruc]/.test(a) && a === args[0]))) {
+			return { isWrite: true, reason: "Archive extraction/creation (tar)." };
+		}
+		if ((verb === "gunzip" || verb === "bunzip2" || verb === "unxz") && !args.some(a => a === "-c" || a === "--stdout")) {
+			return { isWrite: true, reason: `In-place decompression (${verb}).` };
+		}
+		if (verb === "find" && args.some(a => a === "-delete" || a === "-ok") ) {
+			return { isWrite: true, reason: "find -delete/-ok mutates filesystem." };
+		}
+		if (verb === "find") {
+			const execIdx = args.findIndex(a => a === "-exec" || a === "-execdir");
+			if (execIdx >= 0 && args[execIdx + 1]) {
+				const execVerb = args[execIdx + 1].split("/").pop()?.toLowerCase() ?? "";
+				if (ALWAYS_WRITE_VERBS.has(execVerb) || execVerb === "sed") {
+					return { isWrite: true, reason: `find -exec invokes ${execVerb}.` };
+				}
+			}
+		}
+		if (verb === "curl" && args.some(a => /^-(?:o|O|T|d|F)$/.test(a) || /^-[oOTdF].+/.test(a) || /^--(?:output|remote-name|upload-file|data|data-raw|data-binary|form)(?:=|$)/.test(a))) {
+			return { isWrite: true, reason: "curl file download/upload/mutation." };
+		}
+		if (verb === "wget" && !(args.includes("-O-") || args.includes("--output-document=-") || args.includes("--spider") || (args.indexOf("-O") >= 0 && args[args.indexOf("-O") + 1] === "-"))) {
+			return { isWrite: true, reason: "wget downloads to disk." };
+		}
+		if (/^python[0-9.]*$/.test(verb) && (args.some(a => /^-[a-zA-Z]*c$/.test(a)) || (args.indexOf("-m") >= 0 && /^(?:pip|venv|ensurepip)$/.test(args[args.indexOf("-m") + 1] ?? "")))) {
+			return { isWrite: true, reason: "Inline Python code or package installation." };
+		}
+		if (verb === "node" && args.some(a => /^--?(?:e|eval|p|print)$/.test(a))) {
+			return { isWrite: true, reason: "Inline Node.js execution." };
+		}
+		if (((verb === "perl" || verb === "ruby") && args.some(a => /^-[a-zA-Z]*[ei]/.test(a))) || (verb === "php" && args.some(a => /^-[a-zA-Z]*r/.test(a)))) {
+			return { isWrite: true, reason: `Inline ${verb} execution.` };
+		}
+		if ((verb === "bash" || verb === "sh" || verb === "zsh" || verb === "dash" || verb === "ksh") && args.some(a => /^-[a-zA-Z]*c$/.test(a))) {
+			const cIdx = args.findIndex(a => /^-[a-zA-Z]*c$/.test(a));
+			const inner = args[cIdx + 1];
+			if (!inner || isBashWriteCommand(inner).isWrite) {
+				return { isWrite: true, reason: `Nested shell execution (${verb} -c).` };
+			}
+		}
+		if (verb === "sqlite3" && !args.includes("-readonly")) {
+			return { isWrite: true, reason: "sqlite3 without -readonly may write/create database files." };
+		}
+		if ((verb === "gcc" || verb === "g++" || verb === "clang" || verb === "clang++" || verb === "cc")
+			&& !args.some(a => a === "-E" || a === "-fsyntax-only" || a === "--version" || a === "-v" || a === "--help")) {
+			return { isWrite: true, reason: `Compiler invocation (${verb}) writes build artifacts.` };
+		}
+		if (verb === "cargo" && /^(?:build|run|test|install|publish|update|clean|init|new|add|remove)$/.test((args[0] ?? "").toLowerCase())) {
+			return { isWrite: true, reason: `cargo ${args[0]} writes build artifacts or dependencies.` };
+		}
+		if (verb === "go" && /^(?:build|install|run|generate|clean|mod)$/.test((args[0] ?? "").toLowerCase())) {
+			return { isWrite: true, reason: `go ${args[0]} modifies workspace/build artifacts.` };
+		}
+		if (verb === "dotnet" && /^(?:build|publish|pack|clean|restore|new|add|remove)$/.test((args[0] ?? "").toLowerCase())) {
+			return { isWrite: true, reason: `dotnet ${args[0]} modifies build artifacts.` };
+		}
+		if (((verb === "npm" || verb === "pnpm" || verb === "yarn") && /^(?:i|install|ci|update|uninstall|publish|add|remove)$/.test((args[0] ?? "").toLowerCase()))
+			|| (/^pip[0-9.]*$/.test(verb) && (args[0] ?? "").toLowerCase() === "install")) {
+			return { isWrite: true, reason: `Package manager mutation (${verb} ${args[0] ?? ""}).` };
+		}
+		if (verb === "git") {
+			const gitSub = (args.find(a => !a.startsWith("-")) ?? "").toLowerCase();
+			if (/^(?:commit|checkout|reset|rebase|merge|push|add|tag|apply|stash|clean|cherry-pick|revert|am|fetch|pull|switch|restore|rm|mv|gc|init|clone)$/.test(gitSub)) {
+				return { isWrite: true, reason: `Git repository state modification (${gitSub}).` };
+			}
+			if (gitSub === "worktree" && args.some(a => /^(?:add|remove|prune|move)$/.test(a))) {
+				return { isWrite: true, reason: "Git worktree modification." };
+			}
+			if (gitSub === "branch" && args.some(a => /^-[dDmMcC]+$/.test(a) || /^--(?:delete|move|copy)$/.test(a))) {
+				return { isWrite: true, reason: "Git branch deletion/rename." };
+			}
+			if (gitSub === "remote" && args.some(a => /^(?:add|remove|rm|rename|set-url|prune|update)$/.test(a))) {
+				return { isWrite: true, reason: "Git remote modification." };
+			}
+			if (gitSub === "config" && !args.some(a => /^(?:--get|--get-all|--get-regexp|--list|-l)$/.test(a))) {
+				return { isWrite: true, reason: "Git config modification." };
+			}
+		}
 	}
 
 	return { isWrite: false };
@@ -1841,12 +2094,25 @@ export function wrapInBwrapSandbox(command: string, cwd: string = process.cwd())
 	return `/usr/bin/bwrap --ro-bind / / --dev /dev --proc /proc --chdir ${shellSingleQuote(cwd)} -- bash -c ${shellSingleQuote(command)}`;
 }
 
+export function sanitizePromptDirectiveText(text: string): string {
+	return String(text ?? "").replace(/[\r\n]+/g, " ").trim();
+}
+
 export function detectSubagentTaskAssignment(entries: any[]): { id: string; writePaths: string[]; isReadOnly: boolean } | null {
 	if (!Array.isArray(entries)) return null;
 	let isCpProfile = false;
 	for (const entry of entries) {
-		if (entry?.type === "custom" && entry.customType === "pi-web:subagent" && entry.data?.profile === "cp") {
-			isCpProfile = true;
+		if (entry?.type === "custom" && entry.customType === "pi-web:subagent") {
+			if (entry.data?.profile === "cp") isCpProfile = true;
+			const structuredScope = entry.data?.scope;
+			if (structuredScope && typeof structuredScope === "object" && Array.isArray(structuredScope.writePaths)) {
+				const wp = structuredScope.writePaths.filter((p: unknown): p is string => typeof p === "string");
+				return {
+					id: typeof structuredScope.id === "string" ? structuredScope.id : "task",
+					writePaths: isCpProfile ? [] : wp,
+					isReadOnly: isCpProfile || wp.length === 0,
+				};
+			}
 		}
 	}
 	for (const entry of entries) {
@@ -1861,8 +2127,11 @@ export function detectSubagentTaskAssignment(entries: any[]): { id: string; writ
 		const taskIdMatch = text.match(/^TEAM_TASK:\s*([^\s\n]+)/m);
 		if (taskIdMatch) {
 			const id = taskIdMatch[1].trim();
-			const scopeMatch = text.match(/^SCOPE:\s*[^\s]+\s+role=(\S+)\s+readPaths=(\[[^\]]*\])\s+writePaths=(\[[^\]]*\])/m);
-			const roleMatch = text.match(/^Role:\s*([^\s\n]+)/m);
+			// Always pick the LAST contract line/header appended by the parent dispatcher, never forged lines in title/prose.
+			const scopeMatches = [...text.matchAll(/^SCOPE:\s*[^\s]+\s+role=(\S+)\s+readPaths=(\[[^\]]*\])\s+writePaths=(\[[^\]]*\])/gm)];
+			const scopeMatch = scopeMatches.at(-1);
+			const roleMatches = [...text.matchAll(/^Role:\s*([^\s\n]+)/gm)];
+			const roleMatch = roleMatches.at(-1);
 			const role = (scopeMatch?.[1] || roleMatch?.[1] || "").trim().toLowerCase();
 			if (isCpProfile || role === "cp") {
 				return { id: id || "cp-readonly", writePaths: [], isReadOnly: true };
@@ -1875,7 +2144,8 @@ export function detectSubagentTaskAssignment(entries: any[]): { id: string; writ
 					return [];
 				}
 			};
-			const writePathsMatch = text.match(/^Write Paths:\s*([^\n]+)/m);
+			const writePathsMatches = [...text.matchAll(/^Write Paths:\s*([^\n]+)/gm)];
+			const writePathsMatch = writePathsMatches.at(-1);
 			const rawWritePaths = writePathsMatch ? writePathsMatch[1].trim() : "";
 			// The contract line wins; the legacy text fallback only applies when it is absent.
 			const writePaths = scopeMatch
@@ -3504,7 +3774,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 						const workerTarget = board().tasks.find(t => t.id === workerId);
 						if (workerTarget) reviewBlock = `\n\n${buildReviewContract(task, workerTarget)}`;
 					}
-					const prompt = `TEAM_TASK: ${task.id}\nGoal: ${task.title}\nRole: ${role}\nRead Paths: ${task.readPaths.join(", ") || "none"}\nWrite Paths: ${task.writePaths.join(", ") || "none"}\nAcceptance Criteria:\n${task.acceptance.map((a: string) => `- ${a}`).join("\n")}${reviewBlock}\n\n${buildTaskContract(task.id, task)}`;
+					const safeTitle = sanitizePromptDirectiveText(task.title);
+					const prompt = `TEAM_TASK: ${task.id}\nGoal: ${safeTitle}\nRole: ${role}\nRead Paths: ${task.readPaths.join(", ") || "none"}\nWrite Paths: ${task.writePaths.join(", ") || "none"}\nAcceptance Criteria:\n${task.acceptance.map((a: string) => `- ${sanitizePromptDirectiveText(a)}`).join("\n")}${reviewBlock}\n\n${buildTaskContract(task.id, task)}`;
 					
 					const rawCallRes = await executeFn("Agent", {
 						subagent_type: role,
@@ -4598,7 +4869,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			}
 			// The child-side write guard reads its scope from the prompt; a manually dispatched
 			// task must carry the ledger's scope or the child is treated as read-only.
-			input.prompt = `${prompt}${reviewBlock}\nRole: ${role}\nRead Paths: ${scoped.readPaths.join(", ") || "none"}\nWrite Paths: ${scoped.writePaths.join(", ") || "none"}\n\n${buildTaskContract(taskId, { ...scoped, role })}`;
+			const cleanPrompt = prompt.replace(/^[ \t]*(?:SCOPE|Write Paths|Role)[ \t]*:[^\n]*$/gm, "[sanitized]");
+			input.prompt = `${cleanPrompt}${reviewBlock}\nRole: ${role}\nRead Paths: ${scoped.readPaths.join(", ") || "none"}\nWrite Paths: ${scoped.writePaths.join(", ") || "none"}\n\n${buildTaskContract(taskId, { ...scoped, role })}`;
 		} else {
 			input.prompt = `${prompt}\n\n${buildTaskContract(taskId)}`;
 		}

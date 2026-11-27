@@ -40,13 +40,31 @@ version_gt() {
     if (( ${x:-0} > ${y:-0} )); then return 0; fi
     if (( ${x:-0} < ${y:-0} )); then return 1; fi
   done
-  # Numeric cores are equal: stable release > pre-release; otherwise compare pre-release tags.
+  # Numeric cores are equal: stable release > pre-release; otherwise compare SemVer dot identifiers.
   if [ -z "${pre1}" ] && [ -n "${pre2}" ]; then return 0; fi
   if [ -n "${pre1}" ] && [ -z "${pre2}" ]; then return 1; fi
   if [ -n "${pre1}" ] && [ -n "${pre2}" ] && [ "${pre1}" != "${pre2}" ]; then
-    local highest
-    highest="$(printf '%s\n%s\n' "${pre1}" "${pre2}" | sort -V | tail -n1)"
-    [ "${highest}" = "${pre1}" ] && return 0
+    local p1 p2 len k s1 s2 n1 n2
+    IFS=. read -r -a p1 <<< "${pre1}"
+    IFS=. read -r -a p2 <<< "${pre2}"
+    len="${#p1[@]}"; [ "${#p2[@]}" -lt "${len}" ] && len="${#p2[@]}"
+    for (( k=0; k<len; k++ )); do
+      s1="${p1[$k]}"; s2="${p2[$k]}"
+      [ "${s1}" = "${s2}" ] && continue
+      n1=0; n2=0
+      [[ "${s1}" =~ ^[0-9]+$ ]] && n1=1
+      [[ "${s2}" =~ ^[0-9]+$ ]] && n2=1
+      if [ "${n1}" = 1 ] && [ "${n2}" = 1 ]; then
+        (( 10#${s1} > 10#${s2} )) && return 0 || return 1
+      elif [ "${n1}" = 1 ] && [ "${n2}" = 0 ]; then
+        return 1
+      elif [ "${n1}" = 0 ] && [ "${n2}" = 1 ]; then
+        return 0
+      else
+        [[ "${s1}" > "${s2}" ]] && return 0 || return 1
+      fi
+    done
+    (( ${#p1[@]} > ${#p2[@]} )) && return 0 || return 1
   fi
   return 1
 }
