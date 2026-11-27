@@ -50,7 +50,7 @@
 - 2.4：`draining` 模式开关（禁派新任务、允许在飞收尾）+ 输入分类（`classifyInputKind` 纯函数）：纯情绪/反馈不建幽灵 `Q-*`；mustAct 指令永不进丢弃路径；critical 反馈永不自动关闭。
 - 评审：首轮 REWORK 6 项（含 1 critical 误分类）→ 返工后复审 PASS 零阻塞。
 
-### Batch 3 — 派活原子性、扇出提示、生命周期视图（commit `02af296`）
+### Batch 3 — 派活原子性、扇出提示、生命周期视图（commit `c444038`）
 
 修改文件：`team-ledger.ts`（+326）、`extensions/team.ts`（+575）、`team-recovery.ts`（+11）、`tests/test-team-batch3-controls.ts`（新增）。
 
@@ -73,7 +73,7 @@
 | Batch 2 | 39/39 文件通过；返工后 39/39 | batch2 三套件 56/56→60/60；注入防线 12/12 |
 | Batch 3 | 40/40 文件通过，exit 0 | batch3-controls 43/43 |
 
-最终 HEAD `02af296` 全量复跑：`LC_ALL=C npm test` exit 0，**40/40 测试文件全部通过**。
+最终 HEAD `c444038` 全量复跑：`LC_ALL=C npm test` exit 0，**40/40 测试文件全部通过**。
 
 ## 4. 未完成项与诚实声明
 
@@ -89,7 +89,7 @@
 | 改造 1+2 | `0f55201..becf24f`（含 `b854bce`、`becf24f`） | 成功 |
 | Batch 1 | `becf24f..b17382b` | 成功 |
 | Batch 2 | `b17382b..89f9154` | 成功 |
-| Batch 3 + 本报告 | `89f9154..02af296`..（本报告提交后追加） | 成功 |
+| Batch 3 + 本报告 | `89f9154..c444038`（含本报告修正提交） | 成功 |
 
  Commit 信息均为英文 conventional commits，沿用仓库 `feat(...)`/`fix(...)` 风格。
 
@@ -97,5 +97,5 @@
 
 - **未重启** `pi-web-sessiond.service` / `pi-web.service`：全程未执行任何 restart/stop；改动前只读快照 `/tmp/pi-teams-services-before.txt`（两服务 active，启动于 2026-11-27 14:17:43 JST），交付后状态一致。
 - **未发版、未打 tag**：无 version bump、无 `git tag`、无 npm publish。
-- **未安装到 `~/.pi/agent`**：未执行 install.sh/update.sh；`~/.pi/agent/.pi-teams-version` 保持 1.2.6 未动。
+- **未安装到 `~/.pi/agent`**：未执行 install.sh/update.sh；`~/.pi/agent/.pi-teams-version` 现读数为 1.2.7（机主在任务开始前自行升级 v1.2.7 所致，非本次会话改动；本会话全程未执行 install.sh/update.sh、未触碰该目录）。
 - 生产代码未使用 `git worktree remove --force` / `git branch -D`。
