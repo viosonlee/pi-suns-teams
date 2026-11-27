@@ -232,8 +232,8 @@ export function readAgentProfile(role: string, agentDir = getDefaultAgentDir()):
 		...base,
 		displayName: parseScalarField(rawYaml, "display_name"),
 		tools: parseToolsField(rawYaml) ?? defaultToolsForRole(role),
-		model: parseScalarField(rawYaml, "model"),
-		thinking: parseScalarField(rawYaml, "thinking"),
+		model: sanitizeModelOverride(parseScalarField(rawYaml, "model")),
+		thinking: sanitizeModelOverride(parseScalarField(rawYaml, "thinking")),
 		systemPrompt,
 		promptMode,
 		loadMcp: enabled("mcp", "load_mcp"),
@@ -241,6 +241,14 @@ export function readAgentProfile(role: string, agentDir = getDefaultAgentDir()):
 		loadExtensions: enabled("extensions", "load_extensions"),
 		loadContextFiles: enabled("context_files", "load_context_files"),
 	};
+}
+
+const SENTINEL_MODEL_OVERRIDES = new Set(["inherit", "default", "auto", "none", "unset", "null", "undefined"]);
+export function sanitizeModelOverride(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	if (!trimmed || SENTINEL_MODEL_OVERRIDES.has(trimmed.toLowerCase())) return undefined;
+	return trimmed;
 }
 
 function parseScalarField(yaml: string, field: string): string | undefined {
@@ -587,8 +595,8 @@ export async function launchNativeSubagent(
 	}
 
 	const profile = readAgentProfile(role, agentDir);
-	const effectiveModel = params.model || options.getModelOverride?.(role) || profile?.model;
-	const effectiveThinking = params.thinking || options.getThinkingOverride?.(role) || profile?.thinking;
+	const effectiveModel = sanitizeModelOverride(params.model) || sanitizeModelOverride(options.getModelOverride?.(role)) || sanitizeModelOverride(profile?.model);
+	const effectiveThinking = sanitizeModelOverride(params.thinking) || sanitizeModelOverride(options.getThinkingOverride?.(role)) || sanitizeModelOverride(profile?.thinking);
 	const effectiveTools = profile?.tools || defaultToolsForRole(role);
 
 	// New child files go into the project directory; lookups scan the sessions root (team-recovery contract).

@@ -169,4 +169,21 @@ await test("ledgerPrompt stays compact on 300-open-task board while preserving a
 	assert.ok(prompt.length < 40_000, `ledgerPrompt must stay compact (<40KB), got ${prompt.length}`);
 });
 
+await test("ledgerPrompt surfaces manualDispatch hold clearly in fmtTask lines", () => {
+	const board = newLedger();
+	const q = addRequest(board, "manual hold check", "user");
+	addTasks(board, [{
+		id: "W-hold",
+		title: "Held task",
+		requestIds: [q.id],
+		role: "bridges",
+		dependsOn: [],
+		readPaths: [],
+		writePaths: ["src/h.ts"],
+		acceptance: ["ok"],
+	}], "/tmp/proj", { manualDispatch: true });
+	const prompt = ledgerPrompt(board);
+	assert.ok(prompt.includes("hold=manualDispatch"), "manualDispatch hold must be visible in ledgerPrompt");
+});
+
 console.log(`\nAll ${passed} team-state-delta anti-bloat tests passed!`);

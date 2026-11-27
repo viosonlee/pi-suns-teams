@@ -22,7 +22,7 @@ import {
 	taskConflict, parseTeamTaskId, isDeterministic, isReviewExempt, isReviewTask, autoAcceptTask, createReviewerTask, nextDispatchableTasks,
 	reviewerTaskId, completeReviewTask, publishTasks, overlap, recordReview, deliveryVersionOf, reviewRecordsOf,
 	reclaimStaleReviews, isActiveReviewHold, scopeBlockingLive, REVIEW_STALE_MS, pruneStaleReviews,
-	setManualDispatchHold, releaseManualDispatchHold,
+	reviewDispatchOwnershipProblem, setManualDispatchHold, releaseManualDispatchHold,
 	type WorkTask, type WorkLedger,
 } from "../team-ledger.ts";
 import { parseReviewReport } from "../team-review.ts";
@@ -60,11 +60,16 @@ import {
 	stopSubagent,
 	PI_WEB_PARENT_LINK_TYPE,
 	readAgentProfile,
+	sanitizeModelOverride,
 	type ChildCompletion,
 	type ChildSpawnInfo,
 	type NativeRunnerOptions,
 } from "../team-runner.ts";
 import { fileURLToPath } from "node:url";
+import {
+	diagnoseTeamHealth,
+	formatDoctorReport,
+} from "../team-doctor.ts";
 import {
 	launchHostedSubagent,
 	getHostedSubagentResult,
@@ -79,7 +84,7 @@ const TEAM_EXTENSION_PATH = (() => {
 })();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.2.4";
+export const PI_TEAMS_VERSION = "1.2.5";
 export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
@@ -515,8 +520,12 @@ export function mergeConfig(base: TeamConfig, raw: unknown): TeamConfig {
 			const v = r as Record<string, unknown>;
 			const merged: RoleConfig = { ...out.roles[role] };
 			if (typeof v.label === "string" && v.label.trim()) merged.label = v.label.trim();
-			if (typeof v.model === "string" && v.model.trim()) merged.model = v.model.trim();
-			if (typeof v.thinking === "string" && v.thinking.trim()) merged.thinking = v.thinking.trim();
+			const cleanRoleModel = sanitizeModelOverride(v.model);
+			const cleanRoleThinking = sanitizeModelOverride(v.thinking);
+			if (cleanRoleModel) merged.model = cleanRoleModel;
+			else if (typeof v.model === "string") delete merged.model;
+			if (cleanRoleThinking) merged.thinking = cleanRoleThinking;
+			else if (typeof v.thinking === "string") delete merged.thinking;
 			if (typeof v.costly === "boolean") merged.costly = v.costly;
 			out.roles[role] = merged;
 		}
@@ -1622,6 +1631,9 @@ export function buildReviewContract(revTask: WorkTask, workerTask: WorkTask): st
 	return [
 		`[CANONICAL REVIEW CONTRACT — AUTO-INJECTED FROM LEDGER for ${revTask.id}]`,
 		`Target worker task: ${workerTask.id} (${workerTask.role}) — ${workerTask.title}`,
+		...(workerTask.worktreePath
+			? [`Worker worktreePath: ${workerTask.worktreePath}${workerTask.branch ? ` (branch ${workerTask.branch})` : ""} — inspect delivered relative paths inside this worktree when present`]
+			: []),
 		`Delivered paths: ${deliveredPaths}`,
 		`Delivery version: ${deliveryVersionOf(workerTask)}`,
 		...(evidenceExcerpt
@@ -1937,19 +1949,30 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	 * fallback (state.roleModel) wins over cfg.roles[role].model until reset/reconfigured.
 	 */
 	function applyRoleModelOverrides(input: Record<string, unknown>, role: Role): void {
-		const explicit = (v: unknown) => typeof v === "string" && v.trim().length > 0;
-		const sticky = state.roleModel?.[role];
-		if (!explicit(input.model)) {
+		const explicitModel = sanitizeModelOverride(input.model);
+		const sticky = sanitizeModelOverride(state.roleModel?.[role]);
+		const roleDefault = sanitizeModelOverride(cfg.roles[role]?.model);
+		if (explicitModel) {
+			input.model = explicitModel;
+		} else {
+			delete input.model;
 			if (sticky) input.model = sticky;
-			else if (cfg.roles[role]?.model) input.model = cfg.roles[role].model;
+			else if (roleDefault) input.model = roleDefault;
 		}
-		const thinking = (explicit(input.thinking) ? String(input.thinking) : undefined)
-			|| state.roleThinking?.[role]
-			|| cfg.roles[role]?.thinking;
+		const explicitThinking = sanitizeModelOverride(input.thinking)
+			?? sanitizeModelOverride(input.thinkingLevel)
+			?? sanitizeModelOverride(input.thinking_level);
+		const thinking = explicitThinking
+			|| sanitizeModelOverride(state.roleThinking?.[role])
+			|| sanitizeModelOverride(cfg.roles[role]?.thinking);
 		if (thinking) {
 			input.thinking = thinking;
 			input.thinkingLevel = thinking;
 			input.thinking_level = thinking;
+		} else {
+			if ("thinking" in input && !explicitThinking) delete input.thinking;
+			if ("thinkingLevel" in input && !explicitThinking) delete input.thinkingLevel;
+			if ("thinking_level" in input && !explicitThinking) delete input.thinking_level;
 		}
 	}
 
@@ -2077,6 +2100,14 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		const restored = stateFromEntries(entries, cfg);
 		state = restored.state;
 		runs = restored.runs;
+		for (const role of ROLES) {
+			if (state.roleModel && role in state.roleModel && !sanitizeModelOverride(state.roleModel[role])) {
+				delete state.roleModel[role];
+			}
+			if (state.roleThinking && role in state.roleThinking && !sanitizeModelOverride(state.roleThinking[role])) {
+				delete state.roleThinking[role];
+			}
+		}
 		const hasSavedState = entries.some(e => e?.type === "custom" && (e.customType === STATE_TYPE || e.customType === STATE_DELTA_TYPE));
 		lastPersistedJson = hasSavedState ? JSON.stringify(state) : "";
 		lastPersistedState = hasSavedState ? structuredClone(state) : null;
@@ -2255,6 +2286,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			return `${workId}: role mismatch — task role is ${task.role}, dispatch role is ${role}. Fix: dispatch with subagent_type="${task.role}", or register a new task with role="${role}" and supersede ${workId}. Do not duplicate live work.`;
 		}
 		if (!readyTasks(board()).includes(task)) {
+			const revProblem = (task.status === "ready" || task.status === "queued")
+				? reviewDispatchOwnershipProblem(board(), task)
+				: undefined;
+			if (revProblem) return revProblem;
 			const deps = unfinishedDependencyIds(task);
 			const depDetail = deps.map(id => {
 				const d = board().tasks.find(t => t.id === id);
@@ -2486,11 +2521,14 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					// The reviewer's own text is never trusted to be well-formed: parse it first.
 					const parsed = parseReviewReport(reportText, workerTask.acceptance);
 					const cwd = (ctx as any)?.cwd || process.cwd();
+					const primaryCwd = workerTask.worktreePath || cwd;
+					const fallbackCwds = workerTask.worktreePath && workerTask.worktreePath !== cwd ? [cwd] : undefined;
 					// Re-resolve the reviewer's citations against the real artefacts. A PASS with
 					// unresolvable or purely prose evidence is downgraded, never accepted.
-					const refs: EvidenceRef[] = collectEvidenceRefs(parsed.checks.map(c => `${c.criterion} ${c.evidence}`).join("\n"), cwd);
+					const refs: EvidenceRef[] = collectEvidenceRefs(parsed.checks.map(c => `${c.criterion} ${c.evidence}`).join("\n"), primaryCwd);
 					const audit = verifyEvidenceRefs(refs, {
-						cwd,
+						cwd: primaryCwd,
+						fallbackCwds,
 						home: homedir(),
 						exists: existsSync,
 						readFile: (path) => { try { return readFileSync(path, "utf8"); } catch { return null; } },
@@ -2524,7 +2562,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 						createdAt: new Date().toISOString(),
 					}, {
 						deliveryVersion: deliveryVersionOf(workerTask),
-						fingerprint: artefactFingerprint(cwd, workerTask.writePaths),
+						fingerprint: artefactFingerprint(primaryCwd, workerTask.writePaths),
 					});
 					syncLease(applied.reviewTask.runId, applied.reviewTask.sessionId, applied.reviewTask.status as any);
 					// The verdict is in: the reviewed attempt cannot write any more, so release its scope.
@@ -2558,14 +2596,14 @@ export default function teamExtension(pi: ExtensionAPI): void {
 							writeLease(task);
 						} else {
 							const verdicted = alreadyVerdicted(task);
-							createReviewerTask(board(), task, task.reviewerRole, artefactFingerprint((ctx as any)?.cwd || process.cwd(), task.writePaths));
+							createReviewerTask(board(), task, task.reviewerRole, artefactFingerprint(task.worktreePath || (ctx as any)?.cwd || process.cwd(), task.writePaths));
 							if (!verdicted && isActiveReviewHold(board(), { ...task, status: "reviewing" })) task.status = "reviewing";
 							releaseFinishedAttempt(task);
 						}
 						dirty = true;
 					} else {
 						const verdicted = alreadyVerdicted(task);
-						createReviewerTask(board(), task, task.reviewerRole, artefactFingerprint((ctx as any)?.cwd || process.cwd(), task.writePaths));
+						createReviewerTask(board(), task, task.reviewerRole, artefactFingerprint(task.worktreePath || (ctx as any)?.cwd || process.cwd(), task.writePaths));
 						// A delivery that already carries a verdict (an INCOMPLETE review re-queued for re-review)
 						// or whose review hold is already inactive/reclaimable stays "reported" so we never
 						// ping-pong with reclaimStaleReviews() or block the write scope indefinitely.
@@ -3237,7 +3275,13 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				programmaticDispatches.set(task.id, { runId, role, at: Date.now() });
 
 				try {
-					const prompt = `TEAM_TASK: ${task.id}\nGoal: ${task.title}\nRole: ${role}\nRead Paths: ${task.readPaths.join(", ") || "none"}\nWrite Paths: ${task.writePaths.join(", ") || "none"}\nAcceptance Criteria:\n${task.acceptance.map((a: string) => `- ${a}`).join("\n")}\n\n${buildTaskContract(task.id, task)}`;
+					let reviewBlock = "";
+					if (task.id.startsWith("W-rev-") || Boolean(task.parentTaskId)) {
+						const workerId = task.parentTaskId || task.id.replace(/^W-rev-/, "W-");
+						const workerTarget = board().tasks.find(t => t.id === workerId);
+						if (workerTarget) reviewBlock = `\n\n${buildReviewContract(task, workerTarget)}`;
+					}
+					const prompt = `TEAM_TASK: ${task.id}\nGoal: ${task.title}\nRole: ${role}\nRead Paths: ${task.readPaths.join(", ") || "none"}\nWrite Paths: ${task.writePaths.join(", ") || "none"}\nAcceptance Criteria:\n${task.acceptance.map((a: string) => `- ${a}`).join("\n")}${reviewBlock}\n\n${buildTaskContract(task.id, task)}`;
 					
 					const rawCallRes = await executeFn("Agent", {
 						subagent_type: role,
@@ -3433,6 +3477,97 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		} catch {
 			return null;
 		}
+	}
+
+	function runDoctorDiagnostic(ctx: any, fix = false): { report: ReturnType<typeof diagnoseTeamHealth>; appliedFixes: string[] } {
+		const cwd = ctx?.cwd || process.cwd();
+		const appliedFixes: string[] = [];
+		const now = Date.now();
+		let mutated = false;
+
+		if (fix) {
+			for (const role of ROLES) {
+				if (state.roleModel && role in state.roleModel && !sanitizeModelOverride(state.roleModel[role])) {
+					delete state.roleModel[role];
+					appliedFixes.push(`清理 ${role} 无效粘性模型占位符`);
+					mutated = true;
+				}
+				if (state.roleThinking && role in state.roleThinking && !sanitizeModelOverride(state.roleThinking[role])) {
+					delete state.roleThinking[role];
+					appliedFixes.push(`清理 ${role} 无效思考级别占位符`);
+					mutated = true;
+				}
+				const cfgModel = cfg.roles[role]?.model;
+				if (cfgModel !== undefined && !sanitizeModelOverride(cfgModel)) {
+					delete cfg.roles[role].model;
+					appliedFixes.push(`清理 ${role} 默认配置中的无效模型 "${cfgModel}"`);
+				}
+				const reason = state.unavailable?.[role];
+				if (reason && !isRoleUnavailable(state, role, undefined, now)) {
+					clearRoleQuotaLock(state, role, false);
+					appliedFixes.push(`自动解除已失效/过冷静期的 ${role} 限流暂停锁`);
+					mutated = true;
+				}
+			}
+			const reclaimed = settleReclaimedReviews(now);
+			if (reclaimed.length > 0) {
+				appliedFixes.push(`回收 ${reclaimed.length} 条超时卡住的审查占用`);
+			}
+			if (state.ledger && state.ledger.tasks.length > 0) {
+				const pr = pruneStaleReviews(board(), { dryRun: false });
+				if (pr.pruned.length > 0 || pr.migratedToCp.length > 0) {
+					for (const t of board().tasks) {
+						if (t.status === "cancelled" && (t.id.startsWith("W-rev-") || Boolean(t.parentTaskId))) writeLease(t);
+					}
+					reconcileBacklog();
+					mutated = true;
+					appliedFixes.push(`清理失效审查任务 ${pr.pruned.length} 条、迁移至 cp ${pr.migratedToCp.length} 条`);
+				}
+			}
+			if (mutated) {
+				persist();
+				setStatusText(ctx);
+			}
+			const childGc = runChildSessionGc(true, false);
+			if (childGc && (childGc.archived.length > 0 || childGc.orphanSidecarsRemoved > 0)) {
+				const mb = (childGc.totalBytesFreed / (1024 * 1024)).toFixed(2);
+				appliedFixes.push(`归档 ${childGc.archived.length} 个历史子会话（释放 ${mb} MB）`);
+			}
+			const wtGc = runWorktreeGc(cwd, true, false);
+			if (wtGc && (wtGc.removed.length > 0 || wtGc.prunedMetadata)) {
+				const mb = (wtGc.bytesFreed / (1024 * 1024)).toFixed(2);
+				appliedFixes.push(`回收 ${wtGc.removed.length} 个已合并/已替代 worktree（释放 ${mb} MB）`);
+			}
+		}
+
+		let availableModelRefs: Set<string> | undefined;
+		try {
+			const available = loadAllAvailableModels(modelsFile, ctx);
+			if (available.length > 0) availableModelRefs = new Set(available.map(m => m.ref));
+		} catch {
+			// ignore catalog load failure in offline/restricted hosts
+		}
+		const childGcPreview = parentSessionId ? runChildSessionGc(true, true) : null;
+		const wtAudit = auditWorktrees(cwd, { tasks: state.ledger?.tasks ?? [], nowMs: now });
+		const report = diagnoseTeamHealth({
+			enabled: state.enabled,
+			cwd,
+			ledger: state.ledger,
+			roles: cfg.roles,
+			fallbacks: cfg.fallbacks,
+			roleModel: state.roleModel,
+			roleThinking: state.roleThinking,
+			unavailable: state.unavailable,
+			unavailableAt: state.unavailableAt,
+			unavailableModel: state.unavailableModel,
+			unavailableCooldownMs: DEFAULT_UNAVAILABLE_COOLDOWN_MS,
+			availableModelRefs,
+			worktreeAudit: wtAudit,
+			childGcPreview,
+			parentSessionFile: ctx?.sessionManager?.getSessionFile?.() || undefined,
+			nowMs: now,
+		});
+		return { report, appliedFixes };
 	}
 
 	function currentLedgerPrompt(): string { return ledgerPrompt(board(), freeSlots(), schedulableBatch()); }
@@ -3859,6 +3994,15 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			ensureSchedulerDaemon(ctx);
 			runChildSessionGc(false, false);
 			runWorktreeGc(ctx?.cwd || process.cwd(), false, false);
+			if (!isSubagentSession && ctx.hasUI) {
+				const { report } = runDoctorDiagnostic(ctx, false);
+				if (!report.healthy && report.findings.length > 0) {
+					ctx.ui.notify(
+						`🩺 Team Doctor 发现 ${report.findings.length} 项潜在健康问题：${report.findings.slice(0, 2).map(f => f.summary).join("；")}\n运行 /team doctor 查看详情，或 /team doctor --fix 自动安全修复。`,
+						"warning",
+					);
+				}
+			}
 		}
 		if (event.reason === "startup" && state.enabled && ctx.hasUI) {
 			ctx.ui.notify(`团队工作流已就绪（${state.mode}）。/team status 查看状态。`, "info");
@@ -4059,6 +4203,16 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
+		// Sanitize invalid/sentinel model overrides (`inherit`, `""`, `default`, `auto`) on parent subsession tools
+		// even before team-mode checks so direct `spawn_subsession` / `manage_subsession` calls never crash with Unknown model.
+		if (["agent", "spawn_subsession", "spawn_session", "manage_subsession"].includes(toolName) && event.input && typeof event.input === "object") {
+			const rawInput = event.input as Record<string, unknown>;
+			if ("model" in rawInput && !sanitizeModelOverride(rawInput.model)) delete rawInput.model;
+			if ("thinking" in rawInput && !sanitizeModelOverride(rawInput.thinking)) delete rawInput.thinking;
+			if ("thinkingLevel" in rawInput && !sanitizeModelOverride(rawInput.thinkingLevel)) delete rawInput.thinkingLevel;
+			if ("thinking_level" in rawInput && !sanitizeModelOverride(rawInput.thinking_level)) delete rawInput.thinking_level;
+		}
+
 		// bash in parent session:
 		if (toolName === "bash") {
 			if (!state.enabled) return;
@@ -4180,7 +4334,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				return { block: true, reason: `${workId}: foreground dispatch (run_in_background=false) is disallowed while ${otherReady.length} other independent ready task(s) can run: ${sample}${extra}. Fix: retry Agent with run_in_background: true (or omit run_in_background; background is default), then check results with get_subagent_result(wait=false).` };
 			}
 		}
-		const explicitModelArg = typeof input.model === "string" && input.model.trim() ? input.model.trim() : undefined;
+		const explicitModelArg = sanitizeModelOverride(input.model);
 		const decision = decideCall({ role, prompt, state, cfg, prices, activeCount: runningCount(), explicitModel: explicitModelArg });
 		if (decision.block) {
 			// Only real role unavailability or the retained economy rationale gate blocks this optional call.
@@ -4652,7 +4806,11 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				const responseText = params.action === "archive" ? archivePrompt(board()) : currentLedgerPrompt();
 				const extra = autoDispatched.length > 0 ? `\n\n[TEAM SCHEDULER] Auto-dispatched ${autoDispatched.length} subagents: ${autoDispatched.join(", ")}.` : "";
 				const curBoard = board();
-				const detailsPayload = curBoard.tasks.length > 60
+				const boardBytes = curBoard.tasks.length > 60 ? Infinity : Buffer.byteLength(JSON.stringify(curBoard));
+				const compactDetails = curBoard.tasks.length > 60
+					|| boardBytes > 16_384
+					|| (params.action !== "list" && boardBytes > 4096);
+				const detailsPayload = compactDetails
 					? {
 						ledgerSummary: {
 							revision: curBoard.revision,
@@ -4949,7 +5107,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				return null;
 			}
 
-			const items = ["help", "on", "off", "new", "status", "check-update", "update", "model", "model list", "model help", "models", "tasks", "tasks archive", "tasks move", "dispatch", "solo delegated", "solo allow", "reconcile", "unpause", "gc", "gc --all", "gc --worktrees", "prune-reviews", "log", "reset", "goal", "goal status", "goal edit", "goal clear", "goal resume", "goal stop", "mode economy", "mode strict", "budget", "limits"]
+			const items = ["help", "on", "off", "new", "status", "doctor", "doctor --fix", "check-update", "update", "model", "model list", "model help", "models", "tasks", "tasks archive", "tasks move", "dispatch", "solo delegated", "solo allow", "reconcile", "unpause", "gc", "gc --all", "gc --worktrees", "prune-reviews", "log", "reset", "goal", "goal status", "goal edit", "goal clear", "goal resume", "goal stop", "mode economy", "mode strict", "budget", "limits"]
 				.filter((v) => v.startsWith(prefix.trim()))
 				.map((v) => ({ value: v, label: v }));
 			return items.length > 0 ? items : null;
@@ -5010,6 +5168,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					"• /team on              — 启用团队工作流",
 					"• /team off             — 退出团队工作流",
 					"• /team status          — 查看当前工作流运行状态与任务进度",
+					"• /team doctor [--fix]  — 主动自检团队健康状况（无效模型、过期锁、阻塞审查、冗余 worktree 与膨胀），加 --fix 自动安全修复",
 					"• /team mode [standard|economy|strict] — 切换工作流执行模式",
 					"\n【版本与更新】",
 					"• /team check-update    — 检查 GitHub 远程最新版本",
@@ -5447,6 +5606,17 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
+			if (sub === "doctor" || sub === "check" || sub === "health") {
+				if (isSubagentSession) {
+					ctx.ui.notify("自检诊断请在主会话中执行。", "warning");
+					return;
+				}
+				const doFix = rest.includes("--fix") || rest.includes("-f") || rest.includes("fix");
+				const { report, appliedFixes } = runDoctorDiagnostic(ctx, doFix);
+				ctx.ui.notify(formatDoctorReport(report, appliedFixes), report.healthy ? "info" : "warning");
+				return;
+			}
+
 			if (sub === "unpause") {
 				if (isSubagentSession) {
 					ctx.ui.notify("限流暂停锁只能由主会话解除。", "warning");
@@ -5686,7 +5856,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
-			ctx.ui.notify("用法：/team [on|off|model|models|tasks|status|reconcile|gc|unpause|prune-reviews|mode|budget|log|goal|reset]", "warning");
+			ctx.ui.notify("用法：/team [on|off|doctor|model|models|tasks|status|reconcile|gc|unpause|prune-reviews|mode|budget|log|goal|reset]", "warning");
 		},
 	});
 

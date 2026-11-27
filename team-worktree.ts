@@ -167,12 +167,16 @@ export function extractTaskWorktreeRoots(
 	for (const raw of candidates) {
 		if (!raw || typeof raw !== "string") continue;
 		const resolved = resolve(raw);
+		// Pick only the deepest containing registered worktree so a parent worktree task never
+		// falsely marks nested secondary worktrees under it as active dependencies.
+		let deepestMatch: string | null = null;
 		for (const reg of registeredPaths) {
 			const regRes = resolve(reg);
-			if (resolved === regRes || resolved.startsWith(`${regRes}/`) || regRes.startsWith(`${resolved}/`)) {
-				out.add(regRes);
+			if (resolved === regRes || resolved.startsWith(`${regRes}/`)) {
+				if (!deepestMatch || regRes.length > deepestMatch.length) deepestMatch = regRes;
 			}
 		}
+		if (deepestMatch) out.add(deepestMatch);
 	}
 	return [...out];
 }

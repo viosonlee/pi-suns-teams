@@ -584,17 +584,43 @@ export function completedCommandsForHostedReport(entries: SessionEntryLike[], re
 	return index < 0 ? [] : collectObservedCommands(active.branch, index, attemptIdentity({ reportNotBefore }));
 }
 
+function extractCodemodeCommands(code: string): string[] {
+	const out: string[] = [];
+	const re = /\btools\.bash\s*\(\s*\{\s*command\s*:\s*(["'`])((?:\\.|(?!\1)[\s\S])*?)\1/g;
+	for (const match of code.matchAll(re)) {
+		const cmd = match[2]
+			.replace(/\\n/g, "\n")
+			.replace(/\\r/g, "")
+			.replace(/\\t/g, " ")
+			.replace(/\\(["'`\\])/g, "$1")
+			.trim();
+		if (cmd) out.push(cmd);
+	}
+	return out;
+}
+
 function collectObservedCommands(branch: SessionEntryLike[], reportIndex: number, identity: AttemptIdentity): string[] {
 	const completedCallIds = new Set<string>();
+	const succeededCallIds = new Set<string>();
 	for (let i = 0; i <= reportIndex; i += 1) {
 		const entry = branch[i];
 		if (entry.type === "message" && isObject(entry.message) && entry.message.role === "toolResult") {
 			const id = toolResultCallId(entry.message);
-			if (id) completedCallIds.add(id);
+			if (id) {
+				completedCallIds.add(id);
+				if (entry.message.isError !== true) succeededCallIds.add(id);
+			}
 		}
 	}
 	const commands: string[] = [];
 	const seen = new Set<string>();
+	const pushCmd = (raw: string | undefined) => {
+		const trimmed = raw?.trim();
+		if (trimmed && !seen.has(trimmed)) {
+			seen.add(trimmed);
+			commands.push(trimmed);
+		}
+	};
 	for (let i = 0; i <= reportIndex; i += 1) {
 		const entry = branch[i];
 		if (entry.type !== "message" || !isObject(entry.message) || entry.message.role !== "assistant") continue;
@@ -609,14 +635,15 @@ function collectObservedCommands(branch: SessionEntryLike[], reportIndex: number
 		for (const block of content) {
 			if (!isObject(block) || block.type !== "toolCall") continue;
 			const name = asString(block.name)?.toLowerCase();
-			if (name !== "bash") continue;
 			const callId = asString(block.id);
-			if (callId && !completedCallIds.has(callId)) continue;
 			const args = isObject(block.arguments) ? block.arguments : undefined;
-			const cmd = asString(args?.command) ?? asString(args?.cmd);
-			if (cmd && cmd.trim() && !seen.has(cmd.trim())) {
-				seen.add(cmd.trim());
-				commands.push(cmd.trim());
+			if (name === "bash") {
+				if (callId && !completedCallIds.has(callId)) continue;
+				pushCmd(asString(args?.command) ?? asString(args?.cmd));
+			} else if (name === "codemode") {
+				if (callId && !succeededCallIds.has(callId)) continue;
+				const code = asString(args?.code);
+				if (code) for (const cmd of extractCodemodeCommands(code)) pushCmd(cmd);
 			}
 		}
 	}

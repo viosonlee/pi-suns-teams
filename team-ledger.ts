@@ -1023,7 +1023,7 @@ export function ledgerPrompt(board: WorkLedger, _slots = Infinity, validatedBatc
 		...openRequests.map(r => `${r.id} (${r.kind}, source=${r.source}): ${JSON.stringify(r.text)}`),
 		`Pending queue (ordered; completed items auto-archive). Archived tasks: ${board.tasks.length - openTasks.length}. Use team_tasks archive to query history.`,
 		...(() => {
-			const fmtTask = (t: WorkTask) => `${t.id} [${t.status}] ${t.role}: ${JSON.stringify(t.title)} requests=${t.requestIds.join(",")} deps=${t.dependsOn.join(",")} reads=${JSON.stringify(t.readPaths)} writes=${JSON.stringify(t.writePaths)} acceptance=${JSON.stringify(t.acceptance)} reviewTier=${t.reviewTier ?? "unset"} autoAccept=${t.autoAccept ?? "unset"}${t.reviewerRole ? ` reviewerRole=${t.reviewerRole}` : ""}${t.sessionId ? ` child=${t.sessionId}` : ""}${t.reason ? ` reason=${JSON.stringify(t.reason)}` : ""}`;
+			const fmtTask = (t: WorkTask) => `${t.id} [${t.status}] ${t.role}: ${JSON.stringify(t.title)} requests=${t.requestIds.join(",")} deps=${t.dependsOn.join(",")} reads=${JSON.stringify(t.readPaths)} writes=${JSON.stringify(t.writePaths)} acceptance=${JSON.stringify(t.acceptance)} reviewTier=${t.reviewTier ?? "unset"} autoAccept=${t.autoAccept ?? "unset"}${t.manualDispatch ? " hold=manualDispatch" : ""}${t.reviewerRole ? ` reviewerRole=${t.reviewerRole}` : ""}${t.sessionId ? ` child=${t.sessionId}` : ""}${t.reason ? ` reason=${JSON.stringify(t.reason)}` : ""}`;
 			if (openTasks.length <= 80) return openTasks.map(fmtTask);
 			// Prevent 500 KB–1 MB prompt/JSONL bloat on huge long-running boards while preserving all active & top dispatchable items.
 			const batchIds = new Set(batch.slice(0, 30).map(t => t.id));
@@ -1504,7 +1504,9 @@ export function createReviewerTask(board: WorkLedger, workerTask: WorkTask, revi
 		requestIds: [...workerTask.requestIds],
 		role,
 		dependsOn: [workerTask.id],
-		readPaths: [...workerTask.writePaths, ...workerTask.readPaths],
+		// Protect delivered writePaths during review, but avoid inheriting broad worker readPaths
+		// that cause unrelated writers on other files in the same directory to stall behind a review.
+		readPaths: workerTask.writePaths.length > 0 ? [...workerTask.writePaths] : [],
 		writePaths: [],
 		acceptance: workerTask.acceptance.length
 			? workerTask.acceptance.map((a, i) => `AC${i + 1}. ${a}`)

@@ -52,13 +52,31 @@ export interface ReviewBrief {
 const VERDICT_WORDS: ReviewVerdict[] = ["PASS", "REWORK", "ESCALATE", "INCOMPLETE"];
 const CHECK_WORDS: ReviewCheckStatus[] = ["pass", "fail", "unverified"];
 
-/** Strip markdown emphasis, bullets and quoting so a decorated header is still line-anchored. */
+/**
+ * Strip markdown bullets, inline code backticks, double-tilde strikethrough and delimiter
+ * emphasis without corrupting snake_case file paths (`docs/01_spec/...`), globs (`*.py`),
+ * or home paths (`~/foo`).
+ */
 function normalizeLine(line: string): string {
-	return line
-		.replace(/^\s*(?:[-*>+#]|\d+[.)])\s*/, "")
-		.replace(/[*`_~]/g, "")
-		.replace(/\s+/g, " ")
-		.trim();
+	let cleaned = line.replace(/^\s*(?:[-*+](?=\s)|\d+[.)](?=\s)|[>#])+\s*/, "");
+	cleaned = cleaned.replace(/[`]|~~/g, "");
+	for (let pass = 0; pass < 3; pass++) {
+		const next = cleaned.replace(
+			/(^|[\s(\["'>=:])(\*\*|__|\*|_)([^\s*_\n](?:[^\n]*?[^\s*_\n])?)\2(?=$|[\s)\]"',:;!?<]|\.(?![\p{L}\p{N}_]))/gu,
+			(full, lead: string, delim: string, inner: string) => {
+				if (delim.length === 1 && delim === "_" && (/[\/\\]/.test(inner) || /[\p{L}\p{N}_]\.[\p{L}\p{N}]+$/u.test(inner))) {
+					return full;
+				}
+				if (delim === "*" && /\/\*|\*\//.test(full)) {
+					return full;
+				}
+				return `${lead}${inner}`;
+			},
+		);
+		if (next === cleaned) break;
+		cleaned = next;
+	}
+	return cleaned.replace(/\s+/g, " ").trim();
 }
 
 function isBullet(line: string): boolean {
@@ -152,7 +170,7 @@ function parseCheck(normalized: string): { index?: number; check: ReviewCheck } 
 		return { index, check: { criterion, status: "unverified", evidence } };
 	}
 	if (!evidence && verdictPart) {
-		evidence = verdictPart.replace(/^[A-Za-z]+\b/, "").replace(/^[^A-Za-z0-9/._-]+/, "").trim();
+		evidence = verdictPart.replace(/^[A-Za-z]+\b/, "").replace(/^[\s:\u2014\u2013\-|]+/, "").trim();
 	}
 	return { index, check: { criterion, status, evidence } };
 }

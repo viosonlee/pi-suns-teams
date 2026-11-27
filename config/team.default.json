@@ -64,13 +64,13 @@
     "cp": [
       "magpie/cursor/auto",
       "magpie/auto/gpt-6.1-sol",
-      "magpie/agentrouter/gpt-6.1-sol",
+      "magpie/agentrouter/gpt-6.2-sol",
       "magpie/anyrouter/gpt-6.1-sol"
     ],
     "booker": [
       "magpie/cursor/auto",
       "magpie/auto/gpt-6.1-sol",
-      "magpie/agentrouter/gpt-6.1-sol"
+      "magpie/agentrouter/gpt-6.2-sol"
     ],
     "bridges": [
       "magpie/cursor/auto",

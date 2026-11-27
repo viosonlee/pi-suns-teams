@@ -93,8 +93,13 @@ const registryKey = Symbol.for("pi-teams.hosted-runner.state");
 const shared = globalThis as typeof globalThis & { [registryKey]?: HostedRunnerState };
 const defaultState = shared[registryKey] ??= createHostedRunnerState();
 const MAX_WAIT_MS = 300_000;
+const SENTINEL_OVERRIDES = new Set(["inherit", "default", "auto", "none", "unset", "null", "undefined"]);
 const optional = (value: unknown): string | undefined =>
 	typeof value === "string" && value.trim() ? value.trim() : undefined;
+const optionalOverride = (value: unknown): string | undefined => {
+	const v = optional(value);
+	return v && !SENTINEL_OVERRIDES.has(v.toLowerCase()) ? v : undefined;
+};
 const record = (value: unknown): value is Record<string, unknown> =>
 	value !== null && typeof value === "object" && !Array.isArray(value);
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
@@ -294,7 +299,7 @@ export async function launchHostedSubagent(params: AgentCallParams, options: Hos
 	try {
 		const role = (optional(params.subagent_type) ?? "bridges").toLowerCase();
 		if (!/^[a-z][a-z0-9_-]*$/.test(role)) throw new Error("Invalid hosted role");
-		if (id && (optional(params.model) || optional(params.thinking))) throw new Error("manage_subsession resume cannot override model/thinking; omit inherited override fields");
+		if (id && (optionalOverride(params.model) || optionalOverride(params.thinking))) throw new Error("manage_subsession resume cannot override model/thinking; omit inherited override fields");
 		if (signal?.aborted) return { sessionId: id, status: "failed", isError: true, error: "Launch canceled before host call" };
 		const profile = readAgentProfile(role, options.agentDir || getDefaultAgentDir());
 		if (!profile) throw new Error(`Missing agent profile for hosted role ${role}`);
@@ -314,8 +319,8 @@ export async function launchHostedSubagent(params: AgentCallParams, options: Hos
 			const d = await hostDetails("manage_subsession", { action: "resume", sessionId: id, prompt }, options);
 			if (d.status !== "working") throw new HostCallError("manage_subsession: resume did not return structured working status", "manage_subsession", id);
 		} else {
-			const model = optional(params.model) ?? optional(options.getModelOverride?.(role)) ?? optional(profile.model);
-			const thinkingLevel = optional(params.thinking) ?? optional(options.getThinkingOverride?.(role)) ?? optional(profile.thinking);
+			const model = optionalOverride(params.model) ?? optionalOverride(options.getModelOverride?.(role)) ?? optionalOverride(profile.model);
+			const thinkingLevel = optionalOverride(params.thinking) ?? optionalOverride(options.getThinkingOverride?.(role)) ?? optionalOverride(profile.thinking);
 			hostInvoked = true;
 			const d = await hostDetails("spawn_subsession", { prompt, ...(model ? { model } : {}), ...(thinkingLevel ? { thinkingLevel } : {}) }, options);
 			id = String(d.sessionId);
