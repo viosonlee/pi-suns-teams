@@ -1941,10 +1941,58 @@ const ALWAYS_WRITE_VERBS = new Set([
 	"mkdir", "mkfifo", "mknod", "mktemp", "ln", "install", "patch", "cpio",
 	"unzip", "unrar", "7z", "truncate", "dd", "tee",
 	"make", "cmake", "ninja",
-	"vi", "vim", "nvim", "nano", "ed", "ex",
+	"vi", "vim", "nvim", "nano", "ed", "ex", "emacs",
 	"scp", "rsync", "sftp", "eval", "exec", "source", ".",
 	"ssh", "nsenter", "unshare", "chroot", "su", "pkexec",
+	"mount", "umount", "swapon", "swapoff", "fdisk", "parted", "mkfs",
+	"useradd", "userdel", "usermod", "groupadd", "groupdel", "groupmod", "passwd",
+	"iptables", "nft", "ufw", "firewall-cmd", "ip", "ifconfig", "route", "hostnamectl",
 ]);
+
+/** Interpreters / compilers whose non-meta-flag invocation runs arbitrary code or writes artifacts. */
+const INTERPRETER_VERBS = new Set([
+	"perl", "ruby", "php", "lua", "luajit", "tclsh", "wish", "awk", "gawk", "mawk",
+	"javac", "rustc", "gfortran", "swift", "kotlinc",
+]);
+
+/** Remote/service administration CLIs. Non-read subcommands mutate external state bwrap cannot fence. */
+const REMOTE_ADMIN_VERBS = new Set([
+	"mysql", "mysqldump", "mariadb", "psql", "pg_dump", "mongo", "mongosh", "redis-cli",
+	"aws", "gcloud", "az", "terraform", "helm", "ansible", "ansible-playbook", "kubectl",
+]);
+
+const REMOTE_ADMIN_SAFE_SUBCOMMANDS: Record<string, RegExp> = {
+	mysql: /^(?:--version|-V|-h|--help)\b/i,
+	mysqldump: /^(?:--version|-V|--help)\b/i,
+	mariadb: /^(?:--version|-V|-h|--help)\b/i,
+	psql: /^(?:--version|-V|--help)\b/i,
+	pg_dump: /^(?:--version|-V|--help)\b/i,
+	mongo: /^(?:--version|-V|--help)\b/i,
+	mongosh: /^(?:--version|-V|--help)\b/i,
+	"redis-cli": /^(?:--version|-v|--help)\b/i,
+	aws: /^(?:--version|-V|--help|sts get-caller-identity)\b/i,
+	gcloud: /^(?:--version|-V|--help|--configuration|auth list|projects list)\b/i,
+	az: /^(?:--version|-V|--help|account list|account show)\b/i,
+	terraform: /^(?:--version|-v|--help|validate|fmt|plan)\b/i,
+	helm: /^(?:version|list|status|show|search|template|lint)\b/i,
+	ansible: /^(?:--version|--help)\b/i,
+	"ansible-playbook": /^(?:--version|--help|--syntax-check)\b/i,
+	kubectl: /^(?:get|describe|logs|version|cluster-info|api-resources|api-versions|explain|top)\b/i,
+};
+
+/** System/service CLIs. Non-status subcommands change host state bwrap cannot fence. */
+const SYSTEM_ADMIN_VERBS = new Set([
+	"systemctl", "service", "crontab", "kill", "killall", "pkill",
+]);
+
+const SYSTEM_ADMIN_SAFE_SUBCOMMANDS: Record<string, RegExp> = {
+	systemctl: /^(?:status|is-active|is-enabled|is-failed|list-units|list-unit-files|show|cat|help|-h|--help|--version)\b/i,
+	service: /^(?:\s*--status-all\b|\s*--help\b|\s*[A-Za-z0-9_.@+-]+\s+status\s*$)/i,
+	crontab: /^(?:-l|--list|-h|--help)\b/i,
+	kill: /^(?:-l|--help)\b/i,
+	killall: /^(?:--version|-V|--help)\b/i,
+	pkill: /^(?:--version|-V|--help)\b/i,
+};
 
 function extractCommandVerbAndArgs(tokens: string[]): { verb: string; args: string[]; isDynamic?: boolean } | null {
 	let idx = 0;
@@ -2040,7 +2088,7 @@ export function isBashWriteCommand(cmd: string): { isWrite: boolean; reason?: st
 			const execIdx = args.findIndex(a => a === "-exec" || a === "-execdir");
 			if (execIdx >= 0 && args[execIdx + 1]) {
 				const execVerb = args[execIdx + 1].split("/").pop()?.toLowerCase() ?? "";
-				if (ALWAYS_WRITE_VERBS.has(execVerb) || execVerb === "sed") {
+				if (ALWAYS_WRITE_VERBS.has(execVerb) || execVerb === "sed" || INTERPRETER_VERBS.has(execVerb)) {
 					return { isWrite: true, reason: `find -exec invokes ${execVerb}.` };
 				}
 			}
@@ -2069,9 +2117,15 @@ export function isBashWriteCommand(cmd: string): { isWrite: boolean; reason?: st
 				return { isWrite: true, reason: "Arbitrary Node.js eval, heredoc, or script execution." };
 			}
 		}
-		if (verb === "perl" || verb === "ruby" || verb === "php") {
+		if (INTERPRETER_VERBS.has(verb)) {
 			const isMetaFlagOnly = args.length > 0 && args.every(a => /^(?:-v|-V|--version|-h|--help)$/.test(a));
-			if (!isMetaFlagOnly) {
+			if (isMetaFlagOnly) {
+				// Interpreter version/help output only; fall through to other checks.
+			} else if (verb === "awk" || verb === "gawk" || verb === "mawk") {
+				if (args.some(a => /^-f/.test(a) || a.startsWith("--file") || a.startsWith("--include")) || args.some(a => !a.startsWith("-"))) {
+					return { isWrite: true, reason: "awk script/program-file execution." };
+				}
+			} else {
 				return { isWrite: true, reason: `Arbitrary ${verb} script/inline execution.` };
 			}
 		}
@@ -2082,7 +2136,8 @@ export function isBashWriteCommand(cmd: string): { isWrite: boolean; reason?: st
 			if (args.some(a => /^-[a-zA-Z]*c$/.test(a))) {
 				const cIdx = args.findIndex(a => /^-[a-zA-Z]*c$/.test(a));
 				const inner = args[cIdx + 1];
-				if (!inner || isBashWriteCommand(inner).isWrite) {
+				if (!inner || isBashWriteCommand(inner).isWrite
+					|| (/^[^-\[]/.test(inner) && inner !== "-" && !/^["']/.test(inner))) {
 					return { isWrite: true, reason: `Nested shell execution (${verb} -c).` };
 				}
 			} else if (args.some(a => !a.startsWith("-"))) {
@@ -2128,6 +2183,18 @@ export function isBashWriteCommand(cmd: string): { isWrite: boolean; reason?: st
 			}
 			if (gitSub === "config" && !args.some(a => /^(?:--get|--get-all|--get-regexp|--list|-l)$/.test(a))) {
 				return { isWrite: true, reason: "Git config modification." };
+			}
+		}
+		if (REMOTE_ADMIN_VERBS.has(verb)) {
+			const safeRe = REMOTE_ADMIN_SAFE_SUBCOMMANDS[verb];
+			if (!safeRe || !safeRe.test(args.join(" "))) {
+				return { isWrite: true, reason: `Remote/admin command may mutate external state (${verb}).` };
+			}
+		}
+		if (SYSTEM_ADMIN_VERBS.has(verb)) {
+			const safeRe = SYSTEM_ADMIN_SAFE_SUBCOMMANDS[verb];
+			if (!safeRe || !safeRe.test(args.join(" "))) {
+				return { isWrite: true, reason: `Host/system administration command (${verb}).` };
 			}
 		}
 	}

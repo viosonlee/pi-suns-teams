@@ -36,6 +36,12 @@ export interface WorkTask {
 	id: string; title: string; requestIds: string[]; role: string;
 	dependsOn: string[]; readPaths: string[]; writePaths: string[]; acceptance: string[];
 	status: WorkStatus; evidence: string[]; reason?: string; replacementIds?: string[];
+	/** Read liveness policy for read-only tasks: "strict" (default) waits for in-flight writers; "snapshot" reads may run concurrently with in-flight writers. */
+	readMode?: "strict" | "snapshot";
+	/** Auto-worktree provenance: this task was granted a task-owned git worktree by the conflict scheduler. */
+	worktreeOwned?: boolean;
+	/** Auto-worktree branch (auto-created by conflict scheduler; cleanup uses non-force git branch -d only). */
+	worktreeBranch?: string;
 	sessionId?: string; runId?: string; dispatchedAt?: string; archivedAt?: string; queueNote?: string;
 	/** Persisted transport: new pi-web children are host-managed; legacy process children stay native. */
 	executionTransport?: "hosted" | "native";
@@ -380,6 +386,11 @@ export function addTasks(board: WorkLedger, values: unknown, cwd: string, option
 		}
 		const readPaths = paths(spec.readPaths, "readPaths", cwd);
 		const writePaths = paths(rawWritePaths ?? [], "writePaths", cwd);
+		const readMode = spec.readMode === "snapshot" ? "snapshot" as const : spec.readMode === "strict" ? "strict" as const : undefined;
+		if (spec.readMode !== undefined && !["strict", "snapshot"].includes(String(spec.readMode))) throw new Error(`${id}: readMode must be "strict" or "snapshot" (received: ${String(spec.readMode)}).`);
+		if (readMode === "snapshot" && writePaths.length > 0) {
+			throw new Error(`${id}: readMode:"snapshot" requires a read-only task (writePaths=[] and no writer role). Snapshot reads never wait for in-flight writers, so they must not themselves own writes.`);
+		}
 		if ((role === "cp") && writePaths.length) throw new Error(`${id}: ${role} tasks cannot own writes (received writePaths: ${writePaths.join(", ")}). Fix: set writePaths: [] (and declaredReadOnly: true), or assign write work to booker/bridges/cameron/ayton (tests/artifacts only).`);
 		const title = text(spec.title, "title");
 		const acceptance = strings(spec.acceptance, "acceptance", true);
@@ -422,6 +433,7 @@ export function addTasks(board: WorkLedger, values: unknown, cwd: string, option
 		return { id, title, requestIds: strings(spec.requestIds, "requestIds", true), role,
 			dependsOn: strings(spec.dependsOn, "dependsOn"), readPaths, writePaths, acceptance,
 			status: initialStatus as WorkStatus, evidence: [],
+			...(readMode ? { readMode } : {}),
 			...(options.manualDispatch ? {
 				manualDispatch: true,
 				manualDispatchReason: options.manualDispatchReason ?? "Explicit manual dispatch requested (autoDispatch:false).",
@@ -728,6 +740,12 @@ export function taskConflict(a: WorkTask, b: WorkTask): boolean {
 	// 2. Reviewer relationship is exempt from filesystem conflict (reviewer inspects worker's output files)
 	if (a.parentTaskId === b.id || a.id === reviewerTaskId(b.id) || b.parentTaskId === a.id || b.id === reviewerTaskId(a.id)) return false;
 
+	// Snapshot-read relaxation: a read-only task that does not need the writer's uncommitted output may run
+	// concurrently with a writer. Only sharedResources still conflict (checked above).
+	const aSnapshotRead = a.writePaths.length === 0 && !isWriterTask(a) && a.readMode === "snapshot";
+	const bSnapshotRead = b.writePaths.length === 0 && !isWriterTask(b) && b.readMode === "snapshot";
+	if (aSnapshotRead || bSnapshotRead) return false;
+
 	// 3. Worktree isolation validation:
 	const aClaimsWt = a.isolation === "worktree";
 	const bClaimsWt = b.isolation === "worktree";
@@ -786,7 +804,10 @@ export function readyTasks(board: WorkLedger, now = Date.now()): WorkTask[] {
 		&& !board.tasks.some(other => other.id !== task.id
 			&& !(task.parentTaskId === other.id || task.id === reviewerTaskId(other.id))
 			&& scopeBlockingLive(board, other, now)
-			&& taskConflict(task, other)));
+			&& taskConflict(task, other)
+			// Reviewing workers have stopped writing: allow ready tasks with DIFFERENT verified worktree to proceed.
+			&& !(other.status === "reviewing" && hasValidWorktree(task) && hasValidWorktree(other)
+				&& task.worktreePath !== other.worktreePath)));
 }
 /** Legacy slots argument is ignored: select all eligible independent work, never a numeric batch cap. */
 export function dispatchBatch(board: WorkLedger, _slots = Infinity, eligible: (task: WorkTask) => boolean = () => true): WorkTask[] {
@@ -1052,6 +1073,8 @@ export function ledgerPrompt(board: WorkLedger, _slots = Infinity, validatedBatc
 		"New tasks append at the tail. For user urgency/insert requests use team_tasks move front/before/after/tail with a reason. Queue order controls dispatch priority ONLY: do not execute one user request to completion before starting the next. Advance multiple independent requests concurrently by default. Insertion never preempts live children or pauses unrelated work, and cannot bypass real dependencies/conflicts. Prefer splitting deliverables or safely isolating actual workspaces to eliminate avoidable conflicts; minor coordination alone is not a reason to serialize. Dispatch the whole ready independent batch now via background Agent calls with TEAM_TASK: W-id in each prompt. Then do other ready parent work. On any report return, verify only the relevant evidence, accept/rework it, release successors and refill slots immediately; do not wait for a whole wave. Before dispatching, decompose EACH objective as finely as independently executable and verifiable outputs allow. Do not delegate an entire objective as one opaque job when independent components can advance separately. Use multiple child sessions for independent components, including multiple instances of the same role: plan parallelism both WITHIN each objective and ACROSS different objectives. Declare precise per-file/workspace read-write ownership rather than artificial whole-repository conflicts. Avoid meaningless microtasks or unnecessary serial handoff chains. Planned items require explicit dependencies/read-write scopes and acceptance for each resulting deliverable. Serial work requires a real dependency, shared resource, or a stated reason; never invent parallel work or force a minimum worker count.",
 		"ROLE AUTHORITY: Booker is the senior executor and may make bounded local technical decisions within the assigned goal/scope. CP retains global architecture, user-scope changes and major arbitration. Bridges/Ayton/Cameron execute assigned work and report decision needs; they have no product decision authority. Ayton owns automated & physical-device testing (may write tests/artifacts, never product business code); Cameron owns build/packaging/device deployment, release assets & docs (never product business code). A review waiver never grants product decision authority.",
 		"REVIEW POLICY: Ayton (QA/real-device verification) and Cameron (Release/Ops/Docs) with unset reviewTier default review-exempt (delivery stays reported for fast parent acceptance, or uses deterministic+autoAccept:true for pure machine assertions). Booker and Bridges (product code writers) default to independent CP review; explicit reviewTier:none waives review for bounded analysis or small non-decision tasks, without requiring autoAccept:true. reviewTier:llm, autoAccept:false or explicit reviewerRole requests independent review. Explicit deterministic + autoAccept:true still requires ALL objective assertions (file:/artifact:, exit code 0); prose test counts are not verified automatically and route to review. CP/parent and review tasks never auto-accept. Exempt reports still need clean complete delivery, tangible evidence and every recognizable machine assertion; incomplete/failed/unverified/pending reports remain reported with rework/verification reasons and blocked dependencies, without an unnecessary automatic reviewer. Existing current-delivery reviewers and CP REWORK obligations remain binding; never cancel old reviewers to apply defaults.",
+		"READ MODE: read-only scout/inventory/audit tasks may set readMode:\"snapshot\" to declare they do NOT depend on a writer's uncommitted in-flight output — snapshot reads run in parallel with active writers on the same files (only sharedResources still conflict). Default readMode:\"strict\" waits for in-flight writers to land their writes before the read task may start. readMode:\"snapshot\" requires writePaths=[] and a non-writer role; writer tasks cannot set it. Prefer strict when the read must reflect the writer's final state (review/verification); prefer snapshot for independent reconnaissance, inventory, or code archaeology that tolerates stale reads.",
+		"AUTO-WORKTREE ESCAPE: when a ready writable task conflicts with an in-flight task in the main tree but has no sharedResources conflict and the main tree is clean, the scheduler may provision a task-owned git worktree (isolation:\"worktree\", worktreeOwned:true) so both proceed in parallel. The owning child commits its own changes early; integration is serial via the designated integrator; merged/clean auto-worktrees are reclaimed by /team gc --worktrees (never --force/-D). Only-read tasks and sharedResources conflicts NEVER get auto-worktrees.",
 		"Reported is not done until verified automatic acceptance or independent/parent acceptance. Unknown/interrupted is not stopped. Scope checks are scheduling metadata, NOT a tool permission sandbox. Resource/port/shared-repo hazards must also be represented in dependencies. GOAL_COMPLETE is blocked by unresolved user requests or unfinished tasks.",
 	].join("\n");
 }

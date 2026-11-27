@@ -19,6 +19,7 @@ import { join, resolve } from "node:path";
 import { terminalWork, type WorkTask } from "./team-ledger.ts";
 
 export const DEFAULT_WORKTREE_GRACE_MS = 30 * 60_000;
+export const AUTO_WORKTREE_ROOT_NAME = ".pi-teams-worktrees";
 
 export interface GitWorktreeEntry {
 	path: string;
@@ -179,6 +180,37 @@ export function extractTaskWorktreeRoots(
 		if (deepestMatch) out.add(deepestMatch);
 	}
 	return [...out];
+}
+
+export interface AutoWorktreeResult {
+	ok: boolean;
+	reason?: string;
+	worktreePath?: string;
+	branch?: string;
+}
+
+/**
+ * Create a task-owned auto-worktree when a ready writable task conflicts with an in-flight task in the
+ * main tree. Uses `git worktree add -b <auto-branch> <path> HEAD` (never --force, never -D). The path is
+ * a sibling directory of the repo root so extractTaskWorktreeRoots/auditWorktrees/cleanupSafeWorktrees
+ * can track and safely reclaim it after merge.
+ */
+export function provisionAutoWorktree(
+	repoRoot: string,
+	taskId: string,
+	options: { dryRun?: boolean } = {},
+): AutoWorktreeResult {
+	const cleanRootCheck = gitExec(repoRoot, ["status", "--porcelain"]);
+	if (!cleanRootCheck.ok) return { ok: false, reason: `git status failed in ${repoRoot}` };
+	if (cleanRootCheck.stdout.trim().length > 0) return { ok: false, reason: "main tree is dirty; refusing to create auto-worktree (fail-closed)" };
+	const branch = `pi-teams-auto/${taskId}-${Date.now().toString(36)}`;
+	const parent = resolve(repoRoot, "..");
+	const safeId = taskId.replace(/[^A-Za-z0-9._-]/g, "_");
+	const worktreePath = join(parent, `${AUTO_WORKTREE_ROOT_NAME}/${safeId}`);
+	if (options.dryRun) return { ok: true, worktreePath, branch };
+	const add = gitExec(repoRoot, ["worktree", "add", "-b", branch, worktreePath, "HEAD"]);
+	if (!add.ok) return { ok: false, reason: `git worktree add failed: ${add.stderr.trim()}` };
+	return { ok: true, worktreePath, branch };
 }
 
 function boundedDirSize(dirPath: string, maxEntries = 20_000): number {
