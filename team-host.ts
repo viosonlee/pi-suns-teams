@@ -31,7 +31,7 @@ import {
 	type AgentCallParams, type ChildCompletion, type NativeRunnerOptions,
 } from "./team-runner.ts";
 import {
-	resolveChildSessionFile, parseSessionJsonl, buildActiveBranch, completedCommandsForHostedReport,
+	resolveChildSessionFile, parseSessionJsonl, buildActiveBranch, completedCommandsForHostedReport, failedCommandsForHostedReport,
 	RECOVERY_MAX_SESSION_BYTES, type SessionEntryLike,
 } from "./team-recovery.ts";
 
@@ -284,6 +284,7 @@ function finish(id: string, attempt: HostedAttempt, snapshot: HostCheck, options
 		parentSessionId: options.parentSessionId ?? "", status, success: status === "completed",
 		...(reportText.trim() ? { reportText } : {}), stopReason, code: null, signal: null, ...(error ? { error } : {}),
 		observedCommands: disk.entries ? completedCommandsForHostedReport(disk.entries, attempt.notBefore === undefined ? undefined : new Date(attempt.notBefore).toISOString()) : [],
+		observedFailedCommands: disk.entries ? failedCommandsForHostedReport(disk.entries, attempt.notBefore === undefined ? undefined : new Date(attempt.notBefore).toISOString()) : [],
 	};
 	// Commit before calling back: concurrent checks and re-entrant callbacks dedupe.
 	if (attempt.terminal) return completionResult(attempt.terminal);

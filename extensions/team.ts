@@ -10,7 +10,7 @@
  * - 每个任务落一条 team-run 记录；子 Agent 自身是完整 Pi 会话，可 resume 返工。
  */
 
-import { existsSync, readFileSync, statSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync, readdirSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -18,12 +18,13 @@ import { join, isAbsolute, resolve, relative, dirname, sep } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	newLedger, addRequest, addTasks, addBacklog, updateTask, resolveRequest, terminalWork, liveWork, occupiesSlot,
-	readyTasks, dispatchBatch, markDispatched, observeTask, completionBlockers, ledgerPrompt, moveTask, archivePrompt,
+	readyTasks, dispatchBatch, markDispatched, observeTask, completionBlockers, ledgerPrompt, moveTask, archivePrompt, classifyUserInput,
 	taskConflict, reviewingReadAllowed, autoWorktreeEligible, parseTeamTaskId, isDeterministic, isReviewExempt, isReviewTask, autoAcceptTask, createReviewerTask, nextDispatchableTasks,
 	reviewerTaskId, completeReviewTask, publishTasks, overlap, recordReview, deliveryVersionOf, reviewRecordsOf,
 	reclaimStaleReviews, isActiveReviewHold, scopeBlockingLive, REVIEW_STALE_MS, pruneStaleReviews,
 	reviewDispatchOwnershipProblem, setManualDispatchHold, releaseManualDispatchHold,
 	isMetadataSettlementTransition, decideCancelAction, validateSteerTarget, amendTask, formatHolderRejection, preserveManualDispatchOnReadyReturn, decideReviewPolicy,
+	extractStructuredEvidence, mergeStructuredEvidence, prunableReportArtifacts, drainSettlementAllowed, REPORT_INLINE_CLIP,
 	type WorkTask, type WorkLedger,
 } from "../team-ledger.ts";
 import { parseReviewReport } from "../team-review.ts";
@@ -247,6 +248,10 @@ export interface TeamState {
 	budgetOverrideUSD: number | null;
 	/** Legacy state compatibility only; always true. No command can re-enable retired limits. */
 	limitsOff: boolean;
+	/** Batch 2 §2.4: drain mode (/team drain). While set, the scheduler and team_dispatch launch NO new
+	 *  work — in-flight children finish normally so the user can inspect or stop cleanly. Cleared by
+	 *  /team resume (or /team on). Optional reason/at are display-only. */
+	draining?: { at: string; reason?: string };
 	/** 本扩展是否实际切换过主模型；旧会话缺失该字段时按 prevModel 推断，供 /team off 兼容恢复。 */
 	modeModelApplied: boolean;
 }
@@ -1377,6 +1382,17 @@ export function validateGoalAudit(goal: GoalState, input: GoalAuditInput): GoalA
 }
 
 /** 记录 CP 审核结论，推进轮次；新记录固定 auditor=main-cp。 */
+// Batch 2 §2.3: nextTasks must stay compact. Previously reconcileBacklog copied EVERY non-terminal
+// task title verbatim (hundreds of KB on long-running boards) and goalContinuePrompt emitted them
+// untrimmed, bloating every continue prompt. Cap stored entries, trim titles, keep an overflow marker.
+export const GOAL_NEXT_TASKS_MAX = 12;
+export const GOAL_NEXT_TASK_TITLE_CHARS = 120;
+export function compactNextTaskTitles(titles: string[]): string[] {
+	const trimmed = titles.map(t => t.length > GOAL_NEXT_TASK_TITLE_CHARS ? `${t.slice(0, GOAL_NEXT_TASK_TITLE_CHARS)}…` : t);
+	if (trimmed.length <= GOAL_NEXT_TASKS_MAX) return trimmed;
+	return [...trimmed.slice(0, GOAL_NEXT_TASKS_MAX), `(+${trimmed.length - GOAL_NEXT_TASKS_MAX} more open tasks — see team ledger)`];
+}
+
 export function applyAudit(
 	goal: GoalState,
 	input: { verdict: Verdict; summary: string; nextTasks?: string[]; evidence?: string[]; acceptanceMet?: string[] },
@@ -1401,7 +1417,7 @@ export function applyAudit(
 		rounds: round,
 		audits: [...goal.audits, audit].slice(-30),
 		// Stage audits append work; omitted nextTasks must never erase older obligations.
-		nextTasks: input.verdict === "GOAL_COMPLETE" ? [] : [...new Set([...goal.nextTasks, ...audit.nextTasks])],
+		nextTasks: input.verdict === "GOAL_COMPLETE" ? [] : compactNextTaskTitles([...new Set([...goal.nextTasks, ...audit.nextTasks])]),
 		updatedAt: now,
 		lastProgressAt: now,
 		stalls: 0,
@@ -1435,8 +1451,8 @@ export function goalContinuePrompt(state: TeamState, cfg: TeamConfig): string {
 		`总目标：${goal.objective}`,
 		goal.acceptance.length > 0 ? `验收条件：${goal.acceptance.map((a, i) => `${i + 1}) ${a}`).join(" ")}` : "验收条件：未显式列出，按总目标判断",
 		`当前轮次：${goal.rounds}（无轮数上限）`,
-		last ? `上轮主会话 CP 结论：${last.verdict} — ${last.summary}` : "尚未有主会话 CP 审核结论",
-		goal.nextTasks.length > 0 ? `本轮待执行：${goal.nextTasks.map((t) => `• ${t}`).join(" ")}` : "本轮待执行：按总目标差距继续分工（常规实现→bridges，有界分析/复审/难实现→booker 可直接派，测试→ayton，文档→cameron）",
+		last ? `上轮主会话 CP 结论：${last.verdict} — ${last.summary.length > 300 ? `${last.summary.slice(0, 300)}…` : last.summary}` : "尚未有主会话 CP 审核结论",
+		goal.nextTasks.length > 0 ? `本轮待执行：${goal.nextTasks.slice(0, 12).map((t) => `• ${t}`).join(" ")}${goal.nextTasks.length > 12 ? ` (+${goal.nextTasks.length - 12} more in ledger)` : ""}` : "本轮待执行：按总目标差距继续分工（常规实现→bridges，有界分析/复审/难实现→booker 可直接派，测试→ayton，文档→cameron）",
 		"主会话就是 CP（parent）：全局决策、规划、DAG、调度与最终验收都在主会话；子 cp 只是可选第二意见/consultant，不是每轮必需，也不作为派活前置。",
 		"要求：先核对实际产物和证据（不要采信口头声明），再把任务派给合适的 Worker；能并行的并行；优先用 resume 复用原 Worker 会话。",
 		buildParallelWorktreePolicy(),
@@ -2717,7 +2733,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 	function setStatusText(ctx: ExtensionContext): void {
 		if (!ctx.hasUI) return;
-		const label = state.enabled ? `TEAM CP ${state.mode} main:${cfg.mainModelPolicy}` : "TEAM off";
+		const label = state.enabled ? `TEAM CP ${state.mode} main:${cfg.mainModelPolicy}${state.draining ? " DRAIN" : ""}` : "TEAM off";
 		const calls = `cp ${state.calls.cp} bk ${state.calls.booker} · 无额度/并发上限`;
 		const goal = state.goal ? ` 已审核${state.goal.rounds}轮` : "";
 		const paused = Object.keys(state.unavailable ?? {}).length > 0 ? " ⚠︎" : "";
@@ -3206,6 +3222,11 @@ export default function teamExtension(pi: ExtensionAPI): void {
 						exists: existsSync,
 						readFile: (path) => { try { return readFileSync(path, "utf8"); } catch { return null; } },
 						observedCommands: probe.observedCommands,
+						observedFailures: probe.observedFailedCommands,
+						// rework-M1: worker-side harness-observed commands from the worker's structured
+						// evidence are preferred over plain prose — a citation matching one verifies
+						// with [worker-observed] attribution instead of falling to unverifiable.
+						workerObservedCommands: (workerTask.structuredEvidence?.commands ?? []).map(row => row.command),
 					});
 					let verdict = parsed.verdict;
 					const reasons = [...parsed.reasons];
@@ -3243,11 +3264,56 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					writeLease(task);
 					dirty = true;
 				} else {
-					const clippedReport = resolvedReportText.trim().slice(0, 6000);
+					const fullReportText = resolvedReportText.trim();
+					// Batch 2 §2.1: a report beyond the inline clipping budget is never silently truncated —
+					// the tail lives in a durable artifact file and the reference stays in evidence.
+					let fullReportPath: string | undefined;
+					if (fullReportText.length > REPORT_INLINE_CLIP) {
+						try {
+							const reportsDir = join(agentDir(), "team-reports");
+							mkdirSync(reportsDir, { recursive: true });
+							const file = join(reportsDir, `${task.id}-${task.runId ?? "run"}-${Date.now()}.md`);
+							writeFileSync(file, fullReportText, "utf8");
+							fullReportPath = file;
+						} catch (err) {
+							console.error(`[REPORT_PERSIST_FAILED] ${task.id}`, err instanceof Error ? err.message : String(err));
+							// rework-L1 fix: a failed durable persist must surface in evidence — otherwise the
+							// tail is silently truncated exactly in the failure case §2.1 exists to prevent.
+							const failLine = `[REPORT_PERSIST_FAILED] ${task.id}: full report (${fullReportText.length} chars) could not be stored to disk (${err instanceof Error ? err.message : String(err)}); inline copy clipped to ${REPORT_INLINE_CLIP} chars — tail LOST. Rerun the command or inspect the child session log.`;
+							if (!(task.evidence ?? []).some(e => typeof e === "string" && e.startsWith("[REPORT_PERSIST_FAILED]"))) {
+								task.evidence = [failLine, ...(task.evidence ?? [])].slice(0, 4);
+								dirty = true;
+							}
+						}
+					}
+					const clippedReport = fullReportText.slice(0, REPORT_INLINE_CLIP);
 					if (clippedReport) {
 						const prev = task.evidence ?? [];
 						if (prev[0] !== clippedReport) {
 							task.evidence = [clippedReport, ...prev.filter(e => e !== clippedReport)].slice(0, 3);
+							dirty = true;
+						}
+					}
+					// Batch 2 §2.1: first-class structured evidence extracted from the FULL report text,
+					// never the clipped copy, so the tail's verification commands survive inline clipping.
+					if (fullReportText) {
+						const refs = collectEvidenceRefs(fullReportText, task.worktreePath || (ctx as any)?.cwd || process.cwd());
+						const extracted = extractStructuredEvidence(fullReportText, refs, {
+							observedCommands: probe.observedCommands,
+							observedFailures: probe.observedFailedCommands,
+							fullReportPath,
+						});
+						if (extracted.commands.length || extracted.artifacts.length || extracted.fullReportPath) {
+							task.structuredEvidence = mergeStructuredEvidence(task.structuredEvidence, extracted);
+							if (fullReportPath && !(task.evidence ?? []).some(e => typeof e === "string" && e.includes(fullReportPath!))) {
+								// R1(rework-H1) fix: the durable artifact pointer must NEVER be dropped by the
+								// bounding slice. Stale artifact lines are removed first and the newest pointer
+								// is pinned right behind the inline copy (index ≤ 1) so slice(0, 4) always keeps it.
+								const artifactLine = `Full report stored at artifact: ${fullReportPath} (${fullReportText.length} chars; inline copy clipped to ${REPORT_INLINE_CLIP})`;
+								const withoutStale = (task.evidence ?? []).filter(e => typeof e !== "string" || !e.startsWith("Full report stored at artifact: "));
+								withoutStale.splice(Math.min(1, withoutStale.length), 0, artifactLine);
+								task.evidence = withoutStale.slice(0, 4);
+							}
 							dirty = true;
 						}
 					}
@@ -3334,7 +3400,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		return Infinity;
 	}
 	function reconcileBacklog(): void {
-		if (state.goal) state.goal.nextTasks = board().tasks.filter(t => !terminalWork(t.status)).map(t => t.title);
+		if (state.goal) state.goal.nextTasks = compactNextTaskTitles(board().tasks.filter(t => !terminalWork(t.status)).map(t => t.title));
 	}
 	function worktreeTransportProblem(task: WorkTask | undefined, resumeId?: string, ctx = ctxStore.current): string | undefined {
 		if (!task?.worktreeOwned || task.isolation !== "worktree" || !task.worktreePath) return;
@@ -3683,7 +3749,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				};
 			}
 			const ready = allReadyTasksToDispatch();
-			if (ready.length > 0) {
+			// Batch 2 §2.4: drain mode relaxes the yield pressure — no new dispatch is allowed, so the
+			// parent may legitimately end its turn while in-flight children settle.
+			if (ready.length > 0 && !state.draining) {
 				const sample = ready.slice(0, 6).map(t => `${t.id}(${t.role})`).join(", ");
 				const extra = ready.length > 6 ? ` (+${ready.length - 6} more)` : "";
 				return {
@@ -3937,6 +4005,12 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 	async function schedulerPump(ctx: any, maxSlots = 20): Promise<{ launched: string[]; errors: string[]; backfillCount: number }> {
 		if (!state.enabled || isSubagentSession) return { launched: [], errors: [], backfillCount: 0 };
+		// Batch 2 §2.4 + rework-H2 fix: drain mode blocks NEW backlog work but must never stall
+		// settlement of work already in flight. A reviewer spawned for a worker that was running
+		// when it delivered is part of that worker's own lifecycle, so settlement tasks still pump.
+		// Instead of an early return we narrow the launch set below (drainSettlementOnly). Explicit
+		// team_dispatch remains fully gated and the yield pressure is relaxed — net effect per the
+		// documented contract: in-flight work finishes and settles; nothing NEW starts.
 		syncLiveRoleConfig(ctx);
 		if (hasHostTools() && !toolLauncher) return { launched: [], errors: [], backfillCount: 0 }; // Wait for real host tool context; never launch an invisible CLI replacement.
 		if (agentToolUnavailable) return { launched: [], errors: ["Agent tool unavailable for programmatic dispatch (model-only host)"], backfillCount: 0 };
@@ -3952,7 +4026,15 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 			autoProvisionWorktreesForReadyTasks(ctx);
 			const batch = schedulableBatch();
-			const toLaunch = batch.slice(0, Math.min(available, maxSlots));
+			// rework-H2: under drain, only settlement tasks launch — review slots whose parent worker is
+			// itself mid-flight (running/reviewing/reported/uncertain). Brand-new W-* work stays parked.
+			const drainFiltered = state.draining
+				? batch.filter(t => drainSettlementAllowed(t, board()))
+				: batch;
+			if (state.draining && drainFiltered.length === 0) {
+				return { launched: [], errors: [`draining since ${state.draining.at} — /team resume to continue dispatching`], backfillCount: 0 };
+			}
+			const toLaunch = drainFiltered.slice(0, Math.min(available, maxSlots));
 			const launched: string[] = [];
 			const errors: string[] = [];
 			let mutated = false;
@@ -4213,6 +4295,30 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				pruneOrphanSidecars: opts.pruneOrphanSidecars,
 				dryRun,
 			});
+			// Batch 2 spec §2.1 / review M2: prune orphaned team-reports artifacts. A report file is
+			// prunable ONLY when no non-terminal task references it (the referencedReportArtifacts
+			// guard) — referenced evidence is never deleted, by construction. Non-destructive unless
+			// mode === "delete"; in archive mode files are left in place and only reported.
+			try {
+				const reportsDir = join(agentDir(), "team-reports");
+				if (existsSync(reportsDir)) {
+					const entries = readdirSync(reportsDir)
+						.filter(name => name.endsWith(".md"))
+						.map(name => {
+							const full = join(reportsDir, name);
+							try { return { path: full, mtimeMs: statSync(full).mtimeMs }; } catch { return null; }
+						})
+						.filter((e): e is { path: string; mtimeMs: number } => Boolean(e));
+					const prunable = prunableReportArtifacts(board(), entries);
+					if (!dryRun && opts.mode === "delete") {
+						for (const p of prunable) { try { unlinkSync(p); } catch {} }
+					}
+					if (prunable.length && res) {
+						(res as any).reportArtifactsPrunable = prunable.length;
+						(res as any).reportArtifactsPruned = !dryRun && opts.mode === "delete" ? prunable.length : 0;
+					}
+				}
+			} catch {}
 			if (!dryRun && !opts.includeInactiveParents && opts.mode !== "delete") lastChildGcAt = now;
 			return res;
 		} catch {
@@ -4347,7 +4453,19 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		return { report, appliedFixes };
 	}
 
-	function currentLedgerPrompt(): string { return ledgerPrompt(board(), freeSlots(), schedulableBatch()); }
+	// Batch 2 §2.3: inject the full static policy text once per session; later injections pass
+	// compact:true so the ~45 identical hard-rule lines do not re-bill on every team_tasks call.
+	// Security framing (ledger header + user-text-as-DATA), coverage, queue and batch stay verbatim.
+	// rework-M3: session_policy_verbose config (team.config.json → cfg.sessionPolicyVerbose) forces
+	// every injection to carry the full static policy — the escape hatch for sessions where repeated
+	// compaction can strand the parent without the full review-policy/brake fine print.
+	let fullPolicyInjected = false;
+	function currentLedgerPrompt(opts?: { forceFull?: boolean }): string {
+		const verbose = Boolean((cfg as any).sessionPolicyVerbose ?? (cfg as any).session_policy_verbose);
+		const compact = !verbose && fullPolicyInjected && !opts?.forceFull;
+		fullPolicyInjected = true;
+		return ledgerPrompt(board(), freeSlots(), schedulableBatch(), { compact });
+	}
 
 	interface KnownSession {
 		sessionId: string;
@@ -4658,7 +4776,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 	function statusText(): string {
 		const lines: string[] = [];
-		lines.push(`工作流：${state.enabled ? "已启用" : "未启用"}　模式：${state.mode}`);
+		lines.push(`工作流：${state.enabled ? "已启用" : "未启用"}　模式：${state.mode}${state.draining ? `　🛑 DRAIN（${state.draining.at}${state.draining.reason ? `：${state.draining.reason}` : ""}）— 不再派发新任务，/team resume 恢复` : ""}`);
 		lines.push(`角色：Head Coach=主会话 parent（总控/拆解/DAG/调度/终验）；cp (CP)=独立评审/架构仲裁；booker=核心攻坚；bridges=常规实现/侦察/集成；ayton=全能测试/实机QA；cameron=构建打包/部署/发布文档`);
 		lines.push(`主模型策略：${cfg.mainModelPolicy}（preserve=保持当前模型/思考等级；mode=旧行为按模式切换）`);
 		if (state.startedAt) lines.push(`启用时间：${state.startedAt}`);
@@ -4804,7 +4922,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		if (!state.enabled || isSubagentSession || event.source === "extension" || !event.text.trim()) return;
 		if (event.text.trim().startsWith("/")) return;
 		const ledger = board();
-		const receipt = addRequest(ledger, event.text, `input:Q-${ledger.nextRequest}`);
+		// Batch 2 §2.4: classify chatter vs work. Feedback is absorbed as a visible, non-blocking note
+		// (kind:"feedback") — it never enters the obligation backlog and never blocks completion.
+		const kind = classifyUserInput(event.text) === "feedback" ? "feedback" : "user";
+		const receipt = addRequest(ledger, event.text, `input:Q-${ledger.nextRequest}`, kind);
 		(ledger.pendingInputIds ??= []).push(receipt.id); persist();
 	});
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -4817,7 +4938,13 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			const internal = (ledger.pendingInternalPrompts ?? []).indexOf(event.prompt);
 			if (captured >= 0) ledger.pendingInputIds!.splice(captured, 1);
 			else if (internal >= 0) ledger.pendingInternalPrompts!.splice(internal, 1);
-			else addRequest(ledger, event.prompt, `prompt:Q-${ledger.nextRequest}`);
+			else {
+				// rework-M4 fix: RPC/SDK prompts bypass the input hook but must obey the SAME
+				// classification contract — feedback here is absorbed as a non-blocking note,
+				// never re-queued as work by the fallback path.
+				const fallbackKind = classifyUserInput(event.prompt) === "feedback" ? "feedback" : "user";
+				addRequest(ledger, event.prompt, `prompt:Q-${ledger.nextRequest}`, fallbackKind);
+			}
 			persist();
 		}
 		const inlineNotices: InlineSubagentNotice[] = [];
@@ -5527,7 +5654,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					readPaths: { type: "array", items: { type: "string" } }, writePaths: { type: "array", items: { type: "string" } },
 					acceptance: { type: "array", items: { type: "string" } },
 					brief: { type: "string", description: "Optional mutable working brief injected into dispatch/resume prompts. Acceptance remains the hard verification contract; amend briefs via action \"amend\"." },
-					reviewTier: { type: "string", enum: ["deterministic", "llm", "none"], description: "Unset: Ayton (QA/real-device) & Cameron (Release/Ops/Docs) default review-exempt; Booker & Bridges default CP review. none: explicit waiver for bounded analysis or small single-file/non-decision tasks. llm: independent CP review. deterministic: existing ALL machine assertions gate with autoAccept:true (the only automatic settlement route). Exemption skips the reviewer child but the parent still accepts the reported delivery. Existing reviewer obligations are preserved." },
+					reviewTier: { type: "string", enum: ["deterministic", "llm", "none", "advisory"], description: "advisory: independent feedback through the same reviewer lane but NEVER gates settlement (verdict recorded verbatim, worker stays reported). Unset: Ayton (QA/real-device) & Cameron (Release/Ops/Docs) default review-exempt; Booker & Bridges default CP review. none: explicit waiver for bounded analysis or small single-file/non-decision tasks. llm: independent CP review. deterministic: existing ALL machine assertions gate with autoAccept:true (the only automatic settlement route). Exemption skips the reviewer child but the parent still accepts the reported delivery. Existing reviewer obligations are preserved." },
 					autoAccept: { type: "boolean", description: "false requests review even for exempt roles; true is required for deterministic machine acceptance, but not for Ayton/Cameron defaults or reviewTier:none. Never bypasses evidence or existing CP holds. NOTE: reviewTier:\"none\" takes precedence over autoAccept:false (no reviewer spawns; the delivery stays reported until the parent explicitly settles done) — use reviewerRole or reviewTier:\"llm\" to force review on an exempt-tier task." },
 					reviewerRole: { type: "string", description: "Explicit independent reviewer request disables role-based review exemption; defaults do not populate this field. Reviewer must remain independent of implementer." },
 					splitWaiverReason: { type: "string", description: "Optional brief justification ONLY when a task genuinely cannot be split into <= 3 ACs, <= 5 writePaths, or concrete non-directory slices." },
@@ -5856,7 +5983,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					}
 				}
 				const responseText = params.action === "archive" ? archivePrompt(board()) : currentLedgerPrompt();
-				const extra = autoDispatched.length > 0 ? `\n\n[TEAM SCHEDULER] Auto-dispatched ${autoDispatched.length} subagents: ${autoDispatched.join(", ")}.` : "";
+				const drainNote = state.draining ? `\n\n[DRAIN MODE ACTIVE since ${state.draining.at}] No new tasks will launch (auto-dispatch and team_dispatch gated); in-flight children settle normally. /team resume or clear draining to continue.` : "";
+				const extra = (autoDispatched.length > 0 ? `\n\n[TEAM SCHEDULER] Auto-dispatched ${autoDispatched.length} subagents: ${autoDispatched.join(", ")}.` : "") + drainNote;
 				const curBoard = board();
 				const boardBytes = curBoard.tasks.length > 60 ? Infinity : Buffer.byteLength(JSON.stringify(curBoard));
 				const compactDetails = curBoard.tasks.length > 60
@@ -5872,8 +6000,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 						},
 						dispatchable: schedulableBatch().map(t => t.id),
 						autoDispatched,
+						draining: state.draining ?? null,
 					}
-					: { ledger: structuredClone(curBoard), dispatchable: schedulableBatch().map(t => t.id), autoDispatched };
+					: { ledger: structuredClone(curBoard), dispatchable: schedulableBatch().map(t => t.id), autoDispatched, draining: state.draining ?? null };
 				return { content: [{ type: "text" as const, text: `${responseText}${pruneSummary}${extra}` }], details: detailsPayload };
 			} catch (error) {
 				return { content: [{ type: "text" as const, text: `team_tasks rejected; ledger unchanged: ${error instanceof Error ? error.message : String(error)}` }], isError: true, details: {} };
@@ -5895,6 +6024,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		async execute(_id, rawParams, _sig, _up, ctx) {
 			captureToolLauncher(ctx);
 			if (!state.enabled || isSubagentSession) return { content: [{ type: "text" as const, text: "Only the enabled main CP parent can run team_dispatch." }], isError: true, details: {} };
+			// Batch 2 §2.4: drain mode gates explicit dispatch too; in-flight work is untouched.
+			if (state.draining) return { content: [{ type: "text" as const, text: `Drain mode active since ${state.draining.at}${state.draining.reason ? ` (${state.draining.reason})` : ""}: NO new tasks may launch. In-flight children finish normally. Run /team resume to continue dispatching.` }], isError: true, details: {} };
 			const params = (rawParams && typeof rawParams === "object" ? rawParams : {}) as { maxTasks?: number };
 			const maxTasks = typeof params.maxTasks === "number" && params.maxTasks > 0 ? params.maxTasks : 20;
 			// team_dispatch is an explicit release of every pending per-task manual hold.
@@ -6159,7 +6290,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				return null;
 			}
 
-			const items = ["help", "on", "off", "new", "status", "doctor", "doctor --fix", "check-update", "update", "model", "model list", "model help", "models", "tasks", "tasks archive", "tasks move", "dispatch", "solo delegated", "solo allow", "reconcile", "unpause", "gc", "gc --all", "gc --worktrees", "prune-reviews", "log", "reset", "goal", "goal status", "goal edit", "goal clear", "goal resume", "goal stop", "mode economy", "mode strict", "budget", "limits"]
+			const items = ["help", "on", "off", "new", "status", "doctor", "doctor --fix", "check-update", "update", "model", "model list", "model help", "models", "tasks", "tasks archive", "tasks move", "dispatch", "solo delegated", "solo allow", "reconcile", "unpause", "gc", "gc --all", "gc --worktrees", "prune-reviews", "log", "reset", "goal", "goal status", "goal edit", "goal clear", "goal resume", "goal stop", "drain", "resume", "mode economy", "mode strict", "budget", "limits"]
 				.filter((v) => v.startsWith(prefix.trim()))
 				.map((v) => ({ value: v, label: v }));
 			return items.length > 0 ? items : null;
@@ -6343,6 +6474,31 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				} else {
 					ctx.ui.notify(err ? `工作流已启用，但模型切换失败：${err}` : `工作流已启用（${state.mode}），mainModelPolicy=mode：主会话模型按旧行为切换。`, err ? "warning" : "info");
 				}
+				return;
+			}
+
+			if (sub === "drain") {
+				if (isSubagentSession) { ctx.ui.notify("drain 只能由主会话控制。", "warning"); return; }
+				if (state.draining) {
+					ctx.ui.notify(`Drain mode already active since ${state.draining.at} — in-flight children finish, nothing new launches. /team resume to continue.`, "info");
+					return;
+				}
+				state.draining = { at: new Date().toISOString(), reason: rest.join(" ").trim() || undefined };
+				persist();
+				ctx.ui.notify(`🛑 Drain mode active: in-flight children finish normally but NO new tasks will launch (scheduler + team_dispatch gated). Use /team resume to continue dispatching.`, "info");
+				return;
+			}
+
+			if (sub === "resume") {
+				if (isSubagentSession) { ctx.ui.notify("resume 只能由主会话控制。", "warning"); return; }
+				if (!state.draining) {
+					ctx.ui.notify("Drain mode is not active — nothing to resume.", "info");
+					return;
+				}
+				delete state.draining;
+				persist();
+				ensureSchedulerDaemon(ctx);
+				ctx.ui.notify("▶️ Drain mode cleared — dispatching resumed. The scheduler will backfill ready tasks.", "info");
 				return;
 			}
 

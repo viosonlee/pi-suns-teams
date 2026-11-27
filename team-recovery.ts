@@ -172,6 +172,8 @@ export interface RecoveryDerivation {
 	nativeReportText?: string;
 	/** Bash commands actually executed (with toolResult) in the child's active branch for this attempt. */
 	observedCommands?: string[];
+	/** Bash commands whose completed toolResult carried isError — authoritative nonzero exits. */
+	observedFailedCommands?: string[];
 	/**
 	 * Terminal evidence observed for this attempt. Present only when the derivation
 	 * itself classified a terminal state; an unbound marker never becomes terminal
@@ -221,6 +223,7 @@ export interface RecoveryReadResult {
 	report?: RecoveredReport;
 	nativeReportText?: string;
 	observedCommands?: string[];
+	observedFailedCommands?: string[];
 	terminal?: TerminalEvidence;
 	cleanExit?: boolean;
 	/** No decisive attempt evidence (unreadable/ambiguous/oversized/truncated/live): claim nothing. */
@@ -584,6 +587,14 @@ export function completedCommandsForHostedReport(entries: SessionEntryLike[], re
 	return index < 0 ? [] : collectObservedCommands(active.branch, index, attemptIdentity({ reportNotBefore }));
 }
 
+/** rework-H4: hosted sibling — harness-observed FAILED commands (isError toolResults) in the attempt window. */
+export function failedCommandsForHostedReport(entries: SessionEntryLike[], reportNotBefore?: string): string[] {
+	const active = buildActiveBranch(entries);
+	if (!active.ok) return [];
+	const index = active.branch.findLastIndex(e => e.type === "message" && e.message?.role === "assistant");
+	return index < 0 ? [] : collectObservedFailedCommands(active.branch, index, attemptIdentity({ reportNotBefore }));
+}
+
 function extractCodemodeCommands(code: string): string[] {
 	const out: string[] = [];
 	const re = /\btools\.bash\s*\(\s*\{\s*command\s*:\s*(["'`])((?:\\.|(?!\1)[\s\S])*?)\1/g;
@@ -597,6 +608,55 @@ function extractCodemodeCommands(code: string): string[] {
 		if (cmd) out.push(cmd);
 	}
 	return out;
+}
+
+// rework-H4: collect harness-observed FAILED command executions (bash toolResult isError) with the
+// exact same identity-window discipline as collectObservedCommands. Structured evidence prefers these
+// authoritative nonzero exits over any prose claim.
+export function collectObservedFailedCommands(branch: SessionEntryLike[], reportIndex: number, identity: AttemptIdentity): string[] {
+	const completedCallIds = new Set<string>();
+	const failedCallIds = new Set<string>();
+	for (let i = 0; i <= reportIndex; i += 1) {
+		const entry = branch[i];
+		if (entry.type === "message" && isObject(entry.message) && entry.message.role === "toolResult") {
+			const id = toolResultCallId(entry.message);
+			if (id) {
+				completedCallIds.add(id);
+				if (entry.message.isError === true) failedCallIds.add(id);
+			}
+		}
+	}
+	const commands: string[] = [];
+	const seen = new Set<string>();
+	const pushCmd = (raw: string | undefined) => {
+		const trimmed = raw?.trim();
+		if (trimmed && !seen.has(trimmed)) {
+			seen.add(trimmed);
+			commands.push(trimmed);
+		}
+	};
+	for (let i = 0; i <= reportIndex; i += 1) {
+		const entry = branch[i];
+		if (entry.type !== "message" || !isObject(entry.message) || entry.message.role !== "assistant") continue;
+		if (identityRequested(identity)) {
+			const at = entryTimeMs(entry);
+			if (identity.cutoffInvalid || at === undefined) continue;
+			if (identity.cutoff !== undefined && at < identity.cutoff) continue;
+		}
+		const content = Array.isArray(entry.message.content) ? entry.message.content : [];
+		for (const block of content) {
+			if (!isObject(block) || block.type !== "toolCall") continue;
+			const name = asString(block.name)?.toLowerCase();
+			const callId = asString(block.id);
+			const args = isObject(block.arguments) ? block.arguments : undefined;
+			if (name === "bash") {
+				// Only an errored completed bash result is an authoritative nonzero exit.
+				if (!callId || !completedCallIds.has(callId) || !failedCallIds.has(callId)) continue;
+				pushCmd(asString(args?.command) ?? asString(args?.cmd));
+			}
+		}
+	}
+	return commands;
 }
 
 function collectObservedCommands(branch: SessionEntryLike[], reportIndex: number, identity: AttemptIdentity): string[] {
@@ -811,6 +871,8 @@ export function deriveRecoveredReport(
 	}
 
 	const observedCommands = collectObservedCommands(branch, reportIndex, identity);
+	// rework-H4: authoritative nonzero exits (bash toolResult isError) travel beside the clean list.
+	const observedFailedCommands = collectObservedFailedCommands(branch, reportIndex, identity);
 
 	// Post-report activity was located above (before any terminal inference). Only
 	// markers attributable to this attempt can be terminal evidence: an unbound or
@@ -856,6 +918,7 @@ export function deriveRecoveredReport(
 				terminal: { ...markerBase, boundToAttempt: true, clean: true },
 				cleanExit: true,
 				...(observedCommands.length ? { observedCommands } : {}),
+			...(observedFailedCommands.length ? { observedFailedCommands } : {}),
 			};
 		}
 		if (markerNormalized === "running" || markerNormalized === "queued") {
@@ -912,6 +975,7 @@ export function deriveRecoveredReport(
 		hostStatus,
 		report,
 		...(observedCommands.length ? { observedCommands } : {}),
+			...(observedFailedCommands.length ? { observedFailedCommands } : {}),
 	};
 }
 
@@ -1416,6 +1480,7 @@ export function recoverChildReport(sessionId: string, options: RecoverChildOptio
 		...(derived.report ? { report: derived.report } : {}),
 		...(derived.nativeReportText ? { nativeReportText: derived.nativeReportText } : {}),
 		...(derived.observedCommands?.length ? { observedCommands: derived.observedCommands } : {}),
+			...(derived.observedFailedCommands?.length ? { observedFailedCommands: derived.observedFailedCommands } : {}),
 		...(derived.terminal ? { terminal: derived.terminal } : {}),
 		...(derived.cleanExit !== undefined ? { cleanExit: derived.cleanExit } : {}),
 		...(derived.uncertain ? { uncertain: true } : {}),
@@ -1499,7 +1564,7 @@ export function probeLiveChildSession(
 	if (res.status === "recovered" && res.report) {
 		// A recovered report is evidence for reporting only: accepted:false and no
 		// terminal-exit proof. `cleanExit` keeps its historical caller contract.
-		return { sessionId, completed: true, failed: false, cleanExit: true, terminalExitProof: false, status: "completed", report: res.report, reportText: res.report.text ?? res.report.content, observedCommands: res.observedCommands, file: res.file, probeLatencyMs };
+		return { sessionId, completed: true, failed: false, cleanExit: true, terminalExitProof: false, status: "completed", report: res.report, reportText: res.report.text ?? res.report.content, observedCommands: res.observedCommands, observedFailedCommands: res.observedFailedCommands, file: res.file, probeLatencyMs };
 	}
 	if (res.status === "native-completed") {
 		const terminal = res.terminal;
@@ -1507,9 +1572,9 @@ export function probeLiveChildSession(
 		if (!bound) {
 			// An unbound native completion (for example a host status with no attempt
 			// window) is an observation, not decisive attempt evidence.
-			return { sessionId, completed: false, failed: false, cleanExit: false, terminalExitProof: false, uncertain: true, status: res.status, reason: res.reason, ...(terminal ? { terminal } : {}), reportText: res.nativeReportText, observedCommands: res.observedCommands, file: res.file, probeLatencyMs };
+			return { sessionId, completed: false, failed: false, cleanExit: false, terminalExitProof: false, uncertain: true, status: res.status, reason: res.reason, ...(terminal ? { terminal } : {}), reportText: res.nativeReportText, observedCommands: res.observedCommands, observedFailedCommands: res.observedFailedCommands, file: res.file, probeLatencyMs };
 		}
-		return { sessionId, completed: true, failed: false, cleanExit: true, terminalExitProof: true, status: "completed", ...(terminal ? { terminal } : {}), reportText: res.nativeReportText, observedCommands: res.observedCommands, file: res.file, probeLatencyMs };
+		return { sessionId, completed: true, failed: false, cleanExit: true, terminalExitProof: true, status: "completed", ...(terminal ? { terminal } : {}), reportText: res.nativeReportText, observedCommands: res.observedCommands, observedFailedCommands: res.observedFailedCommands, file: res.file, probeLatencyMs };
 	}
 	// A terminal failure can settle the attempt only when it is bound to this
 	// attempt. Reason prose is never parsed here.

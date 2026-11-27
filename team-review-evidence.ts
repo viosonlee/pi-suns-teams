@@ -35,6 +35,13 @@ export interface EvidenceIo {
 	readFile?: (absolutePath: string) => string | null;
 	/** Commands the harness actually observed the reviewer running. */
 	observedCommands?: string[];
+	/**
+	 * rework-M1: commands the harness observed the WORKER running during delivery, carried in
+	 * `structuredEvidence.commands` on the worker task. Review-side re-observation is weaker than
+	 * worker-side observation (the reviewer legitimately re-runs nothing sometimes), so citations
+	 * matching these rows verify as `command: <cmd> [worker-observed]`.
+	 */
+	workerObservedCommands?: string[];
 }
 
 export interface EvidenceAudit {
@@ -253,7 +260,11 @@ export function verifyEvidenceRefs(refs: EvidenceRef[], io: EvidenceIo): Evidenc
 	for (const ref of refs) {
 		if (ref.kind === "command") {
 			const cmd = ref.command ?? ref.raw;
+			// rework-M1: prefer harness-verified sources over plain prose. A command observed in the
+			// reviewer's own session verifies; failing that, worker-side harness observation (carried
+			// in the worker task's structured evidence) verifies with explicit attribution.
 			if (observed.length && observed.some(o => sameCommand(o, cmd))) audit.verified.push(`command: ${cmd}`);
+			else if ((io.workerObservedCommands ?? []).some(o => sameCommand(o, cmd))) audit.verified.push(`command: ${cmd} [worker-observed]`);
 			else audit.unverifiable.push(`command not observed in reviewer session: ${cmd}`);
 			continue;
 		}
