@@ -14,7 +14,7 @@ import { existsSync, readFileSync, statSync, readdirSync, unlinkSync, writeFileS
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join, isAbsolute, resolve, relative } from "node:path";
+import { join, isAbsolute, resolve, relative, dirname } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	newLedger, addRequest, addTasks, addBacklog, updateTask, resolveRequest, terminalWork, liveWork, occupiesSlot,
@@ -84,7 +84,7 @@ const TEAM_EXTENSION_PATH = (() => {
 })();
 
 export const DEFAULT_TARGET_CONCURRENCY = 20;
-export const PI_TEAMS_VERSION = "1.2.5";
+export const PI_TEAMS_VERSION = "1.2.6";
 export const PI_TEAMS_REPO_DEFAULT = "viosonlee/pi-suns-teams";
 
 /** Numeric dotted-version comparison (pre-release suffixes ignored). Returns >0 when a > b. */
@@ -942,28 +942,81 @@ export function clearRoleQuotaLock(state: TeamState, role: Role, clearAutoFallba
 	}
 }
 
+const CONFIG_OVERRIDE_SKEW_MS = 1500;
+const AGENT_FILE_OVERRIDE_SKEW_MS = 2000;
+
+export interface ReconcileQuotaOptions {
+	configMtimeMs?: number;
+	roleModelAt?: Partial<Record<Role, number>>;
+	roleThinkingAt?: Partial<Record<Role, number>>;
+	/** True when an already-initialized session detected an external config file update. */
+	externalConfigChanged?: boolean;
+}
+
+export interface StateReplayOptions {
+	configMtimeMs?: number;
+}
+
+export interface StateReplayPreReconcile {
+	roleModel: Partial<Record<Role, string>>;
+	roleThinking: Partial<Record<Role, string>>;
+	unavailable: Partial<Record<Role, string>>;
+	unavailableModel: Partial<Record<Role, string>>;
+	unavailableAt: Partial<Record<Role, number>>;
+	autoFallbackBase: Partial<Record<Role, string>>;
+	fallbackTried: Partial<Record<Role, number>>;
+}
+
 export function reconcileQuotaState(
 	state: TeamState,
 	cfg: TeamConfig,
 	lastUnavailableEntryAt: Partial<Record<Role, number>> = {},
 	nowMs: number = Date.now(),
-): void {
+	options: ReconcileQuotaOptions = {},
+): boolean {
+	let changed = false;
+	const cfgMtimeMs = options.configMtimeMs;
+	const hasCfgMtime = typeof cfgMtimeMs === "number" && Number.isFinite(cfgMtimeMs);
+
 	for (const role of ROLES) {
+		const thinkingAt = options.roleThinkingAt?.[role];
+		const thinkingNewerOnDisk = hasCfgMtime && typeof thinkingAt === "number" && Number.isFinite(thinkingAt)
+			&& cfgMtimeMs > thinkingAt + CONFIG_OVERRIDE_SKEW_MS;
+		const externalThinkingDiff = Boolean(options.externalConfigChanged && state.roleThinking?.[role] !== cfg.roles[role]?.thinking);
+		if (state.roleThinking && state.roleThinking[role] !== undefined && (thinkingNewerOnDisk || externalThinkingDiff)) {
+			delete state.roleThinking[role];
+			changed = true;
+		}
+
 		const fallbackBase = state.autoFallbackBase?.[role];
 		if (fallbackBase && cfg.roles[role]?.model && cfg.roles[role].model !== fallbackBase) {
 			clearRoleQuotaLock(state, role, true);
+			changed = true;
 			continue;
 		}
+
+		const modelAt = options.roleModelAt?.[role];
+		const sessionModel = state.roleModel?.[role];
+		const modelNewerOnDisk = hasCfgMtime && typeof modelAt === "number" && Number.isFinite(modelAt)
+			&& cfgMtimeMs > modelAt + CONFIG_OVERRIDE_SKEW_MS;
+		const externalModelDiff = Boolean(options.externalConfigChanged && cfg.roles[role]?.model && sessionModel !== cfg.roles[role].model);
+		if (sessionModel && !fallbackBase && (modelNewerOnDisk || externalModelDiff)) {
+			delete state.roleModel[role];
+			changed = true;
+		}
+
 		if (!state.unavailable?.[role]) continue;
 		const effectiveModel = state.roleModel?.[role] || cfg.roles[role]?.model;
 		const pausedModel = state.unavailableModel?.[role];
 		if (pausedModel && effectiveModel && effectiveModel !== pausedModel) {
 			clearRoleQuotaLock(state, role, false);
+			changed = true;
 			continue;
 		}
 		const pausedAt = state.unavailableAt?.[role];
 		if (typeof pausedAt === "number" && Number.isFinite(pausedAt) && (nowMs - pausedAt) >= DEFAULT_UNAVAILABLE_COOLDOWN_MS) {
 			clearRoleQuotaLock(state, role, false);
+			changed = true;
 			continue;
 		}
 		// Legacy (< v1.2.3) pause state with no unavailableModel/unavailableAt:
@@ -971,25 +1024,56 @@ export function reconcileQuotaState(
 		// or the legacy pause entry is older than the cooldown window.
 		if (!pausedModel && pausedAt === undefined) {
 			const fallbacks = cfg.fallbacks?.[role] ?? [];
-			const explicitSwitched = Boolean(state.roleModel?.[role] && !fallbacks.includes(state.roleModel[role]!));
+			const explicitSwitched = Boolean(state.roleModel?.[role] && !fallbacks.includes(state.roleModel[role]!))
+				|| Boolean(!state.roleModel?.[role] && cfg.roles[role]?.model && !fallbacks.includes(cfg.roles[role].model!));
 			const legacyEntryAt = lastUnavailableEntryAt[role];
 			const legacyExpired = typeof legacyEntryAt === "number" && Number.isFinite(legacyEntryAt) && (nowMs - legacyEntryAt) >= DEFAULT_UNAVAILABLE_COOLDOWN_MS;
 			if (explicitSwitched || legacyExpired) {
 				clearRoleQuotaLock(state, role, false);
+				changed = true;
 			}
 		}
 	}
+	return changed;
 }
 
-export function stateFromEntries(entries: unknown, cfg: TeamConfig, nowMs: number = Date.now()): { state: TeamState; runs: RunRecord[] } {
+export function stateFromEntries(
+	entries: unknown,
+	cfg: TeamConfig,
+	nowMs: number = Date.now(),
+	options: StateReplayOptions = {},
+): {
+	state: TeamState;
+	runs: RunRecord[];
+	roleModelAt: Partial<Record<Role, number>>;
+	roleThinkingAt: Partial<Record<Role, number>>;
+	reconciled: boolean;
+	preReconcile?: StateReplayPreReconcile;
+} {
 	let state = initialState(cfg);
 	const runs: RunRecord[] = [];
 	const lastUnavailableEntryAt: Partial<Record<Role, number>> = {};
+	const roleModelAt: Partial<Record<Role, number>> = {};
+	const roleThinkingAt: Partial<Record<Role, number>> = {};
+	const trackRoleConfigChanges = (prevModel: Partial<Record<Role, string>>, prevThinking: Partial<Record<Role, string>> | undefined, entryMs: number) => {
+		const stamp = Number.isFinite(entryMs) ? entryMs : 0;
+		for (const role of ROLES) {
+			const nextM = state.roleModel?.[role];
+			if (!nextM) delete roleModelAt[role];
+			else if (nextM !== prevModel?.[role]) roleModelAt[role] = stamp;
+
+			const nextT = state.roleThinking?.[role];
+			if (!nextT) delete roleThinkingAt[role];
+			else if (nextT !== prevThinking?.[role]) roleThinkingAt[role] = stamp;
+		}
+	};
 	for (const entry of Array.isArray(entries) ? entries : []) {
 		const e = entry as { type?: string; customType?: string; timestamp?: string; data?: unknown };
 		if (e?.type !== "custom") continue;
 		const entryMs = typeof e.timestamp === "string" ? Date.parse(e.timestamp) : NaN;
 		if (e.customType === "team-state" && e.data && typeof e.data === "object") {
+			const prevModel = state.roleModel;
+			const prevThinking = state.roleThinking;
 			const saved = structuredClone(e.data) as Partial<TeamState>;
 			state = {
 				...initialState(cfg),
@@ -1011,14 +1095,18 @@ export function stateFromEntries(entries: unknown, cfg: TeamConfig, nowMs: numbe
 				modeModelApplied: saved.modeModelApplied === true
 					|| (saved.modeModelApplied === undefined && typeof saved.prevModel === "string" && saved.prevModel.length > 0),
 			};
+			trackRoleConfigChanges(prevModel, prevThinking, entryMs);
 			for (const role of ROLES) {
 				if (state.unavailable?.[role] && Number.isFinite(entryMs)) lastUnavailableEntryAt[role] = entryMs;
 				else if (!state.unavailable?.[role]) delete lastUnavailableEntryAt[role];
 			}
 		}
 		if (e.customType === "team-state-delta" && e.data && typeof e.data === "object") {
+			const prevModel = state.roleModel;
+			const prevThinking = state.roleThinking;
 			const delta = e.data as TeamStateDelta;
 			state = applyStateDelta(state, delta, cfg);
+			trackRoleConfigChanges(prevModel, prevThinking, entryMs);
 			const topUnavail = delta.top?.unavailable;
 			if (topUnavail && typeof topUnavail === "object") {
 				for (const role of ROLES) {
@@ -1034,9 +1122,22 @@ export function stateFromEntries(entries: unknown, cfg: TeamConfig, nowMs: numbe
 			runs.push(e.data as RunRecord);
 		}
 	}
-	reconcileQuotaState(state, cfg, lastUnavailableEntryAt, nowMs);
+	const preReconcile: StateReplayPreReconcile = structuredClone({
+		roleModel: state.roleModel,
+		roleThinking: state.roleThinking ?? {},
+		unavailable: state.unavailable,
+		unavailableModel: state.unavailableModel ?? {},
+		unavailableAt: state.unavailableAt ?? {},
+		autoFallbackBase: state.autoFallbackBase ?? {},
+		fallbackTried: state.fallbackTried ?? {},
+	});
+	const reconciled = reconcileQuotaState(state, cfg, lastUnavailableEntryAt, nowMs, {
+		configMtimeMs: options.configMtimeMs,
+		roleModelAt,
+		roleThinkingAt,
+	});
 	// Older running receipts must not vanish merely because 50 newer calls were logged.
-	return { state, runs };
+	return { state, runs, roleModelAt, roleThinkingAt, reconciled, ...(reconciled ? { preReconcile } : {}) };
 }
 
 /** `/team goal` 的保留子命令：参数不匹配时绝不能退化为 start 合并/新建目标。 */
@@ -1860,8 +1961,8 @@ export function matchModelCandidate(query: string, available: AvailableModelItem
 	return containsMatches[0] ?? null;
 }
 
-export function updateAgentFileConfig(role: Role, updates: { model?: string; thinking?: string }): boolean {
-	const filePath = join(agentDir(), "agents", `${role}.md`);
+export function updateAgentFileConfig(role: Role, updates: { model?: string; thinking?: string }, dir: string = agentDir()): boolean {
+	const filePath = join(dir, "agents", `${role}.md`);
 	if (!existsSync(filePath)) return false;
 	try {
 		const raw = readFileSync(filePath, "utf8");
@@ -1890,8 +1991,8 @@ export function updateAgentFileConfig(role: Role, updates: { model?: string; thi
 	}
 }
 
-export function readAgentFileConfig(role: Role): { model?: string; thinking?: string } {
-	const filePath = join(agentDir(), "agents", `${role}.md`);
+export function readAgentFileConfig(role: Role, dir: string = agentDir()): { model?: string; thinking?: string } {
+	const filePath = join(dir, "agents", `${role}.md`);
 	if (!existsSync(filePath)) return {};
 	try {
 		const raw = readFileSync(filePath, "utf8");
@@ -1901,12 +2002,68 @@ export function readAgentFileConfig(role: Role): { model?: string; thinking?: st
 		const modelMatch = fm.match(/^model:\s*(.+)$/m);
 		const thinkingMatch = fm.match(/^thinking:\s*(.+)$/m);
 		return {
-			model: modelMatch?.[1]?.trim(),
-			thinking: thinkingMatch?.[1]?.trim(),
+			model: sanitizeModelOverride(modelMatch?.[1]),
+			thinking: sanitizeModelOverride(thinkingMatch?.[1]),
 		};
 	} catch {
 		return {};
 	}
+}
+
+function safeFileStatSig(file: string): { mtimeMs?: number; sig: string } {
+	try {
+		if (!existsSync(file)) return { sig: "-" };
+		const st = statSync(file);
+		return { mtimeMs: st.mtimeMs, sig: `${st.mtimeMs}:${st.ctimeMs}:${st.size}` };
+	} catch {
+		return { sig: "-" };
+	}
+}
+
+export function probeEffectiveConfigSignature(cfgFile: string, dir: string = dirname(cfgFile)): string {
+	const parts: string[] = [
+		safeFileStatSig(cfgFile).sig,
+		safeFileStatSig(join(dir, ".pi-teams-version")).sig,
+		safeFileStatSig(join(dir, "extensions", "team.ts")).sig,
+	];
+	for (const role of ROLES) {
+		parts.push(safeFileStatSig(join(dir, "agents", `${role}.md`)).sig);
+	}
+	return parts.join("|");
+}
+
+export interface EffectiveConfigSnapshot {
+	cfg: TeamConfig;
+	configMtimeMs: number | undefined;
+	sig: string;
+}
+
+/**
+ * Loads `team.json` as primary config, and honors manual edits to `agents/<role>.md` that are
+ * strictly newer than both `team.json` and the extension installation files (ignoring template overwrites).
+ */
+export function loadEffectiveConfigSnapshot(cfgFile: string, dir: string = dirname(cfgFile)): EffectiveConfigSnapshot {
+	const cfg = loadConfigFrom(cfgFile);
+	const cfgStat = safeFileStatSig(cfgFile);
+	const verStat = safeFileStatSig(join(dir, ".pi-teams-version"));
+	const extStat = safeFileStatSig(join(dir, "extensions", "team.ts"));
+	const installMtimeMs = Math.max(verStat.mtimeMs ?? 0, extStat.mtimeMs ?? 0);
+	const baseCompareMs = Math.max(cfgStat.mtimeMs ?? 0, installMtimeMs);
+	let effectiveMtimeMs = cfgStat.mtimeMs;
+	const sigParts: string[] = [cfgStat.sig, verStat.sig, extStat.sig];
+	for (const role of ROLES) {
+		const agentStat = safeFileStatSig(join(dir, "agents", `${role}.md`));
+		sigParts.push(agentStat.sig);
+		if (agentStat.mtimeMs !== undefined && agentStat.mtimeMs > baseCompareMs + AGENT_FILE_OVERRIDE_SKEW_MS) {
+			const fileConf = readAgentFileConfig(role, dir);
+			if (fileConf.model) cfg.roles[role].model = fileConf.model;
+			if (fileConf.thinking) cfg.roles[role].thinking = fileConf.thinking;
+			if (fileConf.model || fileConf.thinking) {
+				effectiveMtimeMs = effectiveMtimeMs === undefined ? agentStat.mtimeMs : Math.max(effectiveMtimeMs, agentStat.mtimeMs);
+			}
+		}
+	}
+	return { cfg, configMtimeMs: effectiveMtimeMs, sig: sigParts.join("|") };
 }
 
 // ───────────────────────────── 主扩展 ─────────────────────────────
@@ -1929,7 +2086,11 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		return loadAllAvailableModels(modelsFile, knownModelRegistry ? { modelRegistry: knownModelRegistry } : undefined);
 	};
 
-	let cfg = loadConfigFrom(cfgFile);
+	const initSnap = loadEffectiveConfigSnapshot(cfgFile, dir);
+	let cfg = initSnap.cfg;
+	let lastObservedCfgSig = initSnap.sig;
+	let roleModelUpdatedAt: Partial<Record<Role, number>> = {};
+	let roleThinkingUpdatedAt: Partial<Record<Role, number>> = {};
 	let prices = loadPrices(modelsFile);
 	let state = initialState(cfg);
 	const activeCalls = new Map<string, { role: Role; taskId: string; at: number; description: string; reserveUSD: number; sessionId?: string; model?: string }>();
@@ -2011,8 +2172,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		return {
 			agentDir: dir, cwd: ctx?.cwd || process.cwd(), parentSessionId,
 			parentSessionFile: ctx?.sessionManager?.getSessionFile?.() || undefined,
-			getModelOverride: r => state.roleModel?.[r as Role] || cfg.roles[r as Role]?.model,
-			getThinkingOverride: r => state.roleThinking?.[r as Role] || cfg.roles[r as Role]?.thinking,
+			getModelOverride: r => sanitizeModelOverride(state.roleModel?.[r as Role]) || sanitizeModelOverride(cfg.roles[r as Role]?.model),
+			getThinkingOverride: r => sanitizeModelOverride(state.roleThinking?.[r as Role]) || sanitizeModelOverride(cfg.roles[r as Role]?.thinking),
 			executeTool: async (name, args) => {
 				if (!toolLauncher) throw new Error("Host tool executor is not ready; no native fallback was launched.");
 				const token = randomUUID();
@@ -2094,26 +2255,67 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		ctx.ui.setStatus(STATUS_KEY, state.enabled ? `${label}${goal} ${calls}${paused}` : label);
 	}
 
-	function restoreFromSession(ctx: ExtensionContext): void {
+	function syncLiveRoleConfig(ctx?: any, opts: { persistIfChanged?: boolean } = {}): boolean {
+		if (isSubagentSession) return false;
+		const sig = probeEffectiveConfigSignature(cfgFile, dir);
+		if (sig === lastObservedCfgSig) return false;
+		const snap = loadEffectiveConfigSnapshot(cfgFile, dir);
+		const hadBaseline = lastObservedCfgSig.length > 0;
+		lastObservedCfgSig = snap.sig;
+		cfg = snap.cfg;
+		prices = loadPrices(modelsFile);
+		const mutated = reconcileQuotaState(state, cfg, {}, Date.now(), {
+			configMtimeMs: snap.configMtimeMs,
+			roleModelAt: roleModelUpdatedAt,
+			roleThinkingAt: roleThinkingUpdatedAt,
+			externalConfigChanged: hadBaseline,
+		});
+		if (mutated) {
+			for (const role of ROLES) {
+				if (!state.roleModel?.[role]) delete roleModelUpdatedAt[role];
+				if (!state.roleThinking?.[role]) delete roleThinkingUpdatedAt[role];
+			}
+			if (opts.persistIfChanged !== false && state.enabled) persist();
+		}
+		if (ctx && (mutated || hadBaseline)) setStatusText(ctx);
+		return true;
+	}
+
+	function restoreFromSession(ctx: ExtensionContext): { hasSavedState: boolean; reconciled: boolean } {
+		const snap = loadEffectiveConfigSnapshot(cfgFile, dir);
+		cfg = snap.cfg;
+		prices = loadPrices(modelsFile);
+		lastObservedCfgSig = snap.sig;
 		// getEntries includes abandoned branches; only the active path owns current obligations.
 		const entries = activeEntries(ctx);
-		const restored = stateFromEntries(entries, cfg);
+		const restored = stateFromEntries(entries, cfg, Date.now(), { configMtimeMs: snap.configMtimeMs });
 		state = restored.state;
 		runs = restored.runs;
+		roleModelUpdatedAt = { ...restored.roleModelAt };
+		roleThinkingUpdatedAt = { ...restored.roleThinkingAt };
 		for (const role of ROLES) {
 			if (state.roleModel && role in state.roleModel && !sanitizeModelOverride(state.roleModel[role])) {
 				delete state.roleModel[role];
+				delete roleModelUpdatedAt[role];
 			}
 			if (state.roleThinking && role in state.roleThinking && !sanitizeModelOverride(state.roleThinking[role])) {
 				delete state.roleThinking[role];
+				delete roleThinkingUpdatedAt[role];
 			}
 		}
 		const hasSavedState = entries.some(e => e?.type === "custom" && (e.customType === STATE_TYPE || e.customType === STATE_DELTA_TYPE));
-		lastPersistedJson = hasSavedState ? JSON.stringify(state) : "";
-		lastPersistedState = hasSavedState ? structuredClone(state) : null;
+		if (hasSavedState && restored.reconciled && restored.preReconcile) {
+			const preState = { ...structuredClone(state), ...restored.preReconcile };
+			lastPersistedJson = JSON.stringify(preState);
+			lastPersistedState = preState;
+		} else {
+			lastPersistedJson = hasSavedState ? JSON.stringify(state) : "";
+			lastPersistedState = hasSavedState ? structuredClone(state) : null;
+		}
 		agentToolUnavailable = false;
 		lastChildGcAt = 0;
 		lastWorktreeGcAt = 0;
+		return { hasSavedState, reconciled: restored.reconciled };
 	}
 
 	function board(): WorkLedger {
@@ -2692,6 +2894,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		ctx: any,
 		signal?: AbortSignal,
 	): Promise<any> {
+		syncLiveRoleConfig(ctx);
 		const runId = typeof params.run_id === "string" && params.run_id ? params.run_id : `T-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 		const task = board().tasks.find(t => runId && t.runId === runId);
 		const rawRole = params.subagent_type ?? params.role ?? task?.role;
@@ -2708,8 +2911,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			parentSessionId: parentSessionId || ctx?.sessionManager?.getSessionId?.() || "",
 			parentSessionFile: ctx?.sessionManager?.getSessionFile?.() || undefined,
 			teamExtensionPath: TEAM_EXTENSION_PATH,
-			getModelOverride: (r) => state.roleModel?.[r as Role] || cfg.roles[r as Role]?.model,
-			getThinkingOverride: (r) => state.roleThinking?.[r as Role] || cfg.roles[r as Role]?.thinking,
+			getModelOverride: (r) => sanitizeModelOverride(state.roleModel?.[r as Role]) || sanitizeModelOverride(cfg.roles[r as Role]?.model),
+			getThinkingOverride: (r) => sanitizeModelOverride(state.roleThinking?.[r as Role]) || sanitizeModelOverride(cfg.roles[r as Role]?.thinking),
 			onChildSpawned: (info) => linkChildInPiWeb(info, ctx),
 			// Completion is delivered through the process-wide listener (handleNativeChildComplete) so a
 			// reloaded extension instance still receives children launched before the reload.
@@ -3095,6 +3298,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					const activeModel = state.roleModel?.[role] || cfg.roles[role]?.model;
 					const applied = applyQuotaFailure(state, role, cfg, `额度/限流不足（${errorText.trim().slice(0, 80)}）`, activeModel);
 					state = applied.state;
+					if (applied.nextModel) roleModelUpdatedAt[role] = Date.now();
 					dirty = true;
 					const ui = ctxStore.current?.hasUI ? ctxStore.current.ui : undefined;
 					if (applied.nextModel) ui?.notify(`${ROLE_LABEL[role]} 额度不足，后续改用 ${applied.nextModel}`, "warning");
@@ -3183,6 +3387,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 	async function schedulerPump(ctx: any, maxSlots = 20): Promise<{ launched: string[]; errors: string[]; backfillCount: number }> {
 		if (!state.enabled || isSubagentSession) return { launched: [], errors: [], backfillCount: 0 };
+		syncLiveRoleConfig(ctx);
 		if (hasHostTools() && !toolLauncher) return { launched: [], errors: [], backfillCount: 0 }; // Wait for real host tool context; never launch an invisible CLI replacement.
 		if (agentToolUnavailable) return { launched: [], errors: ["Agent tool unavailable for programmatic dispatch (model-only host)"], backfillCount: 0 };
 		if (isPumpActive) return { launched: [], errors: ["pump_in_progress"], backfillCount: 0 };
@@ -3926,13 +4131,14 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		} catch {
 			isSubagentSession = false;
 		}
-		cfg = loadConfigFrom(cfgFile);
-		prices = loadPrices(modelsFile);
 		runs = [];
-		restoreFromSession(ctx);
+		const restoredMeta = restoreFromSession(ctx);
 		loadRecoveredKeys(activeEntries(ctx));
 		loadLeases(ctx);
-		if (state.enabled && !isSubagentSession && !state.ledger) { board(); persist(); }
+		if (state.enabled && !isSubagentSession && (!state.ledger || (restoredMeta.hasSavedState && restoredMeta.reconciled))) {
+			if (!state.ledger) board();
+			persist();
+		}
 
 		const flagOn = (() => {
 			try {
@@ -4030,6 +4236,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		(ledger.pendingInputIds ??= []).push(receipt.id); persist();
 	});
 	pi.on("before_agent_start", async (event, ctx) => {
+		if (!isSubagentSession) syncLiveRoleConfig(ctx, { persistIfChanged: state.enabled });
 		if (!state.enabled || isSubagentSession) return;
 		// RPC/SDK prompts can bypass input; internal goal kickoff is already registered.
 		if (typeof event.prompt === "string" && event.prompt.trim()) {
@@ -4206,6 +4413,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		// Sanitize invalid/sentinel model overrides (`inherit`, `""`, `default`, `auto`) on parent subsession tools
 		// even before team-mode checks so direct `spawn_subsession` / `manage_subsession` calls never crash with Unknown model.
 		if (["agent", "spawn_subsession", "spawn_session", "manage_subsession"].includes(toolName) && event.input && typeof event.input === "object") {
+			if (!isSubagentSession) syncLiveRoleConfig(ctx, { persistIfChanged: state.enabled });
 			const rawInput = event.input as Record<string, unknown>;
 			if ("model" in rawInput && !sanitizeModelOverride(rawInput.model)) delete rawInput.model;
 			if ("thinking" in rawInput && !sanitizeModelOverride(rawInput.thinking)) delete rawInput.thinking;
@@ -4579,6 +4787,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				tracked.model,
 			);
 			state = applied.state;
+			if (applied.nextModel) roleModelUpdatedAt[tracked.role] = Date.now();
 			if (applied.nextModel) {
 				if (ctx.hasUI) ctx.ui.notify(`${ROLE_LABEL[tracked.role]} 额度不足，后续改用 ${applied.nextModel}`, "warning");
 			} else if (ctx.hasUI) {
@@ -5115,6 +5324,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const cmdCtx = ctx as ExtensionCommandContext;
 			captureToolLauncher(ctx);
+			if (!isSubagentSession) syncLiveRoleConfig(ctx, { persistIfChanged: state.enabled });
 			const [sub, ...rest] = args.trim().split(/\s+/);
 			const arg1 = (rest[0] ?? "").toLowerCase();
 
@@ -5812,7 +6022,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					state.roleThinking[targetRole] = newThinking;
 					cfg.roles[targetRole].thinking = newThinking;
 					writeFileSync(cfgFile, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
-					updateAgentFileConfig(targetRole, { thinking: newThinking });
+					updateAgentFileConfig(targetRole, { thinking: newThinking }, dir);
+					roleThinkingUpdatedAt[targetRole] = Date.now();
+					lastObservedCfgSig = probeEffectiveConfigSignature(cfgFile, dir);
 					persist();
 					setStatusText(ctx);
 					ctx.ui.notify(`✓ 已将 ${ROLE_LABEL[targetRole]} (${targetRole}) 的思考级别设置为 ${newThinking}（已持久化保存）`, "info");
@@ -5837,15 +6049,20 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				const hadQuotaPause = Boolean(state.unavailable?.[targetRole]);
 				clearRoleQuotaLock(state, targetRole, true);
 				state.roleModel[targetRole] = finalModelRef;
+				state.autoFallbackBase ??= {};
+				state.autoFallbackBase[targetRole] = finalModelRef;
 				cfg.roles[targetRole].model = finalModelRef;
+				roleModelUpdatedAt[targetRole] = Date.now();
 				if (newThinking) {
 					state.roleThinking ??= {};
 					state.roleThinking[targetRole] = newThinking;
 					cfg.roles[targetRole].thinking = newThinking;
+					roleThinkingUpdatedAt[targetRole] = Date.now();
 				}
 				writeFileSync(cfgFile, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
-				updateAgentFileConfig(targetRole, { model: finalModelRef, thinking: newThinking });
+				updateAgentFileConfig(targetRole, { model: finalModelRef, thinking: newThinking }, dir);
 				prices = loadPrices(modelsFile);
+				lastObservedCfgSig = probeEffectiveConfigSignature(cfgFile, dir);
 				persist();
 				setStatusText(ctx);
 

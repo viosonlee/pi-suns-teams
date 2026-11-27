@@ -4,7 +4,7 @@
  * crash settlement, and listener detachment on session_shutdown. No model calls.
  */
 import { strict as assert } from "node:assert";
-import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -40,7 +40,7 @@ writeFileSync(argvLog, "");
 process.env.PI_BIN = fakePi;
 process.env.FAKE_PI_ARGV_LOG = argvLog;
 
-const { default: team, initialState, defaultConfig, newGoal } = await import("../extensions/team.ts");
+const { default: team, initialState, defaultConfig, loadEffectiveConfigSnapshot, newGoal } = await import("../extensions/team.ts");
 
 let seq = 0;
 let passed = 0;
@@ -221,6 +221,94 @@ try {
 		assert.equal(h.state().roleModel?.bridges, "switched/model");
 		assert.equal(h.state().unavailable?.bridges, undefined, "/team model must clear stale unavailable lock");
 		assert.equal(h.state().fallbackTried?.bridges, undefined, "/team model must reset fallbackTried");
+	});
+
+	await test("running main session picks up team.json role model/thinking edits live without /reload", async () => {
+		const cfgDisk = JSON.parse(readFileSync(join(root, "team.json"), "utf8"));
+		cfgDisk.roles ??= {};
+		cfgDisk.roles.bridges = { ...(cfgDisk.roles.bridges ?? { label: "Mikal Bridges" }), model: "updated/live-model", thinking: "medium" };
+		writeFileSync(join(root, "team.json"), JSON.stringify(cfgDisk, null, 2));
+		const tFuture = new Date(Date.now() + 5000);
+		utimesSync(join(root, "team.json"), tFuture, tFuture);
+
+		await h.emit("before_agent_start", { prompt: "check updated role config" });
+		assert.equal(h.state().roleModel?.bridges, undefined, "live sync clears superseded roleModel override without reload");
+		await h.ledger({ action: "add", autoDispatch: false, tasks: [spec(q, "W-live")] });
+		const call = await h.emit("tool_call", { toolName: "Agent", toolCallId: "call-live", input: { subagent_type: "bridges", prompt: "TEAM_TASK: W-live\nRun with updated model." } });
+		assert.notEqual(call.block, true, call.reason);
+		assert.equal(call.input.model, "updated/live-model");
+		assert.equal(call.input.thinking, "medium");
+		const res = await h.tools.get("Agent").execute("call-live", call.input, undefined, undefined, h.ctx);
+		assert.equal(res.isError, false);
+		await until(() => readFileSync(argvLog, "utf8").split("\n").some((l) => l.includes("updated/live-model") && l.includes("Run with updated model.")), "subagent spawned with live-updated model");
+	});
+
+	await test("/reload clears legacy session roleModel/roleThinking overrides when team.json is newer, and respects agent file mtimes safely", async () => {
+		const cfgDisk = JSON.parse(readFileSync(join(root, "team.json"), "utf8"));
+		cfgDisk.roles.bridges = { ...(cfgDisk.roles.bridges ?? { label: "Mikal Bridges" }), model: "reloaded/new-model", thinking: "low" };
+		writeFileSync(join(root, "team.json"), JSON.stringify(cfgDisk, null, 2));
+		const cfgTime = new Date("2026-11-27T00:32:00.000Z");
+		utimesSync(join(root, "team.json"), cfgTime, cfgTime);
+
+		// Simulate an installer copy updating agents/*.md & .pi-teams-version AFTER team.json with stale template model:
+		// loadEffectiveConfigSnapshot must still keep team.json ("reloaded/new-model").
+		const agentMdPath = join(root, "agents", "bridges.md");
+		const rawMd = readFileSync(agentMdPath, "utf8").replace(/^model:\s*.*$/m, "model: template/stale-model");
+		writeFileSync(agentMdPath, rawMd);
+		writeFileSync(join(root, ".pi-teams-version"), "1.2.6\n");
+		const installTime = new Date("2026-11-27T01:00:00.000Z");
+		utimesSync(agentMdPath, installTime, installTime);
+		utimesSync(join(root, ".pi-teams-version"), installTime, installTime);
+		assert.equal(loadEffectiveConfigSnapshot(join(root, "team.json"), root).cfg.roles.bridges.model, "reloaded/new-model");
+
+		const legacyInit = {
+			...initialState(defaultConfig()),
+			enabled: true,
+			startedAt: "2026-11-26",
+			roleModel: { bridges: "stale/old-session-model" },
+			roleThinking: { bridges: "max" },
+		};
+		const relEntries: any[] = [
+			{ type: "custom", id: "rel1", timestamp: "2026-11-26T08:00:00.000Z", customType: "team-state", data: legacyInit },
+			{ type: "custom", id: "rel2", timestamp: "2026-11-27T00:10:00.000Z", customType: "team-state", data: { ...legacyInit, tasks: 4 } },
+		];
+		const relHooks = new Map<string, Function[]>(), relTools = new Map<string, any>();
+		const relCtx: any = {
+			cwd: work, hasUI: false, isIdle: () => true,
+			sessionManager: { getEntries: () => relEntries, getBranch: () => relEntries, getSessionId: () => "parent-rel", getSessionFile: () => join(root, "parent-rel.jsonl") },
+			ui: { notify() {}, setStatus() {} },
+			model: { provider: "fixture", id: "unused" }, modelRegistry: { find: () => undefined },
+		};
+		team({
+			on: (n: string, f: Function) => relHooks.set(n, [...(relHooks.get(n) ?? []), f]),
+			registerFlag() {}, getFlag: () => false,
+			registerTool: (t: any) => relTools.set(t.name, t),
+			registerCommand() {},
+			appendEntry: (t: string, data: any) => { relEntries.push({ type: "custom", id: `re${++seq}`, customType: t, data }); },
+			getThinkingLevel: () => "high",
+			sendMessage() {},
+			sendUserMessage: async () => {},
+		} as any);
+		for (const fn of relHooks.get("session_start") ?? []) await fn({ reason: "reload" }, relCtx);
+		// Reconstruct latest state from entries (taking delta into account if emitted)
+		const { stateFromEntries } = await import("../extensions/team.ts");
+		const finalState = stateFromEntries(relEntries, loadEffectiveConfigSnapshot(join(root, "team.json"), root).cfg).state;
+		assert.equal(finalState.roleModel?.bridges, undefined, "/reload must clear stale legacy session roleModel");
+		assert.equal(finalState.roleThinking?.bridges, undefined, "/reload must clear stale legacy session roleThinking");
+
+		for (const fn of relHooks.get("input") ?? []) await fn({ text: "reload work", source: "rpc" }, relCtx);
+		const reqId = stateFromEntries(relEntries, defaultConfig()).state.ledger!.requests.at(-1)!.id;
+		await relTools.get("team_tasks").execute("rel-add", { action: "add", autoDispatch: false, tasks: [spec(reqId, "W-rel")] }, undefined, undefined, relCtx);
+		let ev: any = { toolName: "Agent", toolCallId: "call-rel", input: { subagent_type: "bridges", prompt: "TEAM_TASK: W-rel\nRun after reload." } };
+		for (const fn of relHooks.get("tool_call") ?? []) { const p = await fn(ev, relCtx); if (p) ev = { ...ev, ...p }; }
+		assert.equal(ev.input.model, "reloaded/new-model");
+		assert.equal(ev.input.thinking, "low");
+
+		// Genuine manual edit to agents/bridges.md strictly after both team.json and .pi-teams-version overrides cleanly:
+		writeFileSync(agentMdPath, readFileSync(agentMdPath, "utf8").replace(/^model:\s*.*$/m, "model: manual/edited-md-model"));
+		const manualEditTime = new Date("2026-11-27T02:00:00.000Z");
+		utimesSync(agentMdPath, manualEditTime, manualEditTime);
+		assert.equal(loadEffectiveConfigSnapshot(join(root, "team.json"), root).cfg.roles.bridges.model, "manual/edited-md-model");
 	});
 
 	await test("after session_shutdown the instance no longer reacts to child completions", async () => {

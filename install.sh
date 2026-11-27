@@ -134,6 +134,42 @@ TARGET_CONFIG="${PI_AGENT_DIR}/team.json"
 if [ -f "${TARGET_CONFIG}" ]; then
   cp "${SRC_ROOT}/config/team.default.json" "${PI_AGENT_DIR}/team.default.json"
   echo -e "   -> ${GREEN}已有 team.json，完整保留；最新模板另存为 team.default.json 供对比。${NC}"
+  # Prevent template agents/*.md copy from reverting user-configured role model/thinking on upgrade.
+  if [ "${USE_SYMLINK}" != true ] && command -v node >/dev/null 2>&1; then
+    node - "${TARGET_CONFIG}" "${PI_AGENT_DIR}/agents" <<'EOF'
+const fs = require("fs");
+const path = require("path");
+const [cfgPath, agentsDir] = process.argv.slice(2);
+const sentinels = new Set(["inherit", "default", "auto", "none", "unset", "null", "undefined"]);
+const clean = (v) => (typeof v === "string" && v.trim() && !sentinels.has(v.trim().toLowerCase()) ? v.trim() : "");
+try {
+  const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+  const roles = cfg && cfg.roles && typeof cfg.roles === "object" ? cfg.roles : {};
+  for (const role of ["cp", "booker", "bridges", "ayton", "cameron"]) {
+    const r = roles[role];
+    const mdPath = path.join(agentsDir, `${role}.md`);
+    if (!r || typeof r !== "object" || !fs.existsSync(mdPath)) continue;
+    const model = clean(r.model);
+    const thinking = clean(r.thinking);
+    if (!model && !thinking) continue;
+    const raw = fs.readFileSync(mdPath, "utf8");
+    const parts = raw.split("---");
+    if (parts.length < 3) continue;
+    let fm = parts[1];
+    if (model) {
+      fm = /^model:\s*.*$/m.test(fm) ? fm.replace(/^model:\s*.*$/m, `model: ${model}`) : `${fm.trimEnd()}\nmodel: ${model}\n`;
+    }
+    if (thinking) {
+      fm = /^thinking:\s*.*$/m.test(fm) ? fm.replace(/^thinking:\s*.*$/m, `thinking: ${thinking}`) : `${fm.trimEnd()}\nthinking: ${thinking}\n`;
+    }
+    if (fm !== parts[1]) {
+      parts[1] = fm;
+      fs.writeFileSync(mdPath, parts.join("---"), "utf8");
+    }
+  }
+} catch {}
+EOF
+  fi
 else
   cp "${SRC_ROOT}/config/team.default.json" "${TARGET_CONFIG}"
   echo -e "   -> 已生成默认配置: ${TARGET_CONFIG}（请按本机可用模型修改 roles.*.model）"

@@ -650,4 +650,67 @@ test("stateFromEntries automatically recovers legacy (01a2115e-style) stuck unav
 	assert.equal(withFallback.unavailable.cp, undefined);
 });
 
+test("stateFromEntries clears stale legacy roleModel/roleThinking when configMtimeMs is newer while preserving active quota fallbacks", () => {
+	const oldCfg = mergeConfig(cfg, {
+		roles: {
+			...cfg.roles,
+			cp: { ...cfg.roles.cp, model: "magpie/devin/swe-2-1", thinking: "max" },
+			bridges: { ...cfg.roles.bridges, model: "magpie/devin/swe-2-flash", thinking: "max" },
+		},
+		fallbacks: { ...cfg.fallbacks, cp: ["fb/cp"] },
+	});
+	const newCfg = mergeConfig(oldCfg, {
+		roles: {
+			...oldCfg.roles,
+			cp: { ...oldCfg.roles.cp, model: "magpie/devin/swe-2-1", thinking: "max" },
+			bridges: { ...oldCfg.roles.bridges, model: "magpie/codearts/deepseek-v4.1-flash", thinking: "medium" },
+		},
+	});
+	const legacyState: TeamState = {
+		...initialState(oldCfg),
+		enabled: true,
+		roleModel: { cp: "magpie/devin/swe-2-1", bridges: "magpie/devin/swe-2-flash" },
+		roleThinking: { cp: "max", bridges: "max" },
+	};
+	const entries = [
+		// Original time where roleModel.bridges was set
+		{ type: "custom", customType: "team-state", timestamp: "2026-11-26T08:00:00.000Z", data: legacyState },
+		// Later unrelated snapshot carrying identical unchanged roleModel/roleThinking
+		{ type: "custom", customType: "team-state", timestamp: "2026-11-27T00:30:00.000Z", data: { ...legacyState, tasks: 9 } },
+	];
+	const cfgMtimeMs = Date.parse("2026-11-27T00:32:00.000Z");
+	const replayed = stateFromEntries(entries, newCfg, Date.parse("2026-11-27T00:35:00.000Z"), { configMtimeMs: cfgMtimeMs });
+	assert.equal(replayed.reconciled, true);
+	assert.equal(replayed.state.roleModel.bridges, undefined, "stale bridges roleModel must clear even across unchanged snapshots");
+	assert.equal(replayed.state.roleThinking?.bridges, undefined, "stale bridges roleThinking must clear");
+	assert.equal(replayed.state.roleModel.cp, undefined);
+	assert.equal(replayed.state.roleThinking?.cp, undefined);
+
+	// Active 429 quota fallback for cp stays sticky when a LATER team.json edit only changed bridges
+	const fbResult = applyQuotaFailure(replayed.state, "cp", newCfg, "429 limit", "magpie/devin/swe-2-1", Date.parse("2026-11-27T00:40:00.000Z"));
+	assert.equal(fbResult.state.roleModel.cp, "fb/cp");
+	assert.equal(fbResult.state.autoFallbackBase?.cp, "magpie/devin/swe-2-1");
+	const entriesWithFb = [
+		...entries,
+		{ type: "custom", customType: "team-state", timestamp: "2026-11-27T00:40:00.000Z", data: fbResult.state },
+	];
+	const bridgesOnlyCfg = mergeConfig(newCfg, {
+		roles: { ...newCfg.roles, bridges: { ...newCfg.roles.bridges, model: "magpie/devin/swe-2-flash" } },
+	});
+	const keepCpFb = stateFromEntries(entriesWithFb, bridgesOnlyCfg, Date.parse("2026-11-27T00:46:00.000Z"), {
+		configMtimeMs: Date.parse("2026-11-27T00:45:00.000Z"),
+	});
+	assert.equal(keepCpFb.state.roleModel.cp, "fb/cp", "unrelated bridges config edit must not wipe active cp quota fallback");
+
+	// Editing cp's own configured model supersedes its active quota fallback immediately
+	const cpSwitchedCfg = mergeConfig(bridgesOnlyCfg, {
+		roles: { ...bridgesOnlyCfg.roles, cp: { ...bridgesOnlyCfg.roles.cp, model: "magpie/new/cp-model" } },
+	});
+	const clearedCpFb = stateFromEntries(entriesWithFb, cpSwitchedCfg, Date.parse("2026-11-27T00:48:00.000Z"), {
+		configMtimeMs: Date.parse("2026-11-27T00:47:00.000Z"),
+	});
+	assert.equal(clearedCpFb.state.roleModel.cp, undefined, "changing cp's configured model must clear old quota fallback");
+	assert.equal(clearedCpFb.state.autoFallbackBase?.cp, undefined);
+});
+
 console.log(`\n全部通过：${pass} 项`);
