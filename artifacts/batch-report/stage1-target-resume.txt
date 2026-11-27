@@ -1,0 +1,31 @@
+✓ readMode snapshot read-only task runs parallel with an in-flight writer; strict blocks
+✓ readMode snapshot rejects writer tasks and unknown values
+✓ reviewing hold does not block a ready task in a different verified worktree
+✓ provisionAutoWorktree creates a tracked worktree on a clean tree; dirty tree fails closed
+✓ provisionAutoWorktree fails closed on a non-git directory
+✓ send_session_message rejection includes the Agent(resume) recipe
+✓ isBashWriteCommand: bash -c script and secondary interpreters are writes; service status is safe
+✓ auto-worktree defaults true, accepts only boolean overrides, and shipped config agrees
+✓ autoWorktreeEligible admits a writer with blockers, never read-only, owned, failed or empty candidates
+✓ sharedResourcesConflict is symmetric and defeats isolation and snapshot exemptions
+✓ running A + ready B provisions a real worktree, records ownership and releases only file locks
+✓ scheduler preflight provisions before readyTasks and launches with rebased scopes and branch contract
+✓ daemon reaches a scope-blocked candidate but cannot steal a held manual task
+✓ explicit Agent selector provisions a manual held task while daemon leaves it alone
+✓ disabled auto-worktree leaves scheduler and manual Agent serial with no ownership
+✓ shared external resource never provisions or releases through either dispatch path
+✓ dirty provisioning fails once, persists the guard, and stays serial after reload and cleanup
+✓ external absolute scopes fail closed rather than granting worktree isolation to shared files
+✓ prior stopped child keeps its original cwd and identity, not an automatic worktree
+✓ live cross-session resource lease cannot be bypassed by auto-worktree
+✓ same-task live lease prevents moving or redispatching its attempt
+✓ automatic provisioning preserves the five-extra-worktree admission cap
+✓ native manual Agent actually launches in the auto-worktree with its remapped scope
+✓ hosted cwd limitation fails closed: no prompt-only worktree isolation
+✓ persisted auto-owned worktree cannot dispatch through hosted scheduler or manual Agent
+✓ tracked absolute symlink keeps writer and strict reader locks intact
+✓ subdirectory parent provisions beside repository root, never inside main checkout
+✓ dependencies still gate provisioning and dispatch
+✓ strict same-main-tree reader remains blocked by a reviewing hold (not stage 2)
+
+audit regression: 29 tests passed

@@ -42,6 +42,8 @@ export interface WorkTask {
 	worktreeOwned?: boolean;
 	/** Auto-worktree branch (auto-created by conflict scheduler; cleanup uses non-force git branch -d only). */
 	worktreeBranch?: string;
+	/** A failed auto-provision attempt is sticky: keep serial scope checks and do not retry each pump. */
+	autoWorktreeFailedAt?: string;
 	sessionId?: string; runId?: string; dispatchedAt?: string; archivedAt?: string; queueNote?: string;
 	/** Persisted transport: new pi-web children are host-managed; legacy process children stay native. */
 	executionTransport?: "hosted" | "native";
@@ -731,11 +733,25 @@ export function hasValidWorktree(task: WorkTask): boolean {
 	);
 }
 
-export function taskConflict(a: WorkTask, b: WorkTask): boolean {
-	// 1. Shared exclusive external resources (ports, DBs, physical devices) MUST ALWAYS conflict, even for reviewer pairs!
+/** Exclusive external resources are never isolated by a filesystem worktree. */
+export function sharedResourcesConflict(a: WorkTask, b: WorkTask): boolean {
 	const aRes = a.sharedResources ?? [];
 	const bRes = b.sharedResources ?? [];
-	if (aRes.length > 0 && bRes.length > 0 && aRes.some(r => bRes.includes(r))) return true;
+	return aRes.some(r => bRes.includes(r));
+}
+
+/** Pure eligibility only; the scheduler verifies live blockers and provisions on disk before releasing scope. */
+export function autoWorktreeEligible(task: WorkTask, blockers: readonly WorkTask[]): boolean {
+	return isWriterTask(task) && task.writePaths.length > 0
+		&& task.declaredReadOnly !== true && task.role !== "cp" && task.role !== "parent"
+		&& !task.worktreeOwned && !task.worktreePath && task.isolation !== "worktree"
+		&& !task.autoWorktreeFailedAt && blockers.length > 0
+		&& !blockers.some(other => sharedResourcesConflict(task, other));
+}
+
+export function taskConflict(a: WorkTask, b: WorkTask): boolean {
+	// 1. Shared exclusive external resources (ports, DBs, physical devices) MUST ALWAYS conflict, even for reviewer pairs!
+	if (sharedResourcesConflict(a, b)) return true;
 
 	// 2. Reviewer relationship is exempt from filesystem conflict (reviewer inspects worker's output files)
 	if (a.parentTaskId === b.id || a.id === reviewerTaskId(b.id) || b.parentTaskId === a.id || b.id === reviewerTaskId(a.id)) return false;

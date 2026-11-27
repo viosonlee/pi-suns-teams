@@ -14,19 +14,19 @@ import { existsSync, readFileSync, statSync, readdirSync, unlinkSync, writeFileS
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join, isAbsolute, resolve, relative, dirname } from "node:path";
+import { join, isAbsolute, resolve, relative, dirname, sep } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	newLedger, addRequest, addTasks, addBacklog, updateTask, resolveRequest, terminalWork, liveWork, occupiesSlot,
 	readyTasks, dispatchBatch, markDispatched, observeTask, completionBlockers, ledgerPrompt, moveTask, archivePrompt,
-	taskConflict, parseTeamTaskId, isDeterministic, isReviewExempt, isReviewTask, autoAcceptTask, createReviewerTask, nextDispatchableTasks,
+	taskConflict, autoWorktreeEligible, parseTeamTaskId, isDeterministic, isReviewExempt, isReviewTask, autoAcceptTask, createReviewerTask, nextDispatchableTasks,
 	reviewerTaskId, completeReviewTask, publishTasks, overlap, recordReview, deliveryVersionOf, reviewRecordsOf,
 	reclaimStaleReviews, isActiveReviewHold, scopeBlockingLive, REVIEW_STALE_MS, pruneStaleReviews,
 	reviewDispatchOwnershipProblem, setManualDispatchHold, releaseManualDispatchHold,
 	type WorkTask, type WorkLedger,
 } from "../team-ledger.ts";
 import { parseReviewReport } from "../team-review.ts";
-import { conflictPathBetweenScopes, scopeAllowsWrite, writeConflicts } from "../team-scope.ts";
+import { conflictPathBetweenScopes, scopeAllowsWrite, writeConflicts, scopeBase, isDirScope } from "../team-scope.ts";
 import { collectEvidenceRefs, mergeAudits, verifyEvidenceRefs, type EvidenceRef } from "../team-review-evidence.ts";
 import {
 	collectKnownChildSessionIds,
@@ -48,7 +48,7 @@ import {
 } from "../team-gc.ts";
 import {
 	auditWorktrees,
-	cleanupSafeWorktrees,
+	cleanupSafeWorktrees, provisionAutoWorktree, autoWorktreeScopeProblem,
 	DEFAULT_WORKTREE_GRACE_MS,
 	type WorktreeCleanupResult,
 } from "../team-worktree.ts";
@@ -196,6 +196,8 @@ export interface TeamConfig {
 	 * where the parent may do the work inline.
 	 */
 	parentSoloWork: "delegated" | "allow";
+	/** Isolate writable same-file contenders automatically; external resource locks remain exclusive. */
+	autoWorktreeOnConflict: boolean;
 	/** 前台 Agent 调用未指定 wait_timeout 时注入、且作为硬上限的秒数。 */
 	agentWaitTimeoutSeconds: number;
 	/** 自动将已终结且过冷静期的子会话归档移出 sessions/（移至 sessions-archive/，不硬删）。 */
@@ -337,6 +339,7 @@ export function defaultConfig(): TeamConfig {
 		bashTimeoutSeconds: 180,
 		bashMaxTimeoutSeconds: 900,
 		parentSoloWork: "delegated",
+		autoWorktreeOnConflict: true,
 		agentWaitTimeoutSeconds: 600,
 		autoGcChildSessions: true,
 		gcReviewerCooldownMinutes: 60,
@@ -500,6 +503,7 @@ export function mergeConfig(base: TeamConfig, raw: unknown): TeamConfig {
 	num("gcReviewerCooldownMinutes", 30);
 	num("gcWorkerCooldownMinutes", 30);
 	if (typeof src.autoGcChildSessions === "boolean") out.autoGcChildSessions = src.autoGcChildSessions;
+	if (typeof src.autoWorktreeOnConflict === "boolean") out.autoWorktreeOnConflict = src.autoWorktreeOnConflict;
 	if (typeof src.defaultEnabled === "boolean") out.defaultEnabled = src.defaultEnabled;
 	if (src.defaultMode === "economy" || src.defaultMode === "strict" || src.defaultMode === "standard") out.defaultMode = src.defaultMode;
 	if (src.mainModelPolicy === "preserve" || src.mainModelPolicy === "mode") out.mainModelPolicy = src.mainModelPolicy;
@@ -617,13 +621,16 @@ export function extractEscalation(prompt: string, minChars: number): string | nu
 
 /** 本会话生效的金额上限；0 表示不设金额上限（调用次数与并发仍然有效）。 */
 /** 派活时附在任务后的契约（Agent 之间统一英文）。 */
-export function buildTaskContract(taskId: string, scope?: { role: string; title?: string; readPaths: string[]; writePaths: string[]; reviewTier?: WorkTask["reviewTier"]; autoAccept?: boolean; reviewerRole?: string; isolation?: WorkTask["isolation"] }): string {
+export function buildTaskContract(taskId: string, scope?: { role: string; title?: string; readPaths: string[]; writePaths: string[]; reviewTier?: WorkTask["reviewTier"]; autoAccept?: boolean; reviewerRole?: string; isolation?: WorkTask["isolation"]; worktreePath?: string; worktreeBranch?: string; worktreeOwned?: boolean }): string {
 	const scopeLine = scope
 		? [`SCOPE: ${taskId} role=${scope.role} readPaths=${JSON.stringify(scope.readPaths)} writePaths=${JSON.stringify(scope.writePaths)}`]
 		: [];
 	const needsFullWorktreeBlock = !scope || scope.isolation === "worktree" || /\b(?:integrate|integration|merge)\b/i.test(`${taskId} ${scope.title ?? ""}`);
 	return [
 		...scopeLine,
+		...(scope?.worktreeOwned && scope.worktreePath ? [
+			`Auto-worktree: ${scope.worktreePath}; branch: ${scope.worktreeBranch ?? "unknown"}. Run commands with cd ${JSON.stringify(scope.worktreePath)} first; the parent workspace is NOT your write target. Use only the scoped paths below this worktree. Integration and safe cleanup remain pending parent obligations.`,
+		] : []),
 		`[TEAM CONTRACT ${taskId}] Your report must include:`,
 		"1) task goal and scope",
 		"2) actual changes (file:line)",
@@ -3318,11 +3325,19 @@ export default function teamExtension(pi: ExtensionAPI): void {
 	function reconcileBacklog(): void {
 		if (state.goal) state.goal.nextTasks = board().tasks.filter(t => !terminalWork(t.status)).map(t => t.title);
 	}
+	function worktreeTransportProblem(task: WorkTask | undefined, resumeId?: string, ctx = ctxStore.current): string | undefined {
+		if (!task?.worktreeOwned || task.isolation !== "worktree" || !task.worktreePath) return;
+		const hosted = resumeId ? usesHostedTransport(resumeId) : hasHostTools();
+		if (hosted && resolve(task.worktreePath) !== resolve(ctx?.cwd || process.cwd())) {
+			return `${task.id}: hosted transport cannot select auto-worktree cwd ${task.worktreePath}. Next: team_tasks action=update status=blocked for ${task.id} with this incompatibility as evidence; keep isolation/lease records until verified native dispatch or worktree-aware host is available.`;
+		}
+	}
 	function allReadyTasksToDispatch(): ReturnType<typeof readyTasks> {
 		const now = Date.now();
 		settleReclaimedReviews(now);
 		return readyTasks(board(), now).filter(task =>
 			task.role !== "parent"
+			&& !worktreeTransportProblem(task)
 			&& !((task as any).nextRetryAt && (task as any).nextRetryAt > now)
 			&& !heldConflict(task)
 			&& !decideCall({
@@ -3335,12 +3350,75 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		const now = Date.now();
 		settleReclaimedReviews(now);
 		return dispatchBatch(board(), freeSlots(), task => {
+			if (worktreeTransportProblem(task)) return false;
 			if ((task as any).nextRetryAt && (task as any).nextRetryAt > now) return false;
 			return !heldConflict(task) && !decideCall({
 				role: task.role as Role, prompt: task.title,
 				state, cfg, prices, activeCount: runningCount(),
 			}).block;
 		});
+	}
+	/** Provision before readyTasks rejects scope-blocked writers. A selector authorizes ONLY that manual task. */
+	function autoProvisionWorktreesForReadyTasks(ctx: any, explicitTaskId?: string): void {
+		if (!cfg.autoWorktreeOnConflict) return;
+		let changed = false;
+		for (const task of board().tasks) {
+			if (explicitTaskId ? task.id !== explicitTaskId : task.manualDispatch) continue;
+			if (task.status !== "ready" && task.status !== "queued") continue;
+			// Never move an existing child/resume into another cwd or bypass a live attempt's lease.
+			if (task.sessionId || programmaticDispatches.has(task.id)
+				|| [...leases.values()].some(other => other.id === task.id && liveWork(other.status) && !isLeaseSettledOnBoard(other))) continue;
+			if (unfinishedDependencyIds(task).length || reviewDispatchOwnershipProblem(board(), task)) continue;
+			const blockers = board().tasks.filter(other => other.id !== task.id && scopeBlockingLive(board(), other) && taskConflict(task, other));
+			// Cross-session leases are equally authoritative; isolation must not erase their resource locks.
+			for (const other of leases.values()) {
+				if (other.id !== task.id && liveWork(other.status) && !isLeaseSettledOnBoard(other) && taskConflict(task, other)) blockers.push(other);
+			}
+			if (!autoWorktreeEligible(task, blockers)) continue;
+			try {
+				// Hosted spawn_subsession cannot set cwd. Prompt-only relocation is not isolation.
+				if (hasHostTools()) throw new Error("hosted transport cannot set worktree cwd; keep serial until host supports workspace selection");
+				const cwd = ctx?.cwd || process.cwd();
+				const roots = new Set([...board().tasks, ...leases.values()].filter(other => !terminalWork(other.status))
+					.flatMap(other => other.worktreePath ? [resolve(other.worktreePath)] : other.isolation === "worktree" ? [`anon:${other.id}`] : [])
+					.filter(root => root !== resolve(cwd)));
+				if (roots.size >= 5 && !task.splitWaiverReason) throw new Error("max 5 concurrent extra worktrees without splitWaiverReason");
+				const repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] }).trim();
+				// Scopes are already absolute. Rebase repository-local scopes, never external paths, into the clone.
+				const relativeScope = (scope: string) => {
+					const rel = relative(repoRoot, scopeBase(scope));
+					if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw new Error(`scope outside repository: ${scope}`);
+					return rel;
+				};
+				const reads = task.readPaths.map(relativeScope), writes = task.writePaths.map(relativeScope);
+				const scopeProblem = autoWorktreeScopeProblem(repoRoot, [...task.readPaths, ...task.writePaths]);
+				if (scopeProblem) throw new Error(scopeProblem);
+				const result = provisionAutoWorktree(repoRoot, task.id);
+				if (!result.ok || !result.worktreePath || !result.branch) throw new Error(result.reason || "auto-worktree provisioning returned incomplete ownership");
+				const rebase = (paths: string[], rels: string[]) => paths.map((scope, i) => resolve(result.worktreePath!, rels[i]) + (isDirScope(scope) ? sep : ""));
+				const rebasedReads = rebase(task.readPaths, reads), rebasedWrites = rebase(task.writePaths, writes);
+				const rebasedProblem = autoWorktreeScopeProblem(result.worktreePath, [...rebasedReads, ...rebasedWrites]);
+				if (rebasedProblem) {
+					// Retain cleanup provenance even when admission fails; never grant isolation or release locks.
+					task.evidence.push(`auto-worktree-unadmitted:${result.branch}@${result.worktreePath}; cleanup requires read-only verification`);
+					throw new Error(rebasedProblem);
+				}
+				task.readPaths = rebasedReads;
+				task.writePaths = rebasedWrites;
+				task.isolation = "worktree";
+				task.worktreePath = result.worktreePath;
+				task.worktreeBranch = result.branch;
+				task.worktreeOwned = true;
+				task.evidence.push(`auto-worktree-provisioned:${result.branch}@${result.worktreePath}`);
+			} catch (error) {
+				task.autoWorktreeFailedAt = new Date().toISOString();
+				const reason = error instanceof Error ? error.message : String(error);
+				task.evidence.push(`auto-worktree-failed:${reason}`);
+			}
+			board().revision++;
+			changed = true;
+		}
+		if (changed) persist();
 	}
 	let isPumpActive = false;
 
@@ -3377,11 +3455,14 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		const hosted = resume ? usesHostedTransport(resume) : hasHostTools();
 		const parsedTaskId = /^TEAM_TASK:\s*(W-[A-Za-z0-9_.-]+)/m.exec(prompt)?.[1];
 		const scopedTask = task ?? (parsedTaskId ? board().tasks.find(t => t.id === parsedTaskId) : undefined);
+		const transportProblem = worktreeTransportProblem(scopedTask, resume, ctx);
+		if (transportProblem) throw new Error(transportProblem);
 		if (!runs.some(r => r.taskId === runId)) {
 			const receipt: RunRecord = { taskId: runId, role, description, status: "running", at: new Date().toISOString(), executionTransport: hosted ? "hosted" : "native" };
 			runs.push(receipt); pi.appendEntry(RUN_TYPE, receipt);
 		}
 		if (task) task.executionTransport = hosted ? "hosted" : "native";
+		if (scopedTask?.worktreeOwned && scopedTask.isolation === "worktree" && scopedTask.worktreePath) runnerOptions.cwd = scopedTask.worktreePath;
 		const record = [...runs].reverse().find(r => r.taskId === runId);
 		if (record) record.executionTransport = hosted ? "hosted" : "native";
 		const outcome = hosted ? await launchHostedSubagent({
@@ -3858,6 +3939,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			const available = Math.max(0, target - currentRunning);
 			if (available <= 0) return { launched: [], errors: [], backfillCount: 0 };
 
+			autoProvisionWorktreesForReadyTasks(ctx);
 			const batch = schedulableBatch();
 			const toLaunch = batch.slice(0, Math.min(available, maxSlots));
 			const launched: string[] = [];
@@ -3915,7 +3997,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			for (const task of toLaunch) {
 				// The batch was computed before earlier async launches; a hold set or a reservation claimed in
 				// the meantime must win. markDispatched() still re-validates status/deps/scope atomically.
-				if (task.manualDispatch || programmaticDispatches.has(task.id)) continue;
+				if (task.manualDispatch || programmaticDispatches.has(task.id) || worktreeTransportProblem(task, undefined, ctx)) continue;
 				const role = task.role as Role;
 				if (isRoleUnavailable(state, role)) continue;
 				const runId = `run-${task.id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -4046,7 +4128,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		if (ctx) captureToolLauncher(ctx);
 		daemonTimer = setInterval(async () => {
 			if (!state.enabled || isSubagentSession || isPumpActive || agentToolUnavailable) return;
-			if (schedulableBatch().length === 0) return;
+			// Scope-blocked writers must reach the pump's auto-worktree preflight too.
+			if (schedulableBatch().length === 0 && !(cfg.autoWorktreeOnConflict && board().tasks.some(task =>
+				!task.manualDispatch && (task.status === "ready" || task.status === "queued")
+				&& !task.autoWorktreeFailedAt && !task.worktreePath && task.writePaths.length > 0))) return;
 			try {
 				if (disposed || !ctxStore.current) return;
 				await schedulerPump(backgroundDispatchCtx());
@@ -5001,6 +5086,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		if (workId) {
 			settleReclaimedReviews();
 			const task = board().tasks.find(t => t.id === workId);
+			if (task?.role === role && !resumeId) autoProvisionWorktreesForReadyTasks(ctx, workId);
+			const transportProblem = worktreeTransportProblem(task, resumeId, ctx);
+			if (transportProblem) return { block: true, reason: transportProblem };
 			if (!task || !readyTasks(board()).includes(task) || task.role !== role || heldConflict(task)) {
 				return { block: true, reason: dispatchBlockReason(workId, role, task) };
 			}

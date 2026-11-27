@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import team, { initialState, defaultConfig, newGoal } from '../extensions/team.ts';
 const root=mkdtempSync(join(tmpdir(),'team-ledger-hooks-')); const original=process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR=root;
-writeFileSync(join(root,'team.json'),JSON.stringify({maxConcurrent:2,sessionBudgetUSD:0.001,maxAutoRetries:1,goalMaxRounds:1,goalMaxStalls:1,roles:{bridges:{maxCalls:1,budgetUSD:0.001}},fallbacks:{}}));
+writeFileSync(join(root,'team.json'),JSON.stringify({autoWorktreeOnConflict:false,maxConcurrent:2,sessionBudgetUSD:0.001,maxAutoRetries:1,goalMaxRounds:1,goalMaxStalls:1,roles:{bridges:{maxCalls:1,budgetUSD:0.001}},fallbacks:{}}));
 let seq=0,passed=0;
 function harness(seed?:any[],child=false) {
  const state=initialState(defaultConfig()); state.enabled=true; state.startedAt='2026-01-01'; state.goal=newGoal('Original goal',['Original acceptance']);

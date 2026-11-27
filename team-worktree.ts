@@ -15,7 +15,8 @@
 
 import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, opendirSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { scopeBase } from "./team-scope.ts";
 import { terminalWork, type WorkTask } from "./team-ledger.ts";
 
 export const DEFAULT_WORKTREE_GRACE_MS = 30 * 60_000;
@@ -180,6 +181,32 @@ export function extractTaskWorktreeRoots(
 		if (deepestMatch) out.add(deepestMatch);
 	}
 	return [...out];
+}
+
+/** Conservative admission: a checkout is not physical isolation if scopes traverse symlinks.
+ * Reject tracked symlinks (including dangling links and directory descendants), plus symlinked
+ * existing ancestors of missing paths. Keep the original scopes/locks on every failure.
+ */
+export function autoWorktreeScopeProblem(repoRoot: string, scopes: readonly string[]): string | undefined {
+	const root = resolve(repoRoot);
+	for (const scope of scopes) {
+		const absolute = resolve(scopeBase(scope));
+		const rel = relative(root, absolute);
+		if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return `scope outside repository: ${scope}`;
+		let current = absolute;
+		for (;;) {
+			try {
+				if (lstatSync(current).isSymbolicLink()) return `symlink scope ancestor prevents verified isolation: ${current}`;
+			} catch { /* Missing descendants still require checking every existing ancestor. */ }
+			const parent = dirname(current);
+			if (parent === current) break;
+			current = parent;
+		}
+	}
+	const tracked = gitExec(root, ["ls-files", "--stage"]);
+	if (!tracked.ok) return "cannot verify tracked symlinks; refusing auto-worktree (fail-closed)";
+	if (/^120000 /m.test(tracked.stdout)) return "tracked symlinks require explicit physical scope verification; refusing auto-worktree (fail-closed)";
+	return undefined;
 }
 
 export interface AutoWorktreeResult {

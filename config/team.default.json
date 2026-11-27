@@ -15,6 +15,7 @@
   "bashTimeoutSeconds": 180,
   "bashMaxTimeoutSeconds": 900,
   "parentSoloWork": "delegated",
+  "autoWorktreeOnConflict": true,
   "agentWaitTimeoutSeconds": 600,
   "autoGcChildSessions": true,
   "gcReviewerCooldownMinutes": 60,

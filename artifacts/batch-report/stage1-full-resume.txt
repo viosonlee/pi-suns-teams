@@ -1,0 +1,73 @@
+
+> pi-teams@1.2.7 test
+> node tests/run-all.mjs
+
+✓ test-review-gate.ts (222ms)
+✓ test-review-independence.ts (654ms)
+✓ test-review-protocol.ts (232ms)
+✓ test-team-audit-regression.ts (1755ms)
+✓ test-team-cp-parent-hooks.ts (711ms)
+✓ test-team-cp-parent.ts (263ms)
+✓ test-team-dispatch-coordination.ts (341ms)
+✓ test-team-doctor.ts (455ms)
+✓ test-team-gc-safety.ts (372ms)
+✓ test-team-gc.ts (194ms)
+✓ test-team-goal-edit.ts (502ms)
+✓ test-team-host-hooks.ts (576ms)
+✓ test-team-host-probe.ts (378ms)
+✓ test-team-host-runner.ts (255ms)
+✓ test-team-ledger-hooks.ts (910ms)
+✓ test-team-ledger.ts (339ms)
+✓ test-team-model-list.ts (320ms)
+✓ test-team-native-hooks.ts (1308ms)
+✓ test-team-native-runner.ts (1151ms)
+✓ test-team-parallel.ts (297ms)
+✓ test-team-prune-and-review-contract.ts (341ms)
+✓ test-team-recovery-hooks.ts (430ms)
+✓ test-team-recovery-safety.ts (745ms)
+✓ test-team-recovery.ts (464ms)
+✓ test-team-refactor-scheduler.ts (752ms)
+✓ test-team-review-lease-release.ts (660ms)
+✓ test-team-review-lifecycle-safety.ts (707ms)
+✓ test-team-rework-complete.ts (971ms)
+✓ test-team-role-review.ts (530ms)
+✓ test-team-scope-granularity.ts (449ms)
+✓ test-team-scope-precision.ts (230ms)
+✓ test-team-state-delta.ts (2993ms)
+✗ test-team-v21-verification.ts (784ms)
+  ✓ Issue 5: Auto-acceptance verifies terminal state, clean exit, and non-error evidence
+
+  [LATENCY BENCHMARK METRICS]
+  - probeLiveChildSession execution time: avg 1.130 ms
+  - scheduler nextDispatchableTasks (30 tasks -> 20 slots): avg 15.731 ms
+  - End-to-end event-driven backfill: immediate (< 15 ms via microtask) vs 1000 ms (daemon interval)
+  ✗ Issue 6: Measured latency benchmarks for probe, scheduler and backfill
+AssertionError [ERR_ASSERTION]: Scheduler calculation must be fast (<10ms), was 15.731ms
+    at file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:383:10
+    at test (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:55:9)
+    at runVerification (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:313:8) {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: false,
+  expected: true,
+  operator: '==',
+  diff: 'simple'
+}
+FATAL VERIFICATION FAILURE: AssertionError [ERR_ASSERTION]: Scheduler calculation must be fast (<10ms), was 15.731ms
+    at file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:383:10
+    at test (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:55:9)
+    at runVerification (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:313:8) {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: false,
+  expected: true,
+  operator: '==',
+  diff: 'simple'
+}
+
+✓ test-team-version.ts (486ms)
+✓ test-team-worktree.ts (901ms)
+✓ test-team.ts (410ms)
+
+35/36 test files passed
+Failed: test-team-v21-verification.ts
