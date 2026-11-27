@@ -1,0 +1,68 @@
+
+> pi-teams@1.2.7 test
+> node tests/run-all.mjs
+
+✓ test-review-gate.ts (191ms)
+✓ test-review-independence.ts (380ms)
+✓ test-review-protocol.ts (146ms)
+✓ test-team-audit-regression.ts (381ms)
+✓ test-team-cp-parent-hooks.ts (649ms)
+✓ test-team-cp-parent.ts (264ms)
+✓ test-team-dispatch-coordination.ts (331ms)
+✓ test-team-doctor.ts (507ms)
+✓ test-team-gc-safety.ts (394ms)
+✓ test-team-gc.ts (209ms)
+✓ test-team-goal-edit.ts (453ms)
+✓ test-team-host-hooks.ts (503ms)
+✓ test-team-host-probe.ts (446ms)
+✗ test-team-host-runner.ts (499ms)
+✓ normalizeHostToolResult unwraps the SDK wrapper, keeps outer isError, accepts raw mocks
+✓ hosted provenance: spawned marker without pi-web:subagent; legacy CLI is not hosted
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
++ actual - expected
+
++ 'running'
+- 'completed'
+
+    at file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-host-runner.ts:212:10
+    at async test (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-host-runner.ts:37:2)
+    at async file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-host-runner.ts:185:2 {
+  generatedMessage: true,
+  code: 'ERR_ASSERTION',
+  actual: 'running',
+  expected: 'completed',
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v22.23.2
+
+✓ test-team-ledger-hooks.ts (1253ms)
+✓ test-team-ledger.ts (595ms)
+✓ test-team-model-list.ts (520ms)
+✓ test-team-native-hooks.ts (1735ms)
+✓ test-team-native-runner.ts (1135ms)
+✓ test-team-parallel.ts (281ms)
+✓ test-team-prune-and-review-contract.ts (320ms)
+✓ test-team-recovery-hooks.ts (333ms)
+✓ test-team-recovery-safety.ts (652ms)
+✓ test-team-recovery.ts (302ms)
+✓ test-team-refactor-scheduler.ts (395ms)
+✓ test-team-review-lease-release.ts (395ms)
+✓ test-team-review-lifecycle-safety.ts (418ms)
+✓ test-team-rework-complete.ts (467ms)
+✓ test-team-role-review.ts (376ms)
+✓ test-team-scope-granularity.ts (337ms)
+✓ test-team-scope-precision.ts (211ms)
+✓ test-team-state-delta.ts (1719ms)
+✓ test-team-v21-verification.ts (580ms)
+✓ test-team-version.ts (308ms)
+✓ test-team-worktree.ts (848ms)
+✓ test-team.ts (439ms)
+
+35/36 test files passed
+Failed: test-team-host-runner.ts

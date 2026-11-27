@@ -76,7 +76,7 @@ try {
 	});
 
 	test("llm, autoAccept:false and explicit reviewerRole opt into independent review", () => {
-		for (const fields of [{ reviewTier: "llm" }, { autoAccept: false }, { reviewerRole: "cp" }, { reviewTier: "none", autoAccept: false }, { reviewTier: "none", reviewerRole: "cp" }]) {
+		for (const fields of [{ reviewTier: "llm" }, { autoAccept: false }, { reviewerRole: "cp" }, { reviewTier: "none", reviewerRole: "cp" }]) {
 			const f = setup("booker", fields);
 			assert.equal(isReviewExempt(f.task), false);
 			assert.equal(accept(f), false);
@@ -85,6 +85,14 @@ try {
 			assert.equal(f.task.status, "reported");
 			assert.ok(!readyTasks(f.board).includes(f.successor));
 		}
+		// Batch 1 §1.4 intentional semantic change: reviewTier "none" takes precedence over autoAccept:false
+		// for NOT spawning a reviewer; autoAccept:false merely keeps the delivery `reported` until explicit
+		// parent settlement. An explicit reviewerRole still forces independent review (verified above).
+		const waived = setup("booker", { reviewTier: "none", autoAccept: false });
+		assert.equal(isReviewExempt(waived.task), true, "none beats autoAccept:false for reviewer spawn");
+		assert.equal(accept(waived), false, "exemption never auto-settles; delivery stays reported");
+		assert.equal(waived.task.status, "reported");
+		assert.equal(waived.board.tasks.length, 2, "no reviewer spawned for reviewTier none + autoAccept false");
 	});
 
 	test("product-writer default CP review (booker, bridges) vs explicit none for small read/write work", () => {

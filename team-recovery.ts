@@ -1571,3 +1571,80 @@ export function probeAllLiveChildren(
 	}
 	return results;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Batch 1 Rework R3: hosted-child provenance verification for destructive ops.
+// NOTE: the hosted spawn-link literal types below duplicate team-runner.ts
+// PI_WEB_CHILD_LINK_TYPE/PI_WEB_PARENT_LINK_TYPE on purpose — team-runner already
+// imports team-recovery, so importing back would create a module cycle. Keep the
+// strings byte-identical with team-runner.ts.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Byte-identical duplicate of team-runner.ts PI_WEB_CHILD_LINK_TYPE (cycle-safe copy). */
+export const HOSTED_CHILD_LINK_TYPE = "pi-web.subsession.spawned";
+
+export type HostedProvenanceResult =
+	| { ok: true; via: "subagent-meta" | "hosted-spawn-link"; file?: string }
+	| { ok: false; status: "foreign" | "uncertain" | "unreadable" | "unknown-session" | "malformed"; reason: string; file?: string };
+
+/**
+ * Verify that a session file genuinely belongs to THIS parent before any destructive or
+ * state-mutating operation (cancel/stop/abort) is aimed at it. A hosted child may carry no
+ * pi-web:subagent metadata at all (pi-web spawns it through manage_subsession, not through
+ * team-runner), so provenance accepts EITHER:
+ *   (a) a pi-web:subagent metadata entry whose parentSessionId matches, or
+ *   (b) a pi-web.subsession.spawned entry whose data.spawnedBySessionId matches the parent
+ *       AND data.spawnedSessionId matches the target session id.
+ * Anything else — foreign parent, unreadable file, missing file, malformed JSONL — fails
+ * closed as NOT proven. Callers must never act on an unproven session.
+ */
+export function verifyHostedChildProvenance(
+	sessionId: string,
+	parentSessionId: string,
+	options?: { sessionsDir?: string; maxSessionBytes?: number; maxEntries?: number },
+): HostedProvenanceResult {
+	if (!parentSessionId) {
+		return { ok: false, status: "uncertain", reason: "current parent session id is unavailable" };
+	}
+	const resolved = resolveChildSessionFile(sessionId, options?.sessionsDir);
+	if (resolved.status !== "found") {
+		return {
+			ok: false,
+			status: resolved.status === "ambiguous" ? "uncertain" : resolved.status === "invalid" ? "malformed" : "unknown-session",
+			reason: resolved.reason,
+		};
+	}
+	const read = readBoundedNoFollow(resolved.file, options?.maxSessionBytes ?? RECOVERY_MAX_SESSION_BYTES);
+	if (!read.ok || typeof read.text !== "string") {
+		return { ok: false, status: "unreadable", reason: `cannot read child session within bounds: ${read.error ?? "unknown read failure"}`, file: resolved.file };
+	}
+	const parsed = parseSessionJsonl(read.text, { maxEntries: options?.maxEntries, maxChars: options?.maxSessionBytes });
+	if (!parsed.ok) {
+		return { ok: false, status: "malformed", reason: parsed.error, file: resolved.file };
+	}
+	const { header, entries } = parsed.value;
+	if (header.id !== sessionId) {
+		return { ok: false, status: "malformed", reason: `session header id ${header.id} does not match ${sessionId}`, file: resolved.file };
+	}
+	// (a) native/ledger subagent metadata — reuse the exact same strict validation as recovery.
+	const metas = entries.filter((entry) => entry.type === "custom" && entry.customType === SUBAGENT_META_TYPE);
+	if (metas.length) {
+		const check = validateSubagentMetadata(entries, parentSessionId);
+		if (check.ok) return { ok: true, via: "subagent-meta", file: resolved.file };
+		return { ok: false, status: check.status === "malformed" ? "malformed" : "foreign", reason: `subagent metadata present but does not bind this parent: ${check.reason}`, file: resolved.file };
+	}
+	// (b) hosted spawn link.
+	const spawnLinks = entries.filter((entry) => entry.type === "custom" && entry.customType === HOSTED_CHILD_LINK_TYPE);
+	for (const link of spawnLinks) {
+		if (!isObject(link.data)) continue;
+		const spawnedBy = asString(link.data.spawnedBySessionId);
+		const spawned = asString(link.data.spawnedSessionId);
+		if (spawnedBy === parentSessionId && spawned === sessionId) {
+			return { ok: true, via: "hosted-spawn-link", file: resolved.file };
+		}
+	}
+	if (spawnLinks.length) {
+		return { ok: false, status: "foreign", reason: `hosted spawn link binds a different parent/session (${spawnLinks.map(l => isObject(l.data) ? `${asString(l.data.spawnedBySessionId) ?? "?"}->${asString(l.data.spawnedSessionId) ?? "?"}` : "malformed").join(", ")}); this session is not ours`, file: resolved.file };
+	}
+	return { ok: false, status: "foreign", reason: "session carries neither pi-web:subagent metadata nor a pi-web.subsession.spawned link binding this parent; provenance unproven — never act on it", file: resolved.file };
+}

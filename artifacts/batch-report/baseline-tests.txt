@@ -1,0 +1,73 @@
+
+> pi-teams@1.2.7 test
+> node tests/run-all.mjs
+
+✓ test-review-gate.ts (188ms)
+✓ test-review-independence.ts (393ms)
+✓ test-review-protocol.ts (144ms)
+✓ test-team-audit-regression.ts (378ms)
+✓ test-team-cp-parent-hooks.ts (685ms)
+✓ test-team-cp-parent.ts (263ms)
+✓ test-team-dispatch-coordination.ts (350ms)
+✓ test-team-doctor.ts (437ms)
+✓ test-team-gc-safety.ts (364ms)
+✓ test-team-gc.ts (192ms)
+✓ test-team-goal-edit.ts (452ms)
+✓ test-team-host-hooks.ts (537ms)
+✓ test-team-host-probe.ts (373ms)
+✓ test-team-host-runner.ts (251ms)
+✓ test-team-ledger-hooks.ts (831ms)
+✓ test-team-ledger.ts (345ms)
+✓ test-team-model-list.ts (306ms)
+✓ test-team-native-hooks.ts (1187ms)
+✓ test-team-native-runner.ts (1005ms)
+✓ test-team-parallel.ts (279ms)
+✓ test-team-prune-and-review-contract.ts (288ms)
+✓ test-team-recovery-hooks.ts (327ms)
+✓ test-team-recovery-safety.ts (642ms)
+✓ test-team-recovery.ts (304ms)
+✓ test-team-refactor-scheduler.ts (400ms)
+✓ test-team-review-lease-release.ts (394ms)
+✓ test-team-review-lifecycle-safety.ts (413ms)
+✓ test-team-rework-complete.ts (468ms)
+✓ test-team-role-review.ts (327ms)
+✓ test-team-scope-granularity.ts (318ms)
+✓ test-team-scope-precision.ts (221ms)
+✓ test-team-state-delta.ts (1809ms)
+✗ test-team-v21-verification.ts (551ms)
+  - Total Tasks Completed:         30 / 30 (100% Convergence)
+  - Max Concurrency Reached:       20 / 20
+  - CP Main Turns Used:            0 (Zero-turn autonomous background backfill)
+  - Total Background Ticks:        6
+  ✓ Issue 7: 30 independent tasks autonomous backfill to 100% completion (0 CP turns)
+  ✓ Issue 8: Reviewer DAG verifies both PASS and REWORK branches correctly
+  ✗ Issue 9: Subagent Read-Only Bash & Write Isolation (Negative tests & bwrap)
+AssertionError [ERR_ASSERTION]: Kernel must report Read-only file system
+    at file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:715:12
+    at test (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:55:9)
+    at runVerification (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:564:8) {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: "touch: 无法 touch '/tmp/pi-bwrap-test-9OFvu8/test_file.txt': 只读文件系统\n",
+  expected: /Read-only file system/i,
+  operator: 'match',
+  diff: 'simple'
+}
+FATAL VERIFICATION FAILURE: AssertionError [ERR_ASSERTION]: Kernel must report Read-only file system
+    at file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:715:12
+    at test (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:55:9)
+    at runVerification (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:564:8) {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: "touch: 无法 touch '/tmp/pi-bwrap-test-9OFvu8/test_file.txt': 只读文件系统\n",
+  expected: /Read-only file system/i,
+  operator: 'match',
+  diff: 'simple'
+}
+
+✓ test-team-version.ts (300ms)
+✓ test-team-worktree.ts (608ms)
+✓ test-team.ts (329ms)
+
+35/36 test files passed
+Failed: test-team-v21-verification.ts

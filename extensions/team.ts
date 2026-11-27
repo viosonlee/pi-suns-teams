@@ -23,6 +23,7 @@ import {
 	reviewerTaskId, completeReviewTask, publishTasks, overlap, recordReview, deliveryVersionOf, reviewRecordsOf,
 	reclaimStaleReviews, isActiveReviewHold, scopeBlockingLive, REVIEW_STALE_MS, pruneStaleReviews,
 	reviewDispatchOwnershipProblem, setManualDispatchHold, releaseManualDispatchHold,
+	isMetadataSettlementTransition, decideCancelAction, validateSteerTarget, amendTask, formatHolderRejection, preserveManualDispatchOnReadyReturn, decideReviewPolicy,
 	type WorkTask, type WorkLedger,
 } from "../team-ledger.ts";
 import { parseReviewReport } from "../team-review.ts";
@@ -37,6 +38,7 @@ import {
 	recoverChildReport,
 	recoveryKey,
 	probeLiveChildSession,
+	verifyHostedChildProvenance,
 	type RecoveredReport,
 	type RecoveryReadResult,
 } from "../team-recovery.ts";
@@ -58,6 +60,7 @@ import {
 	onSubagentComplete,
 	isSubagentActive,
 	stopSubagent,
+	awaitStopSubagent,
 	PI_WEB_PARENT_LINK_TYPE,
 	readAgentProfile,
 	sanitizeModelOverride,
@@ -2871,6 +2874,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		if (!task || task.status !== "reviewing" || update.status !== "ready") return;
 		releaseFinishedAttempt(task);
 		task.status = "reported";
+		// Batch 1 §1.4: when the WORKER carried manualDispatch, a rework return to ready must preserve it
+		// so schedulerPump cannot steal the re-dispatch. updateTask (team-ledger) applies the same guard.
+		if (update.status === "ready") preserveManualDispatchOnReadyReturn(task);
 	}
 	function heldConflict(task: WorkTask, allowCurrentLiveAttempt = false): boolean {
 		return [...leases.values()].some(other => liveWork(other.status)
@@ -3059,8 +3065,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 				// Already delivered/retrieved for this attempt: never re-poll across reloads or after review INCOMPLETE.
 				if (t.runId && t.completedNotifiedRunId === t.runId) return false;
 				const needsEvidence = !(t.evidence && t.evidence.length > 0);
-				const cpBriefExempt = t.role === "cp" && !isReviewTask(t) && t.autoAccept !== false && !t.reviewerRole?.trim() && t.reviewTier !== "llm";
-				const needsReviewer = !isReviewTask(t) && !isReviewExempt(t) && !cpBriefExempt
+				// Batch 1 §1.4: unified review policy — one decision path instead of parallel ad-hoc rules.
+				const cpBriefExempt = decideReviewPolicy(t.role, t).spawnReviewerOnDelivery === false && t.role === "cp";
+				const needsReviewer = !isReviewTask(t) && decideReviewPolicy(t.role, t).spawnReviewerOnDelivery && !isReviewExempt(t)
 					&& !board().tasks.some(r => r.id === reviewerTaskId(t.id) && r.reviewedDeliveryVersion === deliveryVersionOf(t));
 				return needsEvidence || needsReviewer;
 			});
@@ -3244,7 +3251,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 							dirty = true;
 						}
 					}
-					const cpBriefExempt = task.role === "cp" && !isReviewTask(task) && task.autoAccept !== false && !task.reviewerRole?.trim() && task.reviewTier !== "llm";
+					// Batch 1 §1.4: unified review policy. A cp non-review brief is exempt through the same decision
+					// path as ayton/cameron defaults; isReviewTask guard preserved below.
+					const cpBriefExempt = task.role === "cp" && !isReviewTask(task) && decideReviewPolicy(task.role, task).spawnReviewerOnDelivery === false;
 					if (isReviewExempt(task) || cpBriefExempt) {
 						// Review exemption routes the delivery to the main CP instead of a spawned reviewer.
 						// It never infers "done" from the child's prose: the task stays "reported" until the
@@ -4029,7 +4038,24 @@ export default function teamExtension(pi: ExtensionAPI): void {
 						if (workerTarget) reviewBlock = `\n\n${buildReviewContract(task, workerTarget)}`;
 					}
 					const safeTitle = sanitizePromptDirectiveText(task.title);
-					const prompt = `TEAM_TASK: ${task.id}\nGoal: ${safeTitle}\nRole: ${role}\nRead Paths: ${task.readPaths.join(", ") || "none"}\nWrite Paths: ${task.writePaths.join(", ") || "none"}\nAcceptance Criteria:\n${task.acceptance.map((a: string) => `- ${sanitizePromptDirectiveText(a)}`).join("\n")}${reviewBlock}\n\n${buildTaskContract(task.id, task)}`;
+					// Batch 1 §1.3: the LATEST mutable brief is injected at dispatch time; acceptance stays the hard contract.
+					const briefBlock = typeof task.brief === "string" && task.brief.trim() ? `\nBrief (latest, mutable — acceptance below remains the hard verification contract):\n${sanitizePromptDirectiveText(task.brief.trim())}` : "";
+					// Batch 1 review L3: steers recorded after the last dispatch are injected so the audit
+					// trail claim ("applies to the next resume/rework dispatch") holds on auto-dispatch too.
+					// IMPORTANT: compare against the PREVIOUS attempt's dispatch time — markDispatched() above
+					// already overwrote task.dispatchedAt with "now", which would empty the pending set.
+					const lastDispatchAt = prevAttempt.dispatchedAt ? Date.parse(prevAttempt.dispatchedAt) : 0;
+					const pendingSteers = (task.evidence ?? [])
+						.filter((line: string) => line.startsWith("[STEER] "))
+						.filter((line: string) => {
+							const m = line.match(/^\[STEER\] (\S+)/);
+							return !lastDispatchAt || (m ? Date.parse(m[1]) : 0) > lastDispatchAt;
+						})
+						.map((line: string) => line.replace(/^\[STEER\] \S+ [^:]*: /, ""));
+					const steerBlock = pendingSteers.length
+						? `\nPending parent steering (recorded after your last dispatch — apply these now):\n${pendingSteers.map((m: string) => `- ${sanitizePromptDirectiveText(m)}`).join("\n")}`
+						: "";
+					const prompt = `TEAM_TASK: ${task.id}\nGoal: ${safeTitle}\nRole: ${role}\nRead Paths: ${task.readPaths.join(", ") || "none"}\nWrite Paths: ${task.writePaths.join(", ") || "none"}\nAcceptance Criteria:\n${task.acceptance.map((a: string) => `- ${sanitizePromptDirectiveText(a)}`).join("\n")}${briefBlock}${steerBlock}${reviewBlock}\n\n${buildTaskContract(task.id, task)}`;
 					
 					const rawCallRes = await executeFn("Agent", {
 						subagent_type: role,
@@ -5118,6 +5144,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		const dispatchedModel = typeof input.model === "string" && input.model.trim() ? input.model.trim() : undefined;
 		input.run_id = taskId;
 
+		const priorDispatchAt = workId ? board().tasks.find(t => t.id === workId)?.dispatchedAt : undefined;
 		if (workId) writeLease(markDispatched(board(), workId, role, taskId, resumeId));
 		else writeLease({ id: taskId, title: description, requestIds: [], role, dependsOn: [], readPaths: [], writePaths: [], acceptance: ["Parent verifies the returned report"], status: "running", evidence: [], runId: taskId, sessionId: resumeId, dispatchedAt: new Date().toISOString() });
 		const scoped = workId ? board().tasks.find(t => t.id === workId) : undefined;
@@ -5133,7 +5160,26 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			// The child-side write guard reads its scope from the prompt; a manually dispatched
 			// task must carry the ledger's scope or the child is treated as read-only.
 			const cleanPrompt = prompt.replace(/^[ \t]*(?:SCOPE|Write Paths|Role)[ \t]*:[^\n]*$/gm, "[sanitized]");
-			input.prompt = `${cleanPrompt}${reviewBlock}\nRole: ${role}\nRead Paths: ${scoped.readPaths.join(", ") || "none"}\nWrite Paths: ${scoped.writePaths.join(", ") || "none"}\n\n${buildTaskContract(taskId, { ...scoped, role })}`;
+			// Batch 1 §1.3: inject the LATEST mutable brief into every dispatch/resume prompt; acceptance stays the contract.
+			const manualBriefBlock = typeof scoped.brief === "string" && scoped.brief.trim() && !cleanPrompt.includes(scoped.brief.trim()) ? `\nBrief (latest, mutable — acceptance criteria remain the hard verification contract):\n${sanitizePromptDirectiveText(scoped.brief.trim())}` : "";
+			// Batch 1 review L3: steers recorded in ledger evidence AFTER the last dispatch have never been
+			// seen by the child. Inject them into the resume/re-dispatch prompt so the audit trail's claim
+			// ("applies to the next resume/rework dispatch") is true. A steer line is `[STEER] <iso> <delivery>: <msg>`.
+			// IMPORTANT: scoped.dispatchedAt was just overwritten by markDispatched() with the current
+			// dispatch time — pending steers must be compared against the PREVIOUS attempt's dispatch time.
+			const lastDispatch = priorDispatchAt ? Date.parse(priorDispatchAt) : 0;
+			const pendingSteers = (scoped.evidence ?? [])
+				.filter(line => line.startsWith("[STEER] "))
+				.filter(line => {
+					const m = line.match(/^\[STEER\] (\S+)/);
+					const at = m ? Date.parse(m[1]) : 0;
+					return !lastDispatch || at > lastDispatch;
+				})
+				.map(line => line.replace(/^\[STEER\] \S+ [^:]*: /, ""));
+			const steerBlock = pendingSteers.length
+				? `\nPending parent steering (recorded after your last dispatch — apply these now):\n${pendingSteers.map(m => `- ${sanitizePromptDirectiveText(m)}`).join("\n")}`
+				: "";
+			input.prompt = `${cleanPrompt}${manualBriefBlock}${steerBlock}${reviewBlock}\nRole: ${role}\nRead Paths: ${scoped.readPaths.join(", ") || "none"}\nWrite Paths: ${scoped.writePaths.join(", ") || "none"}\n\n${buildTaskContract(taskId, { ...scoped, role })}`;
 		} else {
 			input.prompt = `${prompt}\n\n${buildTaskContract(taskId)}`;
 		}
@@ -5469,7 +5515,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 		description: "Inspect/register/update the persistent additive request/task queue. New tasks append at the tail. move changes pending priority using front/tail/before/after; dependencies/conflicts still apply and live children are never preempted. Done/cancelled/superseded items auto-archive; archive queries their evidence/history. Add tasks with requestIds, role, dependencies, concrete read/write paths and acceptance. Update statuses with actual evidence and reason; reported is not done. For planned items add replacements then supersede the original using replacementIds. Resolve each user request with evidence only after all linked tasks are terminal. Cancellation/supersession requires explicit user authority referenced in evidence. childStopped=true is a main-CP attestation that an interrupted child has actually stopped, permitting blocked only; verify before retry, never infer stop from timeout. Goal requests can only close through team_goal. Mutations are atomic and parent-only.",
 		parameters: {
 			type: "object", properties: {
-				action: { type: "string", enum: ["list", "add", "move", "archive", "update", "resolve", "dispatch", "prune_reviews"] },
+				action: { type: "string", enum: ["list", "add", "move", "archive", "update", "resolve", "dispatch", "prune_reviews", "cancel", "steer", "amend"] },
 				autoDispatch: { type: "boolean", description: "Whether to immediately launch ready independent tasks up to concurrency capacity (default true)." },
 				dryRun: { type: "boolean", description: "For prune_reviews: preview pruned/migrated review tasks without mutating the ledger." },
 				includeFailed: { type: "boolean", description: "For prune_reviews: also cancel historical failed review tasks (default true)." },
@@ -5480,8 +5526,9 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					requestIds: { type: "array", items: { type: "string" } }, dependsOn: { type: "array", items: { type: "string" } },
 					readPaths: { type: "array", items: { type: "string" } }, writePaths: { type: "array", items: { type: "string" } },
 					acceptance: { type: "array", items: { type: "string" } },
+					brief: { type: "string", description: "Optional mutable working brief injected into dispatch/resume prompts. Acceptance remains the hard verification contract; amend briefs via action \"amend\"." },
 					reviewTier: { type: "string", enum: ["deterministic", "llm", "none"], description: "Unset: Ayton (QA/real-device) & Cameron (Release/Ops/Docs) default review-exempt; Booker & Bridges default CP review. none: explicit waiver for bounded analysis or small single-file/non-decision tasks. llm: independent CP review. deterministic: existing ALL machine assertions gate with autoAccept:true (the only automatic settlement route). Exemption skips the reviewer child but the parent still accepts the reported delivery. Existing reviewer obligations are preserved." },
-					autoAccept: { type: "boolean", description: "false requests review even for exempt roles; true is required for deterministic machine acceptance, but not for Ayton/Cameron defaults or reviewTier:none. Never bypasses evidence or existing CP holds." },
+					autoAccept: { type: "boolean", description: "false requests review even for exempt roles; true is required for deterministic machine acceptance, but not for Ayton/Cameron defaults or reviewTier:none. Never bypasses evidence or existing CP holds. NOTE: reviewTier:\"none\" takes precedence over autoAccept:false (no reviewer spawns; the delivery stays reported until the parent explicitly settles done) — use reviewerRole or reviewTier:\"llm\" to force review on an exempt-tier task." },
 					reviewerRole: { type: "string", description: "Explicit independent reviewer request disables role-based review exemption; defaults do not populate this field. Reviewer must remain independent of implementer." },
 					splitWaiverReason: { type: "string", description: "Optional brief justification ONLY when a task genuinely cannot be split into <= 3 ACs, <= 5 writePaths, or concrete non-directory slices." },
 				}, required: ["title", "role", "requestIds", "dependsOn", "readPaths", "writePaths", "acceptance"] } },
@@ -5490,6 +5537,15 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					evidence: { type: "array", items: { type: "string" } }, reason: { type: "string" },
 					replacementIds: { type: "array", items: { type: "string" } }, childStopped: { type: "boolean" },
 				}, required: ["id", "status", "evidence", "reason"] } },
+				amendments: { type: "array", items: { type: "object", properties: {
+					id: { type: "string" }, brief: { type: "string" }, acceptance: { type: "array", items: { type: "string" } },
+					readPaths: { type: "array", items: { type: "string" } }, writePaths: { type: "array", items: { type: "string" } },
+					title: { type: "string" }, dependsOn: { type: "array", items: { type: "string" } },
+					retryAsRework: { type: "boolean" }, reason: { type: "string" }, evidence: { type: "array", items: { type: "string" } },
+				}, required: ["id", "reason", "evidence"] } },
+				steers: { type: "array", items: { type: "object", properties: {
+					id: { type: "string" }, message: { type: "string" }, reason: { type: "string" },
+				}, required: ["id", "message"] } },
 				move: { type: "object", properties: {
 					id: { type: "string" }, position: { type: "string", enum: ["front", "tail", "before", "after"] },
 					targetId: { type: "string" }, reason: { type: "string" },
@@ -5518,13 +5574,23 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					for (const update of params.updates) {
 						if (!isObject(update)) throw new Error("Invalid update object.");
 						const target = candidate.tasks.find(t => t.id === update.id);
-						const isPendingCleanup = (update.status === "cancelled" || update.status === "superseded")
-							&& target
-							&& !liveWork(target.status)
-							&& ![...leases.values()].some(l => liveWork(l.status) && !isLeaseSettledOnBoard(l) && l.id === target.id);
-						if (target && !isPendingCleanup && heldConflict(target, true)) {
+						// Batch 1 §1.1: metadata-only settlement of a NON-live target (reported/failed/blocked/ready)
+						// into done/cancelled/superseded is never blocked by any lease holder (see skipLease below).
+						// Rework R2: skip the lease check ENTIRELY for metadata settlement of a non-live target —
+						// regardless of which live tasks hold scope, including a stale lease of the target itself.
+						// A non-live ledger status is the parent's attestation that the attempt no longer writes;
+						// settlement writes no files. A liveWork target is never silently settled:
+						// isMetadataSettlementTransition returns false for live statuses, and updateTask's own
+						// liveWork protections still apply as a second layer.
+						// Crucially, the bypass never covers the target's OWN still-live lease: a branch rollback can
+						// leave the ledger status non-live while the child is actually still running and writing.
+						// Non-live ledger status is only meaningful as "no longer writes" when no live own-lease exists.
+						const ownLiveLease = target ? [...leases.values()].some(l => l.id === target.id && liveWork(l.status) && !isLeaseSettledOnBoard(l)) : false;
+						const skipLease = target && !liveWork(target.status) && !ownLiveLease && isMetadataSettlementTransition(target.status, update.status as never);
+						if (target && !skipLease && heldConflict(target, true)) {
 							const hold = describeScopeHold(target);
-							throw new Error(`${target.id}: A still-live child owns this task/scope on another branch. Reconcile that execution before updating.${hold ? ` Conflict: ${hold}` : ""} Note: team_tasks update changes status/reason/evidence only (not readPaths/writePaths).`);
+							const holders = [...leases.values()].filter(l => liveWork(l.status) && !isLeaseSettledOnBoard(l) && (l.id === target.id || taskConflict(target, l))).map(l => l.id);
+							throw new Error(`${target.id}: A still-live child owns this task/scope on another branch. Reconcile that execution before updating.${hold ? ` Conflict: ${hold}` : ""} ${holders.length ? formatHolderRejection({ kind: "same-task", path: target.writePaths[0] || "(scope)", holderIds: [...new Set(holders)] }) : ""} Note: team_tasks update changes status/reason/evidence only (not readPaths/writePaths); use action "amend" for those.`);
 						}
 						reopenDeliveredAttempt(target, update);
 						// autoDispatch travels with the update: false persists the per-task hold, true explicitly
@@ -5554,6 +5620,221 @@ export default function teamExtension(pi: ExtensionAPI): void {
 					}
 				} else if (params.action === "publish") {
 					publishTasks(candidate, Array.isArray(params.taskIds) ? (params.taskIds as string[]) : undefined);
+				} else if (params.action === "cancel") {
+					// Batch 1 §1.2: first-class cancel. Validates authority/evidence/reason, confirms the child is
+					// actually stopped before releasing leases, and fails closed (blocked/uncertain, never cancelled)
+					// when the stop cannot be confirmed.
+					if (!Array.isArray(params.updates) || !params.updates.length) throw new Error("cancel requires a nonempty updates array of { id, reason, evidence } (evidence must reference explicit user authority).");
+					const cancelResults: string[] = [];
+					for (const entry of params.updates as Array<Record<string, unknown>>) {
+						if (!isObject(entry)) throw new Error("Invalid cancel entry.");
+						const reason = typeof entry.reason === "string" ? entry.reason.trim() : "";
+						const evidence = Array.isArray(entry.evidence) ? entry.evidence.filter(e => typeof e === "string" && e.trim()) : [];
+						if (!reason) throw new Error(`cancel ${String(entry.id)}: reason is required.`);
+						if (!evidence.length) throw new Error(`cancel ${String(entry.id)}: evidence referencing explicit user authority is required.`);
+						const task = candidate.tasks.find(t => t.id === entry.id);
+						if (!task) throw new Error(`cancel: unknown task id ${String(entry.id)}.`);
+						const boardTask = board().tasks.find(t => t.id === task.id);
+						// Determine child liveness: native children via the in-process registry; hosted children via
+						// best available signal. When liveness cannot be determined we treat the child as LIVE and
+						// fail closed — never pretend a cancellation succeeded.
+						const sessionId = boardTask?.sessionId ?? task.sessionId;
+						// Batch 1 review M3/M4: liveness determination. isSubagentActive is PROCESS-LOCAL, so it can
+						// only ever prove a child live here — it can never prove absence across host processes.
+						// Confirmed-not-live therefore requires positive exit evidence, not mere non-tracking:
+						//   native — ledger reached reported/failed/reviewing (the child reported through this
+						//     pipeline) or reviewing-after-completion. blocked/ready/queued requeue states mean the
+						//     child may never have reported back: liveness is UNKNOWN for a leased child.
+						//   hosted — a terminal snapshot on disk bound to this runId is the only exit proof.
+						// livenessUnknown is consumed below: when liveness is unknown we treat the child as live
+						// (fail closed) AND force the unconfirmed-stop branch even for non-live ledger statuses.
+						let childLive = false;
+						let livenessUnknown = false;
+						if (sessionId) {
+							const ledgerStatus = (boardTask?.status ?? task.status) as never;
+							if (boardTask?.executionTransport === "hosted") {
+								const snap = hasHostedTerminalSnapshotOnDisk(sessionId, { ...hostedOptions(ctx), reportNotBefore: boardTask?.dispatchedAt, runId: boardTask?.runId });
+								if (snap) childLive = false;
+								else if (liveWork(ledgerStatus)) { childLive = true; livenessUnknown = true; }
+								else if (["reported", "reviewing", "failed"].includes(ledgerStatus as string)) childLive = false;
+								else { childLive = true; livenessUnknown = true; }
+							} else {
+								if (isSubagentActive(sessionId)) childLive = true;
+								else if (liveWork(ledgerStatus)) { childLive = true; livenessUnknown = true; }
+								else if (["reported", "reviewing", "failed"].includes(ledgerStatus as string)) childLive = false;
+								// Non-live ledger status WITHOUT completion evidence (blocked/ready/queued/planned):
+								// a leased child may still be running in another host process. Fail closed.
+								else if (task.sessionId || task.runId || task.dispatchedAt) { childLive = true; livenessUnknown = true; }
+								else childLive = false;
+							}
+						}
+						const decision = decideCancelAction(task, childLive);
+						// Rework R3: provenance gate. Before ANY stop/abort is aimed at a session — and before any
+						// cancellation of a leased task is settled — the session file must prove it belongs to THIS
+						// parent. A foreign or uncertain session is never touched, the lease is never released, and
+						// the task is marked blocked+uncertain with the provenance failure as evidence. Fail closed.
+						if (!terminalWork(task.status) && sessionId && (task.sessionId || task.runId || task.dispatchedAt)) {
+							const provParent = parentSessionId || ctx?.sessionManager?.getSessionId?.() || "";
+							const provenance = verifyHostedChildProvenance(sessionId, provParent);
+							if (!provenance.ok) {
+								task.status = "blocked";
+								task.reason = `Cancel blocked: child session provenance UNPROVEN (${provenance.status}: ${provenance.reason}). No stop was sent and no lease was released. Next: verify the child manually (read ${provenance.file ?? "the session file"}), reconcile with /team reconcile, then retry team_tasks action "cancel". Never force-stop a session that is not proven to be a child of this parent.`;
+								task.evidence = [...(task.evidence ?? []), ...evidence, `[CANCEL BLOCKED — PROVENANCE] ${new Date().toISOString()} ${provenance.status}: ${provenance.reason}`];
+								cancelResults.push(`${task.id}: NOT cancelled — provenance unproven (${provenance.status}: ${provenance.reason}); no stop sent, lease retained`);
+								continue;
+							}
+						}
+						if (decision.action === "cancel") {
+							// Child confirmed stopped or never live: safe to settle cancelled and release the lease.
+							task.status = "cancelled";
+							task.reason = reason;
+							task.evidence = [...evidence, `[CANCELLED] ${new Date().toISOString()} ${decision.reason}`];
+							task.archivedAt = new Date().toISOString();
+							releaseManualDispatchHold(task);
+							if (task.runId) writeLease({ ...task });
+							cancelResults.push(`${task.id}: cancelled (${decision.reason})`);
+						} else if (decision.action === "stop_required") {
+							const sid = decision.sessionId;
+							let stopped = false;
+							let stopDetail = "";
+							if (boardTask?.executionTransport === "hosted") {
+								// Best available hosted stop mechanism: pi-web's manage_subsession stop. If the host
+								// does not expose it, fail closed with explicit instructions.
+								const executeFn = typeof (ctx as any)?.executeTool === "function" ? (ctx as any).executeTool.bind(ctx) : toolLauncher;
+								if (executeFn) {
+									try {
+										await executeFn("manage_subsession", { sessionId: sid, action: "stop" }, { signal: new AbortController().signal });
+										// Batch 1 review M5: the snapshot flush can lag the stop acknowledgement — poll
+										// briefly (bounded, ~4s) before concluding the stop is unconfirmed, so a correctly
+										// stopped hosted child is not stranded in blocked. Still fails closed after the window.
+										let snap = false;
+										for (let pollAttempt = 0; pollAttempt < 8 && !snap; pollAttempt++) {
+											snap = hasHostedTerminalSnapshotOnDisk(sid, { ...hostedOptions(ctx), reportNotBefore: boardTask?.dispatchedAt, runId: boardTask?.runId });
+											if (!snap && pollAttempt < 7) await new Promise(r => setTimeout(r, 500));
+										}
+										stopped = snap;
+										stopDetail = snap ? "hosted stop confirmed by terminal snapshot" : "hosted stop requested but terminal snapshot not visible after a bounded wait";
+									} catch (stopErr) {
+										stopDetail = `hosted stop call failed: ${stopErr instanceof Error ? stopErr.message : String(stopErr)}`;
+									}
+								} else {
+									stopDetail = "no host executeTool available for manage_subsession stop";
+								}
+							} else {
+								const res = await awaitStopSubagent(sid, 10_000);
+								stopped = res === "stopped";
+								stopDetail = res === "stopped" ? "native child SIGTERM/SIGKILL confirmed stopped" : res === "not-tracked" ? "child not tracked in this process (possibly already exited or launched in another host process)" : "stop signal sent but child exit was not confirmed within timeout";
+								if (res === "not-tracked") {
+									// Not tracked here and not proven running: treat as unconfirmed, fail closed.
+									stopped = false;
+								}
+							}
+							if (stopped) {
+								task.status = "cancelled";
+								task.reason = reason;
+								task.evidence = [...evidence, `[CANCELLED] ${new Date().toISOString()} child stop confirmed: ${stopDetail}`];
+								task.archivedAt = new Date().toISOString();
+								releaseManualDispatchHold(task);
+								if (task.runId) writeLease({ ...task });
+								cancelResults.push(`${task.id}: cancelled after confirmed stop (${stopDetail})`);
+							} else {
+								// Fail closed: NEVER claim cancelled, NEVER release the lease. Mark blocked with
+								// explicit retry/reconcile instructions.
+								task.status = "blocked";
+								task.reason = `Cancel requested but child stop is UNCONFIRMED (${stopDetail}).${livenessUnknown ? " Child liveness is UNKNOWN (process-local registry cannot prove absence across host processes)." : ""} Leases retained. Retry: (1) team_tasks action "cancel" again after reconciling, (2) get_subagent_result for ${sid}, or (3) verify the child stopped and team_tasks update with childStopped:true + status "blocked".`;
+								task.evidence = [...(task.evidence ?? []), ...evidence, `[CANCEL UNCONFIRMED] ${new Date().toISOString()} ${stopDetail}; original reason: ${reason}`];
+								cancelResults.push(`${task.id}: NOT cancelled — stop unconfirmed, marked blocked (${stopDetail})`);
+							}
+						} else {
+							// decision.action === "blocked": cannot even target a stop.
+							task.status = "blocked";
+							task.reason = `Cancel blocked: ${decision.reason}`;
+							task.evidence = [...(task.evidence ?? []), ...evidence, `[CANCEL BLOCKED] ${new Date().toISOString()} ${decision.reason}`];
+							cancelResults.push(`${task.id}: NOT cancelled — ${decision.reason}`);
+						}
+					}
+					pruneSummary = `\n\n[CANCEL] ${cancelResults.join("; ")}`;
+				} else if (params.action === "amend") {
+					// Batch 1 §1.3: in-place amendment of brief/acceptance/paths/title/dependsOn plus retryAsRework.
+					if (!Array.isArray(params.amendments) || !params.amendments.length) throw new Error("amend requires a nonempty amendments array.");
+					for (const raw of params.amendments as Array<Record<string, unknown>>) {
+						if (!isObject(raw)) throw new Error("Invalid amendment object.");
+						const target = candidate.tasks.find(t => t.id === raw.id);
+						if (!target) throw new Error(`amend: unknown task id ${String(raw.id)}.`);
+						// Scope-change conflict validation: the amended scope must not conflict with OTHER live
+						// tasks/leases (write-vs-write and strict-reader rules), excluding the task itself.
+						// Amended paths are relative to cwd by contract — resolve them exactly as registration does
+						// (registered tasks store absolute paths; unresolved amendments would bypass conflict checks).
+						const resolveScope = (p: unknown) => { const s = String(p); return isAbsolute(s) ? s : resolve(ctx.cwd, s); };
+						const nextWrite = Array.isArray(raw.writePaths) ? raw.writePaths.map(resolveScope) : target.writePaths;
+						const nextRead = Array.isArray(raw.readPaths) ? raw.readPaths.map(resolveScope) : target.readPaths;
+						const probe = { ...target, writePaths: nextWrite, readPaths: nextRead };
+						for (const other of candidate.tasks) {
+							if (other.id === target.id || terminalWork(other.status) || !scopeBlockingLive(candidate, other)) continue;
+							if (!taskConflict(probe, other)) continue;
+							if (reviewingReadAllowed(probe, other)) continue;
+							throw new Error(`amend ${target.id}: new scope conflicts with live task ${other.id} (${other.status}). ${formatHolderRejection({ kind: "write-write", path: other.writePaths[0] || nextWrite[0] || "(scope)", holderIds: [other.id] })}`);
+						}
+						for (const lease of leases.values()) {
+							if (lease.id === target.id || !liveWork(lease.status) || isLeaseSettledOnBoard(lease)) continue;
+							if (!taskConflict(probe, lease)) continue;
+							if (reviewingReadAllowed(probe, lease)) continue;
+							throw new Error(`amend ${target.id}: new scope conflicts with live lease of ${lease.id} (${lease.status}). ${formatHolderRejection({ kind: "write-write", path: lease.writePaths[0] || nextWrite[0] || "(scope)", holderIds: [lease.id] })}`);
+						}
+						amendTask(candidate, {
+							id: String(raw.id),
+							brief: raw.brief as string | undefined,
+							acceptance: raw.acceptance as string[] | undefined,
+							readPaths: Array.isArray(raw.readPaths) ? nextRead : undefined,
+							writePaths: Array.isArray(raw.writePaths) ? nextWrite : undefined,
+							title: raw.title as string | undefined,
+							dependsOn: raw.dependsOn as string[] | undefined,
+							retryAsRework: raw.retryAsRework === true,
+							reason: typeof raw.reason === "string" ? raw.reason : "",
+							evidence: Array.isArray(raw.evidence) ? raw.evidence.filter(e => typeof e === "string") : [],
+							by: "parent",
+						});
+						// A reopened attempt must release any finished lease so the fresh child may write.
+						if (raw.retryAsRework === true) releaseFinishedAttempt(candidate.tasks.find(t => t.id === raw.id));
+					}
+				} else if (params.action === "steer") {
+					// Batch 1 §1.2: controlled steering channel. Only ledger-owned, non-terminal tasks of THIS
+					// parent; audit evidence is recorded in the ledger regardless of host delivery support.
+					if (!Array.isArray(params.steers) || !params.steers.length) throw new Error("steer requires a nonempty steers array of { id, message }");
+					const steerResults: string[] = [];
+					for (const raw of params.steers as Array<Record<string, unknown>>) {
+						if (!isObject(raw) || typeof raw.message !== "string" || !raw.message.trim()) throw new Error("steer entries require a non-empty message.");
+						const task = candidate.tasks.find(t => t.id === raw.id);
+						const check = validateSteerTarget(task, parentSessionId);
+						if (!check.ok) throw new Error(`steer ${String(raw.id)}: ${check.reason}`);
+						const live = board().tasks.find(t => t.id === task!.id);
+						const sid = live?.sessionId ?? task!.sessionId!;
+						let delivery = "not-delivered";
+						if (live?.executionTransport === "hosted") {
+							// Hosted children can receive session messages through the host mechanism.
+							const executeFn = typeof (ctx as any)?.executeTool === "function" ? (ctx as any).executeTool.bind(ctx) : toolLauncher;
+							if (executeFn) {
+								try {
+									await executeFn("send_session_message", { sessionId: sid, message: `[PARENT STEER for ${task!.id}] ${raw.message.trim()}` }, { signal: new AbortController().signal });
+									delivery = "delivered-via-host";
+								} catch (steerErr) {
+									delivery = `host delivery failed: ${steerErr instanceof Error ? steerErr.message : String(steerErr)}`;
+								}
+							} else {
+								delivery = "no host executeTool; steer recorded but not delivered";
+							}
+						} else {
+							// Native process children have no live stdin/session-message channel in this codebase;
+							// fail closed with an explicit honest route instead of pretending delivery.
+							delivery = isSubagentActive(sid)
+								? "NOT DELIVERED: native running children have no message channel; the steer is recorded in ledger evidence and will reach the child as follow-up instructions on resume/rework (Agent with resume + TEAM_TASK line)"
+								: "child not active; steer recorded and applies to the next resume/rework dispatch";
+						}
+						task!.evidence = [...(task!.evidence ?? []), `[STEER] ${new Date().toISOString()} ${delivery}: ${raw.message.trim().slice(0, 500)}`];
+						candidate.revision++;
+						steerResults.push(`${task!.id}: ${delivery}`);
+					}
+					pruneSummary = `\n\n[STEER] ${steerResults.join("; ")}`;
 				} else if (!["list", "archive"].includes(String(params.action))) throw new Error("Unknown ledger action.");
 				const mutating = !["list", "archive"].includes(String(params.action)) && !(params.action === "prune_reviews" && params.dryRun === true);
 				if (mutating) {

@@ -1,0 +1,255 @@
+================================================================================
+INDEPENDENT REVIEW — Batch 1 (pi-teams-task Batch 1 §1.1–§1.4)
+Repo: /home/viosonlee/pi-workspace/pi-suns-teams  (uncommitted diff vs HEAD becf24f)
+Files: team-ledger.ts (+386), extensions/team.ts (+~220), team-runner.ts (+21),
+       tests/test-team-batch1-controls.ts (new, 293 lines), tests/test-team-role-review.ts (modified)
+Reviewer: cp (independent, read-only)
+================================================================================
+
+VERDICT: REWORK
+
+The batch is mostly well-built: settlement decoupling is correctly scoped, the
+cancel path is genuinely fail-closed, steer honestly reports non-delivery, brief
+injection is correct, and the test file is substantive (91 asserts, real
+behavioral checks, no vacuous tests found). However there is one HIGH-severity
+spec violation (manualDispatch inheritance lost on the amend retryAsRework
+path), several MEDIUM correctness gaps, and minors.
+
+--------------------------------------------------------------------------------
+HIGH
+--------------------------------------------------------------------------------
+
+H1. amend+retryAsRework loses manualDispatch — schedulerPump can steal the re-dispatch
+    Spec §1.4 requires manual-dispatch inheritance for rework; this is implemented
+    for the updateTask requeue path (team-ledger.ts:998 preserveManualDispatchOnReadyReturn)
+    and for the reviewing→ready path (extensions/team.ts:2878), but NOT for the
+    amend retryAsRework path. amendTask (team-ledger.ts:2637-2655) sets
+    task.status="ready" directly and never calls preserveManualDispatchOnReadyReturn.
+    Since recordManualDispatchOrigin wrote the durable origin into evidence at
+    dispatch time (team-ledger.ts:894), the data needed to restore the hold exists —
+    it is simply never consulted on this path. Net effect: a manually dispatched
+    worker retried via `team_tasks amend { retryAsRework:true }` returns to `ready`
+    with manualDispatch undefined, and schedulerPump (extensions/team.ts:3376/4010/4145
+    guards only check the live flag) will auto-dispatch it — exactly the theft §1.4
+    was written to prevent. Note the evidence-line origin is never garbage either, so
+    the fix is a one-liner: call preserveManualDispatchOnReadyReturn(task) inside the
+    retryAsRework branch of amendTask (or in the extension amend handler after
+    amendTask, mirroring extensions/team.ts:2878).
+
+--------------------------------------------------------------------------------
+MEDIUM
+--------------------------------------------------------------------------------
+
+M1. dependsOn amendment can introduce dependency cycles and terminal dependencies
+    Registration validates cycles (team-ledger.ts:512 "Dependency cycle detected
+    involving …"), but amendTask only rejects self-dependency and unknown ids
+    (team-ledger.ts:~2695-2700). A transitive cycle A→B, B→A created by amend is
+    never detected: such tasks become permanently unschedulable with no error
+    surfacing (silent deadlock, not a safety violation, but a liveness trap).
+    Also dependsOn can be amended to reference tasks already in terminal status
+    (done/cancelled) — cancelled deps never satisfy, another silent deadlock.
+    Fix: after applying dependsOn, run the same DFS cycle check used at registration
+    over the whole board; warn/reject terminal deps.
+
+M2. amend of readPaths/writePaths is permitted on RUNNING tasks without rebinding the child scope
+    canAmendTask only guards terminal status (team-ledger.ts:2601). Amending writePaths
+    on a running/uncertain task mutates the ledger scope while the live child still
+    operates under the scope baked into its dispatch prompt (the prompt contract at
+    extensions/team.ts:4037 is fixed at dispatch). The child-side write guard reads its
+    scope from its own prompt, not the ledger, so the amended restriction is NOT enforced
+    on the in-flight child — the ledger believes a narrower scope than the child actually
+    honors. Conversely widening writePaths mid-flight is conflict-validated against other
+    leases (good, extensions/team.ts:5700-5712) but the child won't honor the new scope
+    either. The conflict validation itself is correct (absolute path resolution at
+    extensions/team.ts:5698 resolveScope matches registration semantics, write-vs-write
+    and strict-reader exclusions are preserved via taskConflict + reviewingReadAllowed,
+    leases checked excluding the task itself). But for leased live tasks the amend should
+    either be refused or require retryAsRework (which re-dispatches with the new scope).
+    Recommend: reject readPaths/writePaths amendment when task.sessionId/runId is set and
+    status is running/uncertain unless retryAsRework:true in the same call.
+
+M3. livenessKnown is computed but never consumed in the cancel handler
+    extensions/team.ts:5600-5620 computes livenessKnown=false for the cases where the
+    ledger claims live work but the child is not tracked in this process. The variable is
+    never read afterwards. In practice the current code still fails closed in those cases
+    because childLive is set true whenever liveness is unknown (native: liveWork ledger
+    status → childLive=true; hosted: same), so decideCancelAction returns stop_required
+    or blocked rather than cancel, and the not-tracked stop result is treated as
+    unconfirmed (extensions/team.ts:5655-5676). So the dead variable is benign today but
+    is clearly vestigial scaffolding of an intended stricter check; either use it (e.g. to
+    block cancellation of a NON-live-ledger leased task whose child may run in another
+    host process — see M4) or remove it to avoid misleading future maintainers.
+
+M4. Residual cancel race: leased task with non-live ledger status, child running in another host process
+    Native transport path (extensions/team.ts:5615-5620): if isSubagentActive(sessionId)
+    is false AND the ledger status is non-live (e.g. "reported" or "blocked"), childLive=false
+    and the task is settled cancelled with lease released (5623-5631). But a leased child
+    (dispatchedAt/runId/sessionId all present) whose ledger status is non-live only because
+    the parent restarted and lost the in-process registry can still be genuinely running in
+    another host process — isSubagentActive is process-local. The code comments acknowledge
+    this for liveWork statuses but not for non-live statuses with an intact lease. The window
+    is narrow (a non-live status normally implies the child already reported), so severity is
+    MEDIUM-low; recommend treating "lease intact AND child not provably exited" as unknown
+    rather than dead, at least when sessionId is present and no completion was recorded
+    (e.g. no evidence/report for the current runId).
+
+M5. Hosted stop confirmation depends on terminal-snapshot timing (acknowledged by worker, still a gap)
+    extensions/team.ts:5642-5652: after manage_subsession stop, confirmation requires
+    hasHostedTerminalSnapshotOnDisk within a single immediate check — there is no wait/retry
+    loop (contrast the native path, which awaits up to 10s via awaitStopSubagent). A correctly
+    stopped hosted child whose snapshot flush lags will be reported "NOT cancelled — stop
+    unconfirmed, marked blocked". This is fail-CLOSED so it is safe, but operationally it
+    strands tasks in blocked that a retry moments later would cancel cleanly; consider a
+    bounded await for snapshot visibility. Noted in the worker report (line 87) — flagged
+    here so the follow-up is not lost.
+
+--------------------------------------------------------------------------------
+LOW / MINOR
+--------------------------------------------------------------------------------
+
+L1. decideReviewPolicy spec-vs-implementation tension for reviewTier:"none"+autoAccept:false.
+    Implementation (team-ledger.ts:2495-2506) gives reviewTier:"none" precedence over
+    autoAccept:false (no reviewer spawn). This matches TASK.md Batch 1 §1.4 as described in
+    the brief, but note the interaction: isReviewExempt (team-ledger.ts:1177-1185) returns
+    true for this combination, so the delivery takes the EXEMPT routing path
+    (extensions/team.ts:3253) — i.e. it is routed to the main CP for acceptance exactly like
+    an ayton/cameron default-exempt delivery. The comment in isReviewExempt says
+    "autoAccept:false then merely leaves the delivery reported until explicit parent
+    settlement" — true insofar as nothing auto-settles it, but the operator-visible behavior
+    of reviewTier:none+autoAccept:false is identical to plain reviewTier:none; the
+    autoAccept:false signal is effectively dropped on the floor. Given §4 of AGENTS.md says
+    autoAccept:false should explicitly request review, this combination deserves either a
+    registration-time warning or documentation in the tool schema. Tests
+    (test-team-batch1-controls.ts:117-118) assert the implemented precedence, so this is a
+    deliberate semantic — verified intentional, but documented here as a spec deviation
+    from AGENTS.md §4.
+
+L2. decideReviewPolicy grants review exemption to role "parent" (team-ledger.ts:2557) and to
+    ANY declaredReadOnly task regardless of role or tier unset — both are reasonable, but
+    note declaredReadOnly exemption did not exist in the pre-Batch-1 ad-hoc rules; this is a
+    small semantic widening. bridges scouting tasks with declaredReadOnly:true previously
+    still went through isReviewExempt=false (bridges not exempt); now they are exempt.
+    This appears consistent with AGENTS.md ("small non-decision edits or read-only scouting
+    may use reviewTier none") but it is a behavior change worth calling out in the changelog.
+
+L3. steer on native transport is honest but weak (extensions/team.ts:5755-5760): the steer
+    message is recorded in evidence yet there is no mechanism guaranteeing it reaches the
+    child on resume — the claim "will reach the child as follow-up instructions on
+    resume/rework" is aspirational; nothing in the resume path (extensions/team.ts:5143-5152)
+    injects recorded [STEER] evidence lines into the prompt. Either inject pending steers at
+    resume time or soften the message. Native active children get NO delivery at all — fine
+    as documented limitation, but the audit trail should not imply future delivery.
+
+L4. brief injection duplication guard (extensions/team.ts:5147) uses raw substring matching
+    `!cleanPrompt.includes(scoped.brief.trim())` — a brief that partially overlaps prompt text
+    can be silently skipped. Harmless (worst case: brief omitted when operator pasted it into
+    the prompt already), but the auto-dispatch path (extensions/team.ts:4040) has no such
+    concern since it composes the prompt itself. Injection otherwise verified: latest brief
+    (post-amend) is read from the task object at dispatch time, so no stale brief leakage —
+    amend writes task.brief and briefHistory atomically, and dispatch reads the live task.
+    Resume prompt construction uses scoped = current ledger task, also fresh. PASS.
+
+L5. amendTask validates acceptance-non-empty but allows weakening acceptance criteria on a
+    REPORTED task (pre-review) with only evidence+reason as guard — that's per spec (mutable
+    brief/acceptance with audit), just note the audit relies entirely on the reason/evidence
+    free-text; there is no diff-style record of the OLD acceptance values in briefHistory
+    (only the new brief is recorded). Recommend including prior field values in briefHistory
+    for forensic reconstruction.
+
+L6. Cancel evidence: the spec-required "evidence referencing explicit user authority" is
+    enforced as non-empty array but content is not validated (free-text). Consistent with
+    existing supersede semantics; no regression.
+
+--------------------------------------------------------------------------------
+QUESTIONS ANSWERED (per review brief)
+--------------------------------------------------------------------------------
+
+1. Safety invariants: PRESERVED. isMetadataSettlementTransition (team-ledger.ts:2407) returns
+   false for any liveWork current status (running/uncertain/reviewing) — verified in tests
+   (test lines 50-63) and by reading. Its use in extensions/team.ts:5544-5556 only bypasses
+   heldConflict for NON-live targets, and additionally refuses bypass when the target ITSELF
+   owns a live unsettled lease (the `l.id === target.id` clause at 5549). Write-vs-write and
+   running-writer vs strict-reader exclusions are unchanged elsewhere; the settlement bypass
+   only affects ledger metadata of already-finished attempts. No path found where a live
+   target can be silently settled. updateTask's own liveWork protections still apply as a
+   second layer (the bypass is only about UNRELATED holders, which never protected the target
+   anyway). PASS.
+
+2. cancel fail-closed: VERIFIED with caveats M3/M4/M5. Lease is never released when stop is
+   unconfirmed (extensions/team.ts:5670-5676: blocked, not cancelled; no releaseManualDispatchHold,
+   no writeLease of cancelled state). Status cancelled only in the two confirmed-safe branches
+   (5623-5631, 5662-5668). decideCancelAction itself (team-ledger.ts:2434) is sound: unleased
+   → cancel; leased+dead → cancel; leased+live+no sessionId → blocked; leased+live+sessionId →
+   stop_required. Terminal tasks short-circuit to a metadata-only cancel record — acceptable.
+
+3. amend/retryAsRework: absolute path resolution correct (extensions/team.ts:5698);
+   write-vs-write NOT bypassed (both candidate tasks and live leases checked, 5700-5712);
+   terminal guards correct (canAmendTask/canRetryAsRework); cp-write protection present
+   (team-ledger.ts:~2683). Gaps: H1 (manualDispatch loss), M1 (cycles), M2 (live-scope rebind).
+
+4. Reviewer snapshot semantics: readMode:"snapshot" on W-rev-* does NOT weaken STALE detection.
+   STALE is driven by reviewedDeliveryVersion/reviewFingerprint comparison at completion time
+   (team-ledger.ts:1609-1623 pins both at creation), not by read serialization. Snapshot only
+   means the reviewer doesn't wait for in-flight writers — but a reviewer is spawned after the
+   worker reported, so overlapping writers are third parties, and any post-review write
+   invalidates the fingerprint → STALE fires. One inherent residual: a reviewer reading
+   mid-write files of an unrelated active writer could produce a noise review, but never a
+   false PASS of changed content, since fingerprint mismatch forces REWORK/escalation. PASS.
+
+5. manualDispatch inheritance: reviewers inherit correctly (team-ledger.ts:1614-1619);
+   rework via updateTask/requeue paths preserve the hold (team-ledger.ts:998,
+   extensions/team.ts:2878); dispatch consumes atomically with origin recorded
+   (team-ledger.ts:894-908). HOLE: amend retryAsRework path — see H1. Also note:
+   schedulerPump guards at extensions/team.ts:3376/4010/4145 all key on the flag alone;
+   with H1 fixed there is no remaining theft path found.
+
+6. decideReviewPolicy/isReviewExempt matrix: verified all combinations
+   (team-ledger.ts:2485-2570 vs 1177-1185):
+   - reviewerRole set or tier llm → forced review (both functions agree). ✓
+   - tier none (+ any autoAccept) → no spawn; exempt. ✓ per Batch-1 spec; see L1 re AGENTS.md §4.
+   - deterministic+autoAccept:true → automaticSettlement:true is the ONLY auto route;
+     deterministic WITHOUT autoAccept:true falls through to role defaults — correct per spec. ✓
+     (Note: deterministic+autoAccept:true on a writer role skips independent review entirely —
+     that matches existing isDeterministic semantics pre-batch, not a regression.)
+   - unset tier: cp/ayton/cameron exempt, booker/bridges require review. ✓
+   - Deterministic settlement uniqueness preserved: automaticSettlement=true only in that one branch. ✓
+   PASS with L1/L2 notes.
+
+7. brief injection: latest brief reaches both auto-dispatch (extensions/team.ts:4040) and
+   manual/resume prompts (5147); amend mutates task.brief in place and dispatch reads the live
+   object — no staleness. briefHistory is append-only with reason/fields. Minor: L4/L5.
+
+8. Tests: tests/test-team-batch1-controls.ts is NOT vacuous — 293 lines, 91 asserts, uses the
+   real extension harness (tool_call/tool_result emission through hooks), exercises
+   settlement bypass positively AND negatively (live target rejection), cancel/steer/amend
+   behavior, reviewer inheritance, and the full policy matrix. tests/test-team-role-review.ts
+   changes (10 lines) match the intentional semantic shifts of §1.4 (tier-none precedence,
+   unified policy) — spot-checked, no expectation weakened beyond the intended changes.
+
+9. Regressions: none found beyond items above. The cpBriefExempt unification
+   (extensions/team.ts:3067-3069, 3253-3255) is behaviorally equivalent for cp consults
+   (previously: cp non-review, autoAccept≠false, no reviewerRole, tier≠llm → exempt; now:
+   same gate expressed via decideReviewPolicy — verified equivalent because the cp-exempt
+   branch in decideReviewPolicy only triggers after reviewerRole/llm/none/deterministic/
+   declaredReadOnly/autoAccept:false checks, in the same precedence). One subtle difference:
+   a cp consult with declaredReadOnly is now exempt even if… — no, declaredReadOnly exemption
+   applies to ALL roles now (L2). That is the only deliberate widening.
+
+--------------------------------------------------------------------------------
+RECOMMENDED REWORK (minimal)
+--------------------------------------------------------------------------------
+1. H1: call preserveManualDispatchOnReadyReturn(task) in the retryAsRework branch of
+   amendTask (team-ledger.ts:~2648) or immediately after amendTask in the extension handler.
+   Add a regression test: manual-dispatch worker → amend retryAsRework → manualDispatch true.
+2. M1: run the registration cycle-DFS over the board after applying dependsOn in amendTask.
+3. M2: refuse readPaths/writePaths amendment on leased running/uncertain tasks unless
+   retryAsRework:true accompanies it.
+4. M3/M4: either consume livenessKnown to harden the non-live-ledger leased-cancel case, or
+   delete the variable and document the assumption.
+5. L3: inject pending [STEER] evidence lines into resume/rework prompts, or reword the
+   audit message.
+6. L1: document the reviewTier:none + autoAccept:false precedence in the tool schema
+   description (or warn at registration).
+
+VERDICT: REWORK — H1 must be fixed before acceptance; M1/M2 strongly recommended in the same
+pass since they are small. Everything else can be follow-up tickets.

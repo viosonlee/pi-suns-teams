@@ -859,6 +859,27 @@ export function stopSubagent(sessionId: string): boolean {
 }
 
 /**
+ * Batch 1 §1.2: awaitable native stop. Sends SIGTERM (then SIGKILL after the internal grace)
+ * via terminateChild and waits until the child actually closes or `timeoutMs` elapses.
+ * Returns "stopped" only when the child's close event was observed — a timeout or an
+ * untracked/already-finished child is NEVER reported as stopped, so callers can fail closed.
+ */
+export async function awaitStopSubagent(sessionId: string, timeoutMs = 12_000): Promise<"stopped" | "not-tracked" | "unconfirmed"> {
+	const child = activeChildren.get(sessionId);
+	if (!child) return "not-tracked";
+	if (child.completed) return "stopped";
+	terminateChild(child);
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timedOut = await Promise.race([
+		child.closePromise.then(() => false),
+		new Promise<boolean>((res) => { timer = setTimeout(() => res(true), timeoutMs); }),
+	]);
+	if (timer) clearTimeout(timer);
+	if (!timedOut && child.completed) return "stopped";
+	return "unconfirmed";
+}
+
+/**
  * Explicitly terminate every running child (e.g. `/team off`). Not used on session shutdown:
  * children are detached on purpose so reloads and session switches never destroy work.
  */

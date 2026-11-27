@@ -63,6 +63,10 @@ export interface WorkTask {
 	reviewTier?: "deterministic" | "llm" | "none"; reviewerRole?: string; parentTaskId?: string; autoAccept?: boolean;
 	isolation?: "worktree" | "none"; declaredReadOnly?: boolean; retryCount?: number; stage?: "draft" | "publish";
 	sharedResources?: string[]; worktreePath?: string; splitWaiverReason?: string;
+	/** Mutable working brief (Batch 1): injected into dispatch/resume prompts; acceptance remains the hard verification contract. */
+	brief?: string;
+	/** Append-only history of brief/amendment changes (Batch 1 amend action). */
+	briefHistory?: Array<{ at: string; reason: string; brief?: string; fields?: string[]; by?: string; prior?: Record<string, unknown> }>;
 	/** Delivery version this review task is bound to; a newer delivery needs a new review. */
 	reviewedDeliveryVersion?: string;
 	/** Artefact fingerprint (git sha + diff hash) captured when this review was opened. */
@@ -360,6 +364,8 @@ export interface TaskSpec {
 	id?: string; title: string; requestIds: string[]; role: string;
 	dependsOn: string[]; readPaths: string[]; writePaths: string[]; acceptance: string[];
 	splitWaiverReason?: string;
+	/** Mutable operator/working brief; injected into dispatch prompts. Acceptance stays the hard verification contract. */
+	brief?: string;
 }
 /** Validate the whole batch before mutating; IDs support dependencies inside a batch. */
 /** Options for addTasks; `manualDispatch` persists a per-task hold instead of pausing the scheduler. */
@@ -448,7 +454,8 @@ export function addTasks(board: WorkLedger, values: unknown, cwd: string, option
 			isolation, declaredReadOnly, stage,
 			worktreePath: typeof spec.worktreePath === "string" ? spec.worktreePath : undefined,
 			sharedResources: Array.isArray(spec.sharedResources) ? spec.sharedResources.map(String) : undefined,
-			...(splitWaiverReason ? { splitWaiverReason } : {}) };
+			...(splitWaiverReason ? { splitWaiverReason } : {}),
+			...(typeof spec.brief === "string" && spec.brief.trim() ? { brief: spec.brief } : {}) };
 	});
 	const all = [...board.tasks, ...created];
 	const normCwd = resolve(cwd);
@@ -859,6 +866,34 @@ export function releaseManualDispatchHold(task: WorkTask): boolean {
 	delete task.manualDispatchAt;
 	return held;
 }
+
+const MANUAL_ORIGIN_PREFIX = "manual-dispatch-origin:";
+
+/**
+ * Batch 1 §1.4: a task that was ever held for manual dispatch keeps manualDispatch when it returns to
+ * ready for REWORK, so schedulerPump cannot steal the re-dispatch. markDispatched consumes the hold as
+ * part of the reservation, so the durable origin is recorded in evidence before it is consumed; this
+ * helper restores the hold when the evidence (or the never-cleared flag) proves manual ownership.
+ */
+export function preserveManualDispatchOnReadyReturn(task: WorkTask, now = new Date().toISOString()): void {
+	if (task.manualDispatch === true) return;
+	const lines = task.evidence ?? [];
+	const origin = lines.find(e => typeof e === "string" && e.startsWith(MANUAL_ORIGIN_PREFIX));
+	if (!origin) return;
+	if (!lines.includes(`${MANUAL_ORIGIN_PREFIX}consumed`)) {
+		// Origin line already exists — nothing to add; the flag restoration below is the whole effect.
+	}
+	setManualDispatchHold(task, `${task.id} returned to ready for rework; manualDispatch preserved from origin (${origin.slice(MANUAL_ORIGIN_PREFIX.length).slice(0, 120)}).`, now);
+}
+
+/** Record the durable manual-dispatch origin before markDispatched consumes the flag. Idempotent. */
+export function recordManualDispatchOrigin(task: WorkTask): void {
+	if (task.manualDispatch !== true) return;
+	const lines = task.evidence ?? [];
+	if (!lines.some(e => typeof e === "string" && e.startsWith(MANUAL_ORIGIN_PREFIX))) {
+		task.evidence = [...lines, `${MANUAL_ORIGIN_PREFIX}${(task.manualDispatchReason ?? "manual dispatch held").slice(0, 120)}`];
+	}
+}
 export function markDispatched(board: WorkLedger, id: string, role: string, runId: string, resume?: string): WorkTask {
 	const task = board.tasks.find(t => t.id === id);
 	const ownershipProblem = task ? reviewDispatchOwnershipProblem(board, task) : undefined;
@@ -870,7 +905,9 @@ export function markDispatched(board: WorkLedger, id: string, role: string, runI
 	task.status = "running"; task.runId = runId; task.dispatchedAt = new Date().toISOString();
 	delete task.completedNotifiedRunId;
 	// An explicit dispatch consumes the manual hold atomically with the reservation; nothing about the
-	// reservation is left for the daemon to re-launch.
+	// reservation is left for the daemon to re-launch. The durable origin is recorded in evidence first
+	// so a later rework return-to-ready can restore the hold (Batch 1 §1.4).
+	recordManualDispatchOrigin(task);
 	releaseManualDispatchHold(task);
 	if (resume) task.sessionId = resume;
 	else delete task.sessionId; // Fresh retry must not retain the previous child's ownership.
@@ -955,6 +992,10 @@ export function updateTask(board: WorkLedger, raw: Record<string, unknown>): voi
 			// Review requeues deliberately discard the prior attempt child (new epoch), so only worker tasks
 			// carry a resumable prior session worth protecting here.
 			setManualDispatchHold(task, `${task.id} requeued while owning prior child ${priorSessionId}; resume intention preserved until explicit autoDispatch:true.`, nowIso);
+		} else {
+			// Batch 1 §1.4: a manually-dispatched worker returning to ready for rework keeps its hold even
+			// when the prior session was discarded (the durable origin lives in evidence).
+			preserveManualDispatchOnReadyReturn(task, nowIso);
 		}
 	} else if (terminalWork(status)) {
 		releaseManualDispatchHold(task);
@@ -1135,8 +1176,11 @@ export function isDeterministic(task: WorkTask): boolean {
 /** Role policy only; delivery/evidence/reviewer guards still apply at settlement. */
 export function isReviewExempt(task: WorkTask): boolean {
 	if (isReviewTask(task) || !["booker", "bridges", "ayton", "cameron"].includes(task.role)) return false;
-	if (task.autoAccept === false || task.reviewerRole?.trim()) return false;
+	// Batch 1 §1.4: reviewTier "none" takes precedence over autoAccept:false for NOT spawning a reviewer;
+	// autoAccept:false then merely leaves the delivery `reported` until explicit parent settlement.
+	if (task.reviewerRole?.trim() || task.reviewTier === "llm") return false;
 	if (task.reviewTier === "none") return true;
+	if (task.autoAccept === false) return false;
 	return task.reviewTier === undefined && (task.role === "ayton" || task.role === "cameron");
 }
 
@@ -1565,6 +1609,15 @@ export function createReviewerTask(board: WorkLedger, workerTask: WorkTask, revi
 		parentTaskId: workerTask.id,
 		autoAccept: false,
 		declaredReadOnly: true,
+		// Batch 1 §1.1: reviewers are read-only cp tasks using snapshot reads; staleness is already
+		// handled by deliveryVersion/artefactFingerprint STALE logic, never by strict-write waiting.
+		readMode: "snapshot",
+		// Batch 1 §1.4: a manually-dispatched worker keeps control of its review lifecycle.
+		...(workerTask.manualDispatch ? {
+			manualDispatch: true,
+			manualDispatchReason: `Inherited manualDispatch from worker ${workerTask.id}; schedulerPump must not steal reviewer dispatch.`,
+			manualDispatchAt: new Date().toISOString(),
+		} : {}),
 		reviewedDeliveryVersion: version,
 		reviewFingerprint: fingerprint,
 		reviewAttempts: reusable?.reviewAttempts ?? 0,
@@ -1830,6 +1883,34 @@ function resolveReviewOwner(board: WorkLedger, record: ReviewRecord, candidates:
 	return { kind: "current", slot };
 }
 
+/** Batch 1 Rework R4: currency classification of a reviewer's pinned artefact fingerprint. */
+export type ReviewCurrency = "current" | "drifted" | "artefact-missing" | "unpinned";
+
+/**
+ * Classify whether a review verdict is being validated against the exact artefact it reviewed.
+ * artefactFingerprint() pins files on disk and appends `#N` when at least one scoped file exists,
+ * so a pinned fingerprint WITH a file-count suffix whose current evaluation yields NO suffix means
+ * every artefact file vanished or became unreadable after the review was pinned.
+ * - drifted: both sides have readable artefacts and the fingerprints differ -> verdict is STALE.
+ * - artefact-missing: artefacts existed when pinned but are gone/unreadable now -> the verdict is
+ *   NOT silently discarded as stale; it must be escalated for re-verification (never proven stale).
+ * - unpinned: no fingerprint was pinned (legacy/unsupervised review) -> no currency information.
+ * - current: fingerprints match exactly.
+ */
+export function classifyReviewCurrency(
+	pinned: string | undefined,
+	current: string | undefined,
+): { currency: ReviewCurrency; detail: string } {
+	if (!pinned) return { currency: "unpinned", detail: "no artefact fingerprint was pinned at review creation" };
+	if (pinned === current) return { currency: "current", detail: "pinned artefact fingerprint matches the current artefact" };
+	const pinnedHasFiles = /#\d+$/.test(pinned);
+	const currentHasFiles = typeof current === "string" && /#\d+$/.test(current);
+	if (pinnedHasFiles && !currentHasFiles) {
+		return { currency: "artefact-missing", detail: `artefact files present at pin time (${pinned}) are missing or unreadable at validation time (${current ?? "no fingerprint"}); cannot validate currency` };
+	}
+	return { currency: "drifted", detail: `artefact changed since review pin: ${pinned} != ${current ?? "no fingerprint"}` };
+}
+
 /**
  * Apply a structured review outcome to the ledger.
  * PASS -> worker done; REWORK -> worker ready again; ESCALATE -> worker blocked for the parent;
@@ -1956,11 +2037,24 @@ export function recordReview(
 		reasons.push(`attempt_already_closed:${reviewTask.id}`, resolution.reason);
 	} else {
 		const versionDrift = pinnedVersion !== liveVersion;
-		const fingerprintDrift = Boolean(reviewTask.reviewFingerprint) && Boolean(current?.fingerprint) && reviewTask.reviewFingerprint !== current?.fingerprint;
+		// Batch 1 Rework R4: split fingerprint mismatch-with-artefact (STALE discard) from artefact
+		// missing/unreadable (escalation, never silent discard). When `current` is omitted entirely the
+		// caller supplied no artefact evaluation (legacy/test callers); currency checking is skipped.
+		// artefact-missing converts the verdict to INCOMPLETE with an explicit escalation reason unless
+		// the caller already submitted INCOMPLETE/ESCALATE — so the review cannot vanish silently and
+		// the parent is forced to re-verify rather than the verdict settling against nothing on disk.
+		const currency = current === undefined
+			? { currency: "unpinned" as ReviewCurrency, detail: "no artefact evaluation supplied by caller" }
+			: classifyReviewCurrency(reviewTask.reviewFingerprint, current.fingerprint);
+		const fingerprintDrift = currency.currency === "drifted";
+		const artefactMissing = currency.currency === "artefact-missing";
 		if (versionDrift || fingerprintDrift) {
 			effective = "STALE";
 			if (versionDrift) reasons.push(`delivery_version_drift:${pinnedVersion}!=${liveVersion}`);
 			if (fingerprintDrift) reasons.push(`artefact_fingerprint_drift:${reviewTask.reviewFingerprint}!=${current?.fingerprint}`);
+		} else if (artefactMissing && incoming.verdict !== "STALE" && incoming.verdict !== "INCOMPLETE" && incoming.verdict !== "ESCALATE") {
+			effective = "INCOMPLETE";
+			reasons.push(`artefact_missing_or_unreadable:${currency.detail}`);
 		} else if (workerExecuting && incoming.verdict !== "STALE") {
 			// Every verdict branch protects a newer executing owner, not just STALE.
 			effective = "STALE";
@@ -2338,4 +2432,393 @@ export function pruneStaleReviews(board: WorkLedger, options: PruneReviewsOption
 
 	if (mutated) board.revision++;
 	return { pruned, migratedToCp, keptActive, keptPendingCp, dryRun, retiredDuplicates };
+}
+
+// ============================================================================
+// BATCH 1 — pure control-policy helpers
+// ============================================================================
+
+/**
+ * Batch 1 §1.1: true when a transition is ledger-metadata-only settlement —
+ * moving a NON-live target into a terminal state (done/cancelled/superseded).
+ * Such settlement must NOT be blocked by unrelated in-flight write-vs-read or
+ * write-vs-write leases. A liveWork target (running/uncertain/reviewing) can
+ * never be silently settled this way; updateTask's liveWork protections remain.
+ */
+export function isMetadataSettlementTransition(
+	currentStatus: WorkStatus | null | undefined,
+	nextStatus: WorkStatus | null | undefined,
+): boolean {
+	if (!nextStatus || !terminalWork(nextStatus)) return false;
+	if (currentStatus && liveWork(currentStatus)) return false;
+	if (!currentStatus) return true;
+	return currentStatus !== nextStatus;
+}
+
+/** Cancellation safety decision for the first-class cancel action (Batch 1 §1.2). */
+export type CancelDecision =
+	| { action: "cancel"; reason: string }
+	| { action: "stop_required"; sessionId: string }
+	| { action: "blocked"; reason: string };
+
+/**
+ * Pure decision for cancelling a task. The caller executes any required child stop and only
+ * applies `cancelled` when the child is confirmed stopped or was never actually live. When the
+ * stop is unconfirmed the task must be left/marked blocked with retry/reconcile instructions —
+ * never cancelled, and leases are never released.
+ */
+export function decideCancelAction(
+	task: Pick<WorkTask, "status" | "sessionId" | "runId" | "dispatchedAt">,
+	childActuallyLive: boolean,
+): CancelDecision {
+	if (terminalWork(task.status)) {
+		return { action: "cancel", reason: `already terminal (${task.status}); recording cancellation only` };
+	}
+	const leased = Boolean(task.sessionId || task.runId || task.dispatchedAt);
+	if (!leased) return { action: "cancel", reason: "no child lease/session/run recorded; never dispatched" };
+	if (!childActuallyLive) {
+		return { action: "cancel", reason: "child lease exists but the child is confirmed not live" };
+	}
+	if (!task.sessionId) {
+		return { action: "blocked", reason: "task has a run lease but no sessionId; cannot target a stop. Reconcile (get_subagent_result / /team reconcile) to bind the session, then retry cancel." };
+	}
+	return { action: "stop_required", sessionId: task.sessionId };
+}
+
+/** Batch 1 §1.2: validate a steer target is a ledger-owned non-terminal task of this parent. */
+export function validateSteerTarget(
+	task: WorkTask | undefined,
+	parentSessionId?: string,
+): { ok: true } | { ok: false; reason: string } {
+	if (!task) return { ok: false, reason: "task not found in ledger" };
+	if (terminalWork(task.status)) {
+		return { ok: false, reason: `task is terminal (${task.status}); cannot steer finished work` };
+	}
+	if (!task.sessionId) {
+		return { ok: false, reason: "task has no child session bound; nothing to steer. Dispatch/resume it first." };
+	}
+	if (parentSessionId && task.parentSessionId && task.parentSessionId !== parentSessionId) {
+		return { ok: false, reason: `task belongs to parent ${task.parentSessionId}, not ${parentSessionId}` };
+	}
+	return { ok: true };
+}
+
+// --------------------------------------------------------------------------
+// Unified review policy (Batch 1 §1.4) — consolidates cpBriefExempt / isReviewExempt
+// --------------------------------------------------------------------------
+
+export interface ReviewPolicyInput {
+	reviewTier?: "deterministic" | "llm" | "none";
+	autoAccept?: boolean;
+	reviewerRole?: string;
+	declaredReadOnly?: boolean;
+}
+
+export interface ReviewPolicyDecision {
+	/** Independent reviewer is mandatory for this registration. */
+	requireIndependentReview: boolean;
+	/** Scheduler should create a W-rev-* reviewer child on delivery. */
+	spawnReviewerOnDelivery: boolean;
+	/** Deterministic machine gates may settle automatically. */
+	automaticSettlement: boolean;
+	exemptByDefault: boolean;
+	reason: string;
+}
+
+/**
+ * Single unified review-policy decision path, replacing the parallel ad-hoc
+ * cpBriefExempt / isReviewExempt rules:
+ *  - explicit reviewerRole or reviewTier "llm"      => independent review forced
+ *  - reviewTier "none"                              => NO reviewer spawn, even with autoAccept:false
+ *    (the delivery just stays `reported` until the parent explicitly settles it done)
+ *  - deterministic + autoAccept:true                => automatic settlement route
+ *  - cp consult/read-only tasks                     => exempt
+ *  - unset tier: cp/ayton/cameron default exempt; booker/bridges default require review
+ */
+export function decideReviewPolicy(
+	role: string,
+	input: ReviewPolicyInput,
+): ReviewPolicyDecision {
+	if (input.reviewerRole?.trim() || input.reviewTier === "llm") {
+		return {
+			requireIndependentReview: true,
+			spawnReviewerOnDelivery: true,
+			automaticSettlement: false,
+			exemptByDefault: false,
+			reason: input.reviewerRole?.trim()
+				? `explicit reviewerRole ${input.reviewerRole} forces independent review`
+				: 'reviewTier "llm" forces independent review',
+		};
+	}
+	if (input.reviewTier === "none") {
+		// Batch 1 review L1 (documented spec deviation from AGENTS.md §4): reviewTier "none" takes
+		// precedence over autoAccept:false — no reviewer spawns and the autoAccept:false signal is
+		// effectively dropped (the delivery routes to parent acceptance exactly like a plain "none"
+		// task). This is the deliberate TASK.md Batch-1 §1.4 semantic; operators who want an explicit
+		// review must use reviewTier "llm" or reviewerRole instead of autoAccept:false.
+		return {
+			requireIndependentReview: false,
+			spawnReviewerOnDelivery: false,
+			automaticSettlement: false,
+			exemptByDefault: true,
+			reason: 'reviewTier "none" waives reviewer spawn (takes precedence over autoAccept:false)',
+		};
+	}
+	if (input.reviewTier === "deterministic" && input.autoAccept === true) {
+		return {
+			requireIndependentReview: false,
+			spawnReviewerOnDelivery: false,
+			automaticSettlement: true,
+			exemptByDefault: true,
+			reason: "deterministic+autoAccept automatic settlement route",
+		};
+	}
+	if (input.declaredReadOnly) {
+		// Batch 1 review L2: this exemption did not exist in the pre-Batch-1 ad-hoc rules — a bridges
+		// scouting task with declaredReadOnly:true previously still went through default review.
+		// It is a deliberate widening consistent with AGENTS.md §2/§4 ("routine code/log scouting
+		// (declaredReadOnly: true)", "small non-decision edits or read-only scouting may use
+		// reviewTier none"): a task that writes nothing cannot invalidate review by definition,
+		// and its report is still parent-accepted on evidence — exemption never auto-settles.
+		return {
+			requireIndependentReview: false,
+			spawnReviewerOnDelivery: false,
+			automaticSettlement: false,
+			exemptByDefault: true,
+			reason: "declared read-only task is review-exempt",
+		};
+	}
+	if (input.autoAccept === false) {
+		return {
+			requireIndependentReview: true,
+			spawnReviewerOnDelivery: true,
+			automaticSettlement: false,
+			exemptByDefault: false,
+			reason: "autoAccept:false explicitly requests independent review",
+		};
+	}
+	// Unset tier: role defaults. cp consults (non-review cp tasks) are session-scoped helpers.
+	if (role === "cp" || role === "ayton" || role === "cameron" || role === "parent") {
+		return {
+			requireIndependentReview: false,
+			spawnReviewerOnDelivery: false,
+			automaticSettlement: false,
+			exemptByDefault: true,
+			reason: `${role} default review-exempt`,
+		};
+	}
+	return {
+		requireIndependentReview: true,
+		spawnReviewerOnDelivery: true,
+		automaticSettlement: false,
+		exemptByDefault: false,
+		reason: `${role} product-code default requires independent review`,
+	};
+}
+
+// --------------------------------------------------------------------------
+// Retry-as-rework + amend validation (Batch 1 §1.3)
+// --------------------------------------------------------------------------
+
+const RETRYABLE_STATUSES: ReadonlySet<WorkStatus> = new Set(["reported", "reviewing", "failed", "blocked", "uncertain"]);
+
+/**
+ * In-place retry-as-rework keeps the SAME W-id (history is preserved in-place instead of
+ * forcing replacement task IDs). Only non-terminal, non-live statuses may be retried, and a
+ * leased uncertain/running child must be cancelled/reconciled first.
+ */
+export function canRetryAsRework(
+	task: Pick<WorkTask, "status" | "sessionId" | "runId">,
+): { ok: true } | { ok: false; reason: string } {
+	if (terminalWork(task.status)) {
+		return { ok: false, reason: `task is terminal (${task.status}); terminal work is never reopened — register follow-up work instead` };
+	}
+	if (!RETRYABLE_STATUSES.has(task.status)) {
+		return {
+			ok: false,
+			reason: `retryAsRework requires status reported/reviewing/failed/blocked/uncertain, got "${task.status}"`,
+		};
+	}
+	if ((task.status === "uncertain" || task.status === "running") && (task.sessionId || task.runId)) {
+		return {
+			ok: false,
+			reason: "task still has a lease that may be live; use team_tasks cancel or verify childStopped first",
+		};
+	}
+	return { ok: true };
+}
+
+/** Terminal work is immutable history: no silent acceptance weakening, no scope rewrite. */
+export function canAmendTask(task: Pick<WorkTask, "status">): { ok: true } | { ok: false; reason: string } {
+	if (terminalWork(task.status)) {
+		return { ok: false, reason: `task is terminal (${task.status}); amendment would rewrite accepted history` };
+	}
+	return { ok: true };
+}
+
+/**
+ * Batch 1 §1.3: in-place amendment of brief/acceptance/readPaths/writePaths/title/dependsOn,
+ * plus retryAsRework. Pure ledger mutation — the caller (extension) must validate scope
+ * conflicts against live leases BEFORE calling (see validateAmendScope).
+ */
+export interface AmendInput {
+	id: string;
+	brief?: string;
+	acceptance?: string[];
+	readPaths?: string[];
+	writePaths?: string[];
+	title?: string;
+	dependsOn?: string[];
+	retryAsRework?: boolean;
+	reason: string;
+	evidence: string[];
+	by?: string;
+}
+
+export function amendTask(board: WorkLedger, input: AmendInput): WorkTask {
+	const task = board.tasks.find(t => t.id === input.id);
+	if (!task) throw new Error(`Unknown task id: ${String(input.id)}.`);
+	const guard = canAmendTask(task);
+	if (!guard.ok) throw new Error(`${task.id}: ${guard.reason}`);
+	if (!input.reason?.trim()) throw new Error(`${task.id}: amend requires a non-empty reason (audit trail).`);
+	if (!Array.isArray(input.evidence) || !input.evidence.length) throw new Error(`${task.id}: amend requires evidence entries (authority reference).`);
+	// Batch 1 review M2 (validated BEFORE any mutation): the in-flight child enforces the scope baked into
+	// its dispatch prompt, not the ledger — amending read/write paths on a live leased task cannot rebind
+	// it, so the ledger would believe a scope the child never honors. Refuse unless retryAsRework
+	// re-dispatches the task with the new scope in the same call.
+	if ((input.readPaths !== undefined || input.writePaths !== undefined) && !input.retryAsRework
+		&& (task.status === "running" || task.status === "uncertain") && (task.sessionId || task.runId)) {
+		throw new Error(`${task.id}: readPaths/writePaths cannot be amended on a live (running/uncertain) leased task — the in-flight child still enforces the scope baked into its dispatch prompt, so the amendment would not be enforced. Fix: include retryAsRework:true so the task re-dispatches with the new scope, or wait for the child to finish and amend the non-live task.`);
+	}
+
+	const changed: string[] = [];
+	const at = new Date().toISOString();
+	// Batch 1 review L5: snapshot prior values of every mutable field BEFORE mutation so the
+	// briefHistory entry supports forensic reconstruction of what the amendment replaced.
+	const priorValues: Record<string, unknown> = {};
+	if (input.brief !== undefined) priorValues.brief = task.brief;
+	if (input.title !== undefined) priorValues.title = task.title;
+	if (input.acceptance !== undefined) priorValues.acceptance = [...task.acceptance];
+	if (input.readPaths !== undefined) priorValues.readPaths = [...task.readPaths];
+	if (input.writePaths !== undefined) priorValues.writePaths = [...task.writePaths];
+	if (input.dependsOn !== undefined) priorValues.dependsOn = [...task.dependsOn];
+	if (input.retryAsRework) priorValues.status = task.status;
+
+	if (input.retryAsRework) {
+		const retry = canRetryAsRework(task);
+		if (!retry.ok) throw new Error(`${task.id}: retryAsRework refused — ${retry.reason}`);
+		// Preserve the prior attempt verbatim in evidence/history before reopening.
+		const priorStatus = task.status;
+		task.evidence = [...(task.evidence ?? []),
+			`[RETRY-AS-REWORK] ${at} attempt closed at status=${priorStatus} delivery=${deliveryVersionOf(task)} reason=${input.reason}`,
+			...input.evidence,
+		];
+		task.status = "ready";
+		task.retryCount = (task.retryCount ?? 0) + 1;
+		// Release finished-attempt identity so a fresh child may launch; review obligations and
+		// deliveryVersion/artefactFingerprint STALE protection are pinned to the NEW deliveryVersion.
+		delete task.runId; delete task.sessionId; delete task.dispatchedAt;
+		// Batch 1 review H1: preserve the manual-dispatch hold on this return-to-ready so schedulerPump
+		// cannot steal the re-dispatch (same guard as the updateTask requeue path). The durable origin
+		// recorded in evidence at dispatch time is the source of truth.
+		preserveManualDispatchOnReadyReturn(task, at);
+		changed.push("retryAsRework");
+	} else {
+		task.evidence = [...(task.evidence ?? []), ...input.evidence];
+	}
+
+	if (input.brief !== undefined) {
+		if (typeof input.brief !== "string") throw new Error(`${task.id}: brief must be a string.`);
+		task.brief = input.brief;
+		changed.push("brief");
+	}
+	if (input.title !== undefined) {
+		if (typeof input.title !== "string" || !input.title.trim()) throw new Error(`${task.id}: title must be a non-empty string.`);
+		task.title = input.title.trim();
+		changed.push("title");
+	}
+	if (input.acceptance !== undefined) {
+		if (!Array.isArray(input.acceptance) || !input.acceptance.length || !input.acceptance.every(a => typeof a === "string" && a.trim())) {
+			throw new Error(`${task.id}: acceptance must be a non-empty array of non-empty strings.`);
+		}
+		task.acceptance = input.acceptance.map(a => a.trim());
+		changed.push("acceptance");
+	}
+	if (input.readPaths !== undefined) {
+		if (!Array.isArray(input.readPaths) || !input.readPaths.every(p => typeof p === "string")) throw new Error(`${task.id}: readPaths must be a string array.`);
+		task.readPaths = input.readPaths.map(String);
+		changed.push("readPaths");
+	}
+	if (input.writePaths !== undefined) {
+		if (!Array.isArray(input.writePaths) || !input.writePaths.every(p => typeof p === "string")) throw new Error(`${task.id}: writePaths must be a string array.`);
+		if (task.role === "cp" && input.writePaths.length) throw new Error(`${task.id}: cp tasks cannot own writes; amend refused.`);
+		task.writePaths = input.writePaths.map(String);
+		changed.push("writePaths");
+	}
+	if (input.dependsOn !== undefined) {
+		if (!Array.isArray(input.dependsOn) || !input.dependsOn.every(d => typeof d === "string")) throw new Error(`${task.id}: dependsOn must be a string array.`);
+		const missing = input.dependsOn.filter(d => !board.tasks.some(t => t.id === d));
+		if (missing.length) throw new Error(`${task.id}: dependsOn references unknown tasks: ${missing.join(", ")}.`);
+		if (input.dependsOn.includes(task.id)) throw new Error(`${task.id}: cannot depend on itself.`);
+		// Batch 1 review M1: cancelled dependencies never satisfy (silent deadlock), and transitive
+		// cycles created by amendment are never detected by the registration-time check — validate both.
+		const cancelledDeps = input.dependsOn.filter(d => {
+			const dep = board.tasks.find(t => t.id === d);
+			return dep && (dep.status === "cancelled" || dep.status === "superseded");
+		});
+		if (cancelledDeps.length) {
+			throw new Error(`${task.id}: dependsOn references cancelled/superseded tasks (${cancelledDeps.join(", ")}) which can never satisfy — the task would deadlock. Fix: remove them or register live replacements first.`);
+		}
+		const priorDependsOn = task.dependsOn;
+		task.dependsOn = input.dependsOn.map(String);
+		// Full-board transitive cycle check, same DFS semantics as registration. On failure the
+		// dependsOn mutation is rolled back so the board is never left in an unschedulable state.
+		const visiting = new Set<string>(), visited = new Set<string>();
+		const visit = (id: string) => {
+			if (visiting.has(id)) throw new Error(`${task.id}: amending dependsOn introduces a dependency cycle involving ${id}. dependsOn was rolled back; fix the chain and retry.`);
+			if (visited.has(id)) return;
+			visiting.add(id);
+			for (const dep of board.tasks.find(t => t.id === id)?.dependsOn ?? []) visit(dep);
+			visiting.delete(id); visited.add(id);
+		};
+		try { for (const t of board.tasks) visit(t.id); } catch (error) {
+			task.dependsOn = priorDependsOn;
+			throw error;
+		}
+		changed.push("dependsOn");
+	}
+	if (!changed.length) throw new Error(`${task.id}: amend changed nothing; supply at least one mutable field.`);
+
+	task.briefHistory = [...(task.briefHistory ?? []), {
+		at, reason: input.reason, by: input.by,
+		...(input.brief !== undefined ? { brief: input.brief } : {}),
+		fields: changed,
+		// Batch 1 review L5: prior values of the changed fields for forensic reconstruction.
+		prior: priorValues,
+	}];
+	board.revision++;
+	return task;
+}
+
+// --------------------------------------------------------------------------
+// Error message helpers (Batch 1 §1.1) — actionable lock/scope rejections
+// --------------------------------------------------------------------------
+
+/** Build a lock/scope rejection that names holder task ids and concrete next actions. */
+export function formatHolderRejection(opts: {
+	kind: "write-read" | "write-write" | "strict-reader" | "same-task";
+	path: string;
+	holderIds: string[];
+	extra?: string;
+}): string {
+	const holders = opts.holderIds.join(", ") || "unknown";
+	const lines = [
+		`Lease conflict (${opts.kind}) on "${opts.path}" held by task(s): ${holders}.`,
+		`Next actions:`,
+		`  1. Wait for ${holders} to finish, then retry, or`,
+		`  2. Cancel the holder: team_tasks action "cancel" with updates [{ id: "<holder-id>", reason: "...", evidence: ["<user authority>"] }], or`,
+		`  3. If the holder is stuck: verify the child actually stopped, then team_tasks update with childStopped:true + status "blocked".`,
+	];
+	if (opts.extra) lines.push(opts.extra);
+	return lines.join("\n");
 }

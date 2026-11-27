@@ -1,0 +1,233 @@
+# Batch 1 RE-REVIEW (round 2) — after rework
+Repo: /home/viosonlee/pi-workspace/pi-suns-teams (git diff vs HEAD becf24f; 5 files, +888/-18 including tests)
+Reviewer: cp (independent, read-only). Round-1 verdict was REWORK (/tmp/pi-teams-batch1-review.txt).
+Re-review target: rework report /tmp/pi-teams-batch1-rework-report.txt claims R2/R3/R4 fixed by worker,
+R1/R5/R6 fixed by parent earlier; all findings verified against the actual diff, not the report.
+
+VERDICT: PASS
+
+No HIGH or MEDIUM findings remain. All round-1 blockers verified fixed by direct code inspection and
+by execution of the regression suites. Residual LOW items below are follow-ups, not rework gates.
+
+==============================================================================
+VERIFICATION OF ROUND-1 FINDINGS (per user focus items)
+==============================================================================
+
+--- R2 — metadata settlement decoupling across ALL paths — VERIFIED CORRECT ---
+
+1. Bulk/single update path (extensions/team.ts:5588-5589):
+     const ownLiveLease = target ? [...leases.values()].some(l => l.id === target.id &&
+       liveWork(l.status) && !isLeaseSettledOnBoard(l)) : false;
+     const skipLease = target && !liveWork(target.status) && !ownLiveLease &&
+       isMetadataSettlementTransition(target.status, update.status as never);
+   Verified invariants:
+   a. skipLease can NEVER be true for a live target: isMetadataSettlementTransition() returns false
+      for live statuses AND the explicit !liveWork(target.status) guard is redundant-but-present.
+      A live target always hits the full heldConflict(target, true) enforcement — no weakening.
+   b. The ownLiveLease refinement (added beyond the rework letter) closes the branch-rollback hole:
+      ledger status can read non-live (ready) while the child is actually still running/writing
+      after a rollback. The scan covers lease-registry entries owned by the target itself with a
+      live lease status that is not already settled on the board. This is exactly the invariant
+      round-1 required ("settlement must never bypass a lease actually owned by the target itself").
+      NOTE the ordering subtlety: liveWork(l.status) reads the LEASE status, not the ledger status,
+      so a lease entry stamped running/uncertain blocks settlement even when the ledger row says
+      ready. Correct.
+   c. Unrelated live readers/writers no longer block settlement of a genuinely dead target —
+      confirmed by test "R2: cancel of a non-live unleased task succeeds while an unrelated live
+      reader runs" and "R2: live target settlement in the SAME bulk call as a non-live settlement
+      only blocks the live one" (tests/test-team-batch1-rework.ts) — both assert the negative case
+      (live target rejected, atomic rollback of the entire bulk call). Not vacuous.
+   d. heldConflict is still evaluated per-target inside the loop, and updateTask's own internal
+      liveWork protections act as a second layer. Atomic mutation: the update loop mutates a
+      structuredClone'd candidate; one rejection discards the whole batch (verified by test).
+
+2. Cancel path: cancel targets never consult heldConflict at all (dead children cannot be blocked
+   by unrelated readers); the gating is entirely liveness+provenance+stop-confirmation based —
+   the correct construction for a cancel operation. Lease release happens ONLY in the two
+   confirmed-safe branches (writeLease({...task, status:"cancelled"}) at team.ts:5694, 5742).
+   No path releases a lease on an unconfirmed stop — verified by reading the full cancel loop
+   (team.ts:5640-5758).
+
+3. Amend path: correctly does NOT participate in the settlement bypass — amend validates scope
+   conflicts against live tasks AND live leases regardless of target liveness
+   (team.ts:5768-5788), which is the safe side. isMetadataSettlementTransition is not consulted
+   there at all. No regression.
+
+4. Live-target enforcement spot check: team.ts:5589 — when skipLease is false the error path
+   throws BEFORE updateTask/reopenDeliveredAttempt run, and the whole candidate clone is
+   discarded. No partial application.
+
+--- R3 — verifyHostedChildProvenance genuinely fail-closed — VERIFIED CORRECT ---
+
+team-recovery.ts:1601-1663 verifyHostedChildProvenance(sessionId, parentSessionId, options?):
+  a. No parent session id available → {ok:false, status:"uncertain"} — never defaults to ok.
+  b. resolveChildSessionFile — not found → unknown-session; ambiguous → uncertain; invalid →
+     malformed. Every non-found resolution fails closed.
+  c. readBoundedNoFollow — bounded read, no symlink following; unreadable/oversized → unreadable.
+  d. parseSessionJsonl failure → malformed. Header id mismatch with the target sessionId → malformed.
+  e. If pi-web:subagent metadata entries exist, ONLY validateSubagentMetadata(entries, parentSessionId)
+     decides — same strict validation as recovery; a bind failure → foreign (never falls through to
+     the hosted-link alternative, so a crafted spawn-link cannot override contradictory meta).
+  f. Otherwise pi-web.subsession.spawned links must match BOTH spawnedBySessionId === parent AND
+     spawnedSessionId === target; a link binding a different parent → foreign; no links at all →
+     foreign ("provenance unproven — never act on it").
+  File is opened read-only throughout: readBoundedNoFollow + parseSessionJsonl only parse text;
+  NO session-file mutation exists anywhere in this path — the "no mutation bypasses validation"
+  requirement is trivially satisfied because no mutation exists at all.
+
+Cancel integration (team.ts:5670-5686): provenance gate runs BEFORE any stop is aimed and before
+any settle-cancelled branch, for every non-terminal leased task (sessionId && (sessionId || runId
+|| dispatchedAt)). Unproven → blocked, lease retained (writeLease never called with cancelled),
+evidence line [CANCEL BLOCKED — PROVENANCE] names status+reason, cancelResults reports
+"no stop sent, lease retained". Verified by three executed tests: foreign parent → blocked + lease
+retained; correct parent → cancelled; missing session file entirely → blocked + lease retained.
+
+Liveness rewrite (team.ts:5652-5667): isSubagentActive is used only to prove LIVE, never absence.
+Confirmed-not-live requires positive exit evidence: ledger in reported/reviewing/failed for native,
+or a terminal snapshot on disk bound to this runId for hosted. blocked/ready/queued with lease
+fields → liveness UNKNOWN → treated as live (fail closed), and livenessUnknown is consumed in the
+unconfirmed-stop reason text (team.ts:5749) — the round-1 vestigial-variable complaint is resolved.
+
+M5 fix (team.ts:5708-5716): after manage_subsession stop the code polls up to 8×500ms for the
+terminal snapshot before concluding unconfirmed; still fails closed after the window. Correct.
+
+--- R4 — artefact-missing escalates, mismatch-with-artefact stays STALE — VERIFIED CORRECT ---
+
+team-ledger.ts:1895-1911 classifyReviewCurrency(pinned, current):
+  exact match → current; pinned differs and both carry a #N file-count suffix (or pinned lacks one) →
+  drifted (STALE discard, unchanged legacy semantics); pinned HAS the #N suffix but current does not
+  → artefact-missing. No pin → unpinned (legacy reviews keep pre-Batch-1 behavior — never escalated,
+  never auto-staled). Format fails closed on shape rather than content because the suffix is only
+  ever appended by artefactFingerprint() when at least one file existed at pin time; the regex
+  /#\d+$/ cannot be produced for an empty file set. Correct by construction.
+
+team-ledger.ts:2040-2061 recordReview conversion:
+  - drifted → STALE (discarded, never applied to a newer delivery) — unchanged, test asserts
+    reviewTask superseded + worker NOT done + stored verdict STALE.
+  - artefact-missing → verdict converted to INCOMPLETE unless caller already submitted
+    INCOMPLETE/ESCALATE/STALE (idempotent for already-cautious verdicts); reason
+    artefact_missing_or_unreadable:<detail> attached. INCOMPLETE branch (team-ledger.ts:2152-2172):
+    worker stays reported (never done), reviewer blocked for an explicit parent decision with
+    automatic relaunch disabled, lease released with the epoch archived. The verdict cannot vanish
+    silently — the parent is forced to re-verify. Exactly the required semantics.
+  - workerExecuting guard still converts everything to STALE first (newer-owner protection intact).
+  - originalVerdict is preserved on the receipt when conversion happens (team-ledger.ts:2071) —
+    audit trail kept.
+  - Edge reviewed: PARTIAL artefact loss (some files still present, fewer than at pin) classifies
+    as drifted → STALE discard, not escalation. Both outcomes are non-settling and parent-visible,
+    so the misclassification risk is conservative-only. Noted as LOW.
+
+Tests (executed, 12/12 pass): unit coverage of all four currencies; STALE discard with artefact
+present asserts reviewTask.status==='superseded' AND workerTask.status!=='done' AND stored verdict
+STALE; artefact-missing asserts stored verdict INCOMPLETE AND reasons prefix AND reviewer blocked
+AND worker not done. Not vacuous.
+
+--- R1/R5/R6 (parent-fixed) — VERIFIED NOT REGRESSED ---
+  - manualDispatch inference polarity unchanged in team-ledger.ts (inference only at registration
+    with autoDispatch===false; preserved across amend/retry via preserveManualDispatchOnReadyReturn).
+  - TaskAddTask type fields present; addTasks registration contract intact.
+  - Lease-lifecycle comments intact. All pre-existing suites pass (see Test execution below).
+
+--- H1 (round-1 HIGH) — VERIFIED FIXED ---
+team-ledger.ts amendTask retryAsRework branch calls preserveManualDispatchOnReadyReturn(task, at) —
+the same durable origin mechanism as the updateTask requeue path. Regression test asserts
+manualDispatch=true survives failed → amend retryAsRework → ready. Additionally the H1 test
+exercises the full pipeline: steer → amend retryAsRework → redispatch prompt injection.
+
+--- M1 — VERIFIED FIXED ---
+amendTask dependsOn amendment now rejects cancelled/superseded dependencies and runs a full-board
+transitive cycle DFS with rollback of the dependsOn mutation on failure (test asserts the board's
+dependsOn is byte-identical after the rejected amend). Matches registration-time semantics
+(team-ledger.ts:505-512).
+
+--- M2 — VERIFIED FIXED ---
+amendTask refuses readPaths/writePaths amendment on a running/uncertain task that still holds lease
+identity (sessionId/runId) unless retryAsRework:true accompanies it (error names "in-flight child").
+Test asserts refusal + scope byte-identical, and that the non-leased running edge remains amendable.
+L5 additionally verified: briefHistory entries now carry prior values of mutated fields
+(test asserts prior.writePaths reconstruction).
+
+--- M3/M4 — VERIFIED FIXED --- (see liveness rewrite under R3 above; the blocked/ready/queued
+leased-child case now yields childLive=true, livenessUnknown=true — fail closed across host
+processes; reason text consumed.)
+
+--- L3 — VERIFIED FIXED --- (real feature bug: the steer-injection audit claim was previously dead)
+Both dispatch paths inject "Pending parent steering" blocks: scheduler pump team.ts:4046-4058 and
+manual interception team.ts:5170-5184. The second bug the worker found is real and correctly fixed:
+markDispatched() overwrites task.dispatchedAt with now BEFORE the comparison runs, so comparing
+steer timestamps against task.dispatchedAt post-mark always yields an empty pending set. The fix
+captures the PREVIOUS attempt's dispatch time: prevAttempt is a snapshot object literal built at
+team.ts:4015 BEFORE markDispatched (a copy, not a reference — verified: const prevAttempt = {
+status: task.status, runId..., dispatchedAt... }), so prevAttempt.dispatchedAt still holds the prior
+value at team.ts:4047. Manual path captures priorDispatchAt at team.ts:5147 before markDispatched
+at team.ts:5148. Correct on both paths. Regression test asserts the redispatch prompt contains the
+steer block with the actual message content — end-to-end, not vacuous.
+
+--- L1/L2 — VERIFIED DOCUMENTED (decideReviewPolicy comments; no behavior change — per spec) ---
+--- L4/L6 — ACCEPTED as-is (worker documented rationale; consistent with existing evidence model) ---
+
+==============================================================================
+REGRESSION SCAN OF THE REWORK DIFF ITSELF
+==============================================================================
+
+- No weakening of write-vs-write or running-writer-vs-strict-reader exclusion anywhere: the amend
+  conflict loops (team.ts:5768-5788) still check BOTH live ledger tasks and live leases, still
+  exclude only the target itself, still honor reviewingReadAllowed exactly as registration does.
+- amend scope resolution: resolveScope resolves relative paths against ctx.cwd before validation
+  AND before mutation (team.ts:5772-5773) — unresolved amendments cannot bypass conflict checks.
+  Same semantics as registration. Correct.
+- Own-live-lease scan uses the lease registry (in-memory). If the host process restarts, the
+  in-process registry is empty — but then no lease is held by this process either, and the ledger
+  status alone governs; cross-process writes are protected by the ledger status check
+  (skipLease requires !liveWork(target.status)). No new hole introduced.
+- structuredClone(board()) discipline preserved in all reworked paths — atomic rejection intact.
+- The provenance gate applies to native children too (it is not hosted-only): for a native child
+  whose pi-web:subagent meta binds this parent, validation path (a) succeeds. Safe.
+
+==============================================================================
+RESIDUAL LOW FINDINGS (follow-ups, NOT rework gates)
+==============================================================================
+
+n1. LOW — team.ts:5670-5676 — provenance gate friction for genuinely dead children: the gate runs
+    whenever a sessionId exists, even when liveness evidence already proves the child is dead
+    (ledger reported/failed). If the session file has been deleted/rotated away, a safe no-op
+    cancellation of a dead child is forced through the blocked+manual-verify dance. Fail-closed so
+    not a safety issue, but operationally annoying. Suggestion: skip the provenance requirement for
+    the pure metadata-settle branch (decision.action === "cancel" && !sessionId-targeted stop
+    needed) — the stop-targeting branches are where provenance truly matters.
+
+n2. LOW — team.ts:5674 — leased fields derivation gap: the gate condition requires
+    (task.sessionId || task.runId || task.dispatchedAt); a task cancelled mid-lease whose lease
+    fields were partially cleared (abnormal ledger shape) could skip provenance and pass through
+    decision.action === "cancel" if decideCancelAction judges childLive false. Extremely narrow
+    (requires malformed ledger state), fail-open only in a hand-corrupted board. Consider keying
+    the gate on sessionId alone.
+
+n3. LOW — team-ledger.ts:1900-1911 — partial artefact loss (some files remain) classifies as
+    "drifted" → STALE discard rather than artefact-missing escalation. Both outcomes refuse to
+    settle the worker, so the risk is conservative-only; the escalation affordance (parent
+    re-verify prompt) is lost for the partial case. Acceptable as-is; could key on
+    currentHasFiles && file-count decreased if ever needed.
+
+n4. LOW — team.ts:5708-5716 — the M5 poll holds the team_tasks execute() call up to 4s in the
+    worst case (hosted child already dead but snapshot flush broken). Bounded and fail-closed;
+    fine for a user-initiated cancel, but be aware cancels are synchronous ledger operations.
+
+n5. INFO — the ownLiveLease refinement narrows the literal bypass spec ("regardless of which live
+    tasks hold") for the target's OWN lease only — this narrowing is REQUIRED for safety (proven by
+    the branch-rollback regression test) and matches the hard invariant of Batch 1. Reviewer
+    explicitly endorses this deviation from the letter of the rework prompt.
+
+==============================================================================
+TEST EXECUTION (this review, executed independently)
+==============================================================================
+npx tsx tests/test-team-batch1-controls.ts  → 16/16 passed
+npx tsx tests/test-team-batch1-rework.ts    → 12/12 passed (R2×2, R3×3, R4×3, H1, M1, M2+L5, L3)
+npx tsx tests/test-team-role-review.ts      → 17/17 passed
+npx tsx tests/test-review-gate.ts           → 9/9 passed
+npx tsx tests/test-review-protocol.ts       → 20/20 passed
+npx tsx tests/test-team-ledger.ts           → 21/21 passed
+Worker reports LC_ALL=C npm test → 39/39 test files; tests/ contains exactly 39 files (consistent).
+
+VERDICT: PASS — Batch 1 (with rework) satisfies the spec and preserves all safety invariants.
+Residual items n1-n5 are LOW/INFO follow-ups suitable for a future batch, not blockers.

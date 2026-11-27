@@ -1,0 +1,98 @@
+
+> pi-teams@1.2.7 test
+> node tests/run-all.mjs
+
+✓ test-review-gate.ts (316ms)
+✓ test-review-independence.ts (542ms)
+✓ test-review-protocol.ts (203ms)
+✓ test-team-audit-regression.ts (1872ms)
+✓ test-team-cp-parent-hooks.ts (1255ms)
+✓ test-team-cp-parent.ts (455ms)
+✓ test-team-dispatch-coordination.ts (511ms)
+✓ test-team-doctor.ts (845ms)
+✓ test-team-gc-safety.ts (1182ms)
+✓ test-team-gc.ts (569ms)
+✓ test-team-goal-edit.ts (1384ms)
+✓ test-team-host-hooks.ts (1745ms)
+✓ test-team-host-probe.ts (924ms)
+✗ test-team-host-runner.ts (588ms)
+✓ normalizeHostToolResult unwraps the SDK wrapper, keeps outer isError, accepts raw mocks
+✓ hosted provenance: spawned marker without pi-web:subagent; legacy CLI is not hosted
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+
+AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
++ actual - expected
+
++ 'running'
+- 'completed'
+
+    at file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-host-runner.ts:212:10
+    at async test (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-host-runner.ts:37:2)
+    at async file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-host-runner.ts:185:2 {
+  generatedMessage: true,
+  code: 'ERR_ASSERTION',
+  actual: 'running',
+  expected: 'completed',
+  operator: 'strictEqual',
+  diff: 'simple'
+}
+
+Node.js v22.23.2
+
+✓ test-team-ledger-hooks.ts (1598ms)
+✓ test-team-ledger.ts (575ms)
+✓ test-team-model-list.ts (447ms)
+✓ test-team-native-hooks.ts (1496ms)
+✓ test-team-native-runner.ts (1922ms)
+✓ test-team-parallel.ts (927ms)
+✓ test-team-prune-and-review-contract.ts (1261ms)
+✓ test-team-recovery-hooks.ts (1106ms)
+✓ test-team-recovery-safety.ts (1997ms)
+✓ test-team-recovery.ts (847ms)
+✓ test-team-refactor-scheduler.ts (1295ms)
+✓ test-team-review-lease-release.ts (1257ms)
+✓ test-team-review-lifecycle-safety.ts (1181ms)
+✓ test-team-rework-complete.ts (929ms)
+✓ test-team-role-review.ts (715ms)
+✓ test-team-scope-granularity.ts (621ms)
+✓ test-team-scope-precision.ts (399ms)
+✓ test-team-state-delta.ts (2407ms)
+✗ test-team-v21-verification.ts (656ms)
+  ✓ Issue 5: Auto-acceptance verifies terminal state, clean exit, and non-error evidence
+
+  [LATENCY BENCHMARK METRICS]
+  - probeLiveChildSession execution time: avg 1.168 ms
+  - scheduler nextDispatchableTasks (30 tasks -> 20 slots): avg 12.816 ms
+  - End-to-end event-driven backfill: immediate (< 15 ms via microtask) vs 1000 ms (daemon interval)
+  ✗ Issue 6: Measured latency benchmarks for probe, scheduler and backfill
+AssertionError [ERR_ASSERTION]: Scheduler calculation must be fast (<10ms), was 12.816ms
+    at file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:383:10
+    at test (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:55:9)
+    at runVerification (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:313:8) {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: false,
+  expected: true,
+  operator: '==',
+  diff: 'simple'
+}
+FATAL VERIFICATION FAILURE: AssertionError [ERR_ASSERTION]: Scheduler calculation must be fast (<10ms), was 12.816ms
+    at file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:383:10
+    at test (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:55:9)
+    at runVerification (file:///home/viosonlee/pi-workspace/pi-suns-teams/tests/test-team-v21-verification.ts:313:8) {
+  generatedMessage: false,
+  code: 'ERR_ASSERTION',
+  actual: false,
+  expected: true,
+  operator: '==',
+  diff: 'simple'
+}
+
+✓ test-team-version.ts (411ms)
+✓ test-team-worktree.ts (1556ms)
+✓ test-team.ts (506ms)
+
+34/36 test files passed
+Failed: test-team-host-runner.ts, test-team-v21-verification.ts

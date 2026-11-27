@@ -1,0 +1,10 @@
+VERDICT: PASS
+
+No material remaining issue found for the prior persisted auto-owned worktree blocker.
+
+- `extensions/team.ts:3328–3334` rejects incompatible hosted dispatch using persisted ownership and worktree cwd.
+- Readiness/batch filters and the scheduler guard reject it before reservation (`extensions/team.ts:3340,3353,4000`).
+- Manual Agent rejects it before reservation (`extensions/team.ts:5086–5093`); execution rechecks before receipt/spawn (`extensions/team.ts:3458–3461`).
+- Regression covers persisted ownership through both scheduler and manual Agent, asserting no launch, no run ID, and retained ownership (`tests/test-team-audit-regression.ts:405–415`).
+
+Tests inspected only; reported 29/29 not independently rerun. No writes or prohibited operations performed.
