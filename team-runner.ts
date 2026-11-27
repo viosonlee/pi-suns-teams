@@ -107,6 +107,8 @@ export interface AgentCallParams {
 	wait_timeout?: number;
 	/** Ledger run id; recorded on markers so recovery can bind terminal evidence to this attempt. */
 	run_id?: string;
+	/** Authoritative task write scope passed by the parent dispatcher (persisted in pi-web:subagent). */
+	scope?: { id: string; writePaths: string[]; isReadOnly?: boolean };
 }
 
 export interface ActiveChild {
@@ -339,6 +341,7 @@ function createChildSessionFile(
 	description: string,
 	prompt: string,
 	runId: string | undefined,
+	scope?: { id: string; writePaths: string[]; isReadOnly?: boolean },
 ): void {
 	const now = new Date().toISOString();
 	const header = {
@@ -362,6 +365,7 @@ function createChildSessionFile(
 			profile: role,
 			description,
 			task: prompt,
+			...(scope ? { scope } : {}),
 		},
 	};
 	const statusEntry = {
@@ -617,15 +621,16 @@ export async function launchNativeSubagent(
 		if (resolved.status === "found" && resolved.file) {
 			sessionFile = resolved.file;
 			ensureChildLinkMarker(sessionFile, childSessionId, parentSessionId, parentSessionFile);
+			if (params.scope) appendSessionMarker(sessionFile, "pi-web:subagent", { version: 1, parentSessionId, ...(parentSessionFile ? { parentSessionPath: parentSessionFile } : {}), profile: role, scope: params.scope });
 			appendSessionMarker(sessionFile, "pi-web:subagent-status", { status: "running", ...(runId ? { runId } : {}) });
 		} else {
 			sessionFile = path.join(sessionsDir, `${new Date().toISOString().replace(/:/g, "-")}_${childSessionId}.jsonl`);
-			createChildSessionFile(sessionFile, childSessionId, cwd, parentSessionId, parentSessionFile, role, description, prompt, runId);
+			createChildSessionFile(sessionFile, childSessionId, cwd, parentSessionId, parentSessionFile, role, description, prompt, runId, params.scope);
 		}
 	} else {
 		childSessionId = crypto.randomUUID();
 		sessionFile = path.join(sessionsDir, `${new Date().toISOString().replace(/:/g, "-")}_${childSessionId}.jsonl`);
-		createChildSessionFile(sessionFile, childSessionId, cwd, parentSessionId, parentSessionFile, role, description, prompt, runId);
+		createChildSessionFile(sessionFile, childSessionId, cwd, parentSessionId, parentSessionFile, role, description, prompt, runId, params.scope);
 	}
 
 	try {

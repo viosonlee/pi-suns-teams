@@ -1762,11 +1762,11 @@ export function buildReviewContract(revTask: WorkTask, workerTask: WorkTask): st
 export const HAS_BWRAP = existsSync("/usr/bin/bwrap");
 
 function splitShellSegmentsAndInspectSubcmds(cmd: string): {
-	segments: string[][];
+	segments: Array<{ tokens: string[]; hasHeredoc: boolean }>;
 	hasUnsafeRedirection: boolean;
 	subcommands: string[];
 } {
-	const segments: string[][] = [];
+	const segments: Array<{ tokens: string[]; hasHeredoc: boolean }> = [];
 	const subcommands: string[] = [];
 	let currentTokens: string[] = [];
 	let currentTok = "";
@@ -1774,6 +1774,7 @@ function splitShellSegmentsAndInspectSubcmds(cmd: string): {
 	let inSingle = false;
 	let inDouble = false;
 	let hasUnsafeRedirection = false;
+	let currentHeredoc = false;
 
 	const pushTok = () => {
 		if (hasToken || currentTok.length > 0) {
@@ -1784,9 +1785,10 @@ function splitShellSegmentsAndInspectSubcmds(cmd: string): {
 	};
 	const pushSeg = () => {
 		pushTok();
-		if (currentTokens.length > 0) {
-			segments.push(currentTokens);
+		if (currentTokens.length > 0 || currentHeredoc) {
+			segments.push({ tokens: currentTokens, hasHeredoc: currentHeredoc });
 			currentTokens = [];
+			currentHeredoc = false;
 		}
 	};
 
@@ -1879,7 +1881,7 @@ function splitShellSegmentsAndInspectSubcmds(cmd: string): {
 		if (ch === "&" || ch === "|") {
 			if (ch === "&" && cmd[i + 1] === ">") {
 				const rest = cmd.slice(i + 2).trimStart();
-				if (!rest.startsWith("/dev/null")) hasUnsafeRedirection = true;
+				if (!/^\/dev\/(?:null|stdout|stderr|full|zero)(?:\s|$|;|&|\|)/.test(rest)) hasUnsafeRedirection = true;
 				i++;
 				pushTok();
 				continue;
@@ -1908,16 +1910,24 @@ function splitShellSegmentsAndInspectSubcmds(cmd: string): {
 			}
 			const adv = nextCh === ">" ? 2 : 1;
 			const rest = cmd.slice(i + adv).trimStart();
-			if (!rest.startsWith("/dev/null")) hasUnsafeRedirection = true;
+			if (!/^\/dev\/(?:null|stdout|stderr|full|zero)(?:\s|$|;|&|\|)/.test(rest)) hasUnsafeRedirection = true;
 			i += adv - 1;
 			currentTok = "";
 			hasToken = false;
 			continue;
 		}
-		if (ch === "<" && cmd[i + 1] === ">") {
-			hasUnsafeRedirection = true;
-			i++;
-			continue;
+		if (ch === "<") {
+			if (cmd[i + 1] === ">") {
+				hasUnsafeRedirection = true;
+				i++;
+				continue;
+			}
+			if (cmd[i + 1] === "<") {
+				currentHeredoc = true;
+				i += cmd[i + 2] === "<" ? 2 : 1;
+				pushTok();
+				continue;
+			}
 		}
 		currentTok += ch;
 		hasToken = true;
@@ -1932,16 +1942,29 @@ const ALWAYS_WRITE_VERBS = new Set([
 	"unzip", "unrar", "7z", "truncate", "dd", "tee",
 	"make", "cmake", "ninja",
 	"vi", "vim", "nvim", "nano", "ed", "ex",
-	"scp", "rsync", "sftp", "eval", "exec",
+	"scp", "rsync", "sftp", "eval", "exec", "source", ".",
+	"ssh", "nsenter", "unshare", "chroot", "su", "pkexec",
 ]);
 
-function extractCommandVerbAndArgs(tokens: string[]): { verb: string; args: string[] } | null {
+function extractCommandVerbAndArgs(tokens: string[]): { verb: string; args: string[]; isDynamic?: boolean } | null {
 	let idx = 0;
 	while (idx < tokens.length) {
 		const tok = tokens[idx];
 		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tok)) { idx++; continue; }
+		if (tok.startsWith("$")) return { verb: tok, args: tokens.slice(idx + 1), isDynamic: true };
 		const base = tok.split("/").pop()?.toLowerCase() ?? "";
-		if (base === "command" || base === "env" || base === "time" || base === "nice" || base === "nohup" || base === "sudo" || base === "doas") {
+		if (base === "sudo" || base === "doas") {
+			idx++;
+			while (idx < tokens.length && tokens[idx].startsWith("-")) {
+				if (/^-[is]$/.test(tokens[idx]) || tokens[idx] === "--login" || tokens[idx] === "--shell") {
+					return { verb: base, args: tokens.slice(idx), isDynamic: false };
+				}
+				idx++;
+			}
+			if (idx >= tokens.length) return { verb: base, args: [] };
+			continue;
+		}
+		if (base === "command" || base === "env" || base === "time" || base === "nice" || base === "nohup") {
 			idx++;
 			while (idx < tokens.length && tokens[idx].startsWith("-")) idx++;
 			continue;
@@ -1972,19 +1995,36 @@ export function isBashWriteCommand(cmd: string): { isWrite: boolean; reason?: st
 		if (subRes.isWrite) return subRes;
 	}
 
-	for (const seg of segments) {
-		const parsed = extractCommandVerbAndArgs(seg);
+	for (let segIdx = 0; segIdx < segments.length; segIdx++) {
+		const seg = segments[segIdx];
+		const parsed = extractCommandVerbAndArgs(seg.tokens);
 		if (!parsed) continue;
-		const { verb, args } = parsed;
+		const { verb, args, isDynamic } = parsed;
 		const argLine = args.join(" ");
+		const hasStdinScript = seg.hasHeredoc || segIdx > 0;
 
-		if (ALWAYS_WRITE_VERBS.has(verb)) {
-			return { isWrite: true, reason: `File/build/transfer mutation command (${verb}).` };
+		if (isDynamic) {
+			return { isWrite: true, reason: `Dynamic variable command invocation (${verb}) cannot be verified read-only.` };
+		}
+		if (ALWAYS_WRITE_VERBS.has(verb) || verb === "sudo" || verb === "doas") {
+			return { isWrite: true, reason: `File, build, remote, namespace, or privilege command (${verb}).` };
+		}
+		if (verb === "docker" || verb === "podman") {
+			const sub = (args.find(a => !a.startsWith("-")) ?? "").toLowerCase();
+			if (!/^(?:ps|images|version|info|inspect|logs|stats|top|port|diff)$/.test(sub)) {
+				return { isWrite: true, reason: `Container runtime mutation/execution (${verb} ${sub}).` };
+			}
+		}
+		if (verb === "kubectl") {
+			const sub = (args.find(a => !a.startsWith("-")) ?? "").toLowerCase();
+			if (!/^(?:get|describe|logs|version|cluster-info|api-resources|api-versions|explain|top)$/.test(sub)) {
+				return { isWrite: true, reason: `Kubernetes mutation/execution (${verb} ${sub}).` };
+			}
 		}
 		if (verb === "sed" && args.some(a => /^-[a-zA-Z]*i/.test(a) || a === "--in-place" || a.startsWith("--in-place="))) {
 			return { isWrite: true, reason: "In-place file editing (sed -i)." };
 		}
-		if ((verb === "awk" || verb === "gawk") && />\s*['"/a-zA-Z0-9_.-]/.test(argLine.replace(/>\s*\/dev\/(?:null|stderr)/g, ""))) {
+		if ((verb === "awk" || verb === "gawk") && />\s*['"/a-zA-Z0-9_.-]/.test(argLine.replace(/>\s*\/dev\/(?:null|stdout|stderr)/g, ""))) {
 			return { isWrite: true, reason: "awk file redirection (>)." };
 		}
 		if (verb === "tar" && args.some(a => /^-[a-zA-Z]*[xruc]/.test(a) || /^--(?:extract|get|append|update|create|delete)$/.test(a) || (/^[a-zA-Z]+$/.test(a) && /[xruc]/.test(a) && a === args[0]))) {
@@ -1993,7 +2033,7 @@ export function isBashWriteCommand(cmd: string): { isWrite: boolean; reason?: st
 		if ((verb === "gunzip" || verb === "bunzip2" || verb === "unxz") && !args.some(a => a === "-c" || a === "--stdout")) {
 			return { isWrite: true, reason: `In-place decompression (${verb}).` };
 		}
-		if (verb === "find" && args.some(a => a === "-delete" || a === "-ok") ) {
+		if (verb === "find" && args.some(a => a === "-delete" || a === "-ok")) {
 			return { isWrite: true, reason: "find -delete/-ok mutates filesystem." };
 		}
 		if (verb === "find") {
@@ -2011,23 +2051,45 @@ export function isBashWriteCommand(cmd: string): { isWrite: boolean; reason?: st
 		if (verb === "wget" && !(args.includes("-O-") || args.includes("--output-document=-") || args.includes("--spider") || (args.indexOf("-O") >= 0 && args[args.indexOf("-O") + 1] === "-"))) {
 			return { isWrite: true, reason: "wget downloads to disk." };
 		}
-		if (/^python[0-9.]*$/.test(verb) && (args.some(a => /^-[a-zA-Z]*c$/.test(a)) || (args.indexOf("-m") >= 0 && /^(?:pip|venv|ensurepip)$/.test(args[args.indexOf("-m") + 1] ?? "")))) {
-			return { isWrite: true, reason: "Inline Python code or package installation." };
-		}
-		if (verb === "node" && args.some(a => /^--?(?:e|eval|p|print)$/.test(a))) {
-			return { isWrite: true, reason: "Inline Node.js execution." };
-		}
-		if (((verb === "perl" || verb === "ruby") && args.some(a => /^-[a-zA-Z]*[ei]/.test(a))) || (verb === "php" && args.some(a => /^-[a-zA-Z]*r/.test(a)))) {
-			return { isWrite: true, reason: `Inline ${verb} execution.` };
-		}
-		if ((verb === "bash" || verb === "sh" || verb === "zsh" || verb === "dash" || verb === "ksh") && args.some(a => /^-[a-zA-Z]*c$/.test(a))) {
-			const cIdx = args.findIndex(a => /^-[a-zA-Z]*c$/.test(a));
-			const inner = args[cIdx + 1];
-			if (!inner || isBashWriteCommand(inner).isWrite) {
-				return { isWrite: true, reason: `Nested shell execution (${verb} -c).` };
+		if (/^python[0-9.]*$/.test(verb)) {
+			const mIdx = args.indexOf("-m");
+			const modName = mIdx >= 0 ? (args[mIdx + 1] ?? "") : "";
+			const isMetaFlagOnly = args.length > 0 && args.every(a => /^(?:-v|-V|--version|-h|--help)$/.test(a));
+			if (!isMetaFlagOnly && (
+				hasStdinScript
+				|| args.some(a => /^-[a-zA-Z]*c$/.test(a) || !a.startsWith("-"))
+				|| (mIdx >= 0 && /^(?:pip|venv|ensurepip|compileall|py_compile|http\.server)$/.test(modName))
+			)) {
+				return { isWrite: true, reason: "Arbitrary Python execution, script run, or package/bytecode write." };
 			}
 		}
-		if (verb === "sqlite3" && !args.includes("-readonly")) {
+		if (verb === "node") {
+			const isMetaFlagOnly = args.length > 0 && args.every(a => /^(?:-v|--version|-h|--help)$/.test(a));
+			if (!isMetaFlagOnly && (hasStdinScript || args.some(a => /^--?(?:e|eval|p|print)$/.test(a) || !a.startsWith("-")))) {
+				return { isWrite: true, reason: "Arbitrary Node.js eval, heredoc, or script execution." };
+			}
+		}
+		if (verb === "perl" || verb === "ruby" || verb === "php") {
+			const isMetaFlagOnly = args.length > 0 && args.every(a => /^(?:-v|-V|--version|-h|--help)$/.test(a));
+			if (!isMetaFlagOnly) {
+				return { isWrite: true, reason: `Arbitrary ${verb} script/inline execution.` };
+			}
+		}
+		if (verb === "bash" || verb === "sh" || verb === "zsh" || verb === "dash" || verb === "ksh") {
+			if (seg.hasHeredoc || hasStdinScript) {
+				return { isWrite: true, reason: `Heredoc or piped stdin to shell (${verb}).` };
+			}
+			if (args.some(a => /^-[a-zA-Z]*c$/.test(a))) {
+				const cIdx = args.findIndex(a => /^-[a-zA-Z]*c$/.test(a));
+				const inner = args[cIdx + 1];
+				if (!inner || isBashWriteCommand(inner).isWrite) {
+					return { isWrite: true, reason: `Nested shell execution (${verb} -c).` };
+				}
+			} else if (args.some(a => !a.startsWith("-"))) {
+				return { isWrite: true, reason: `Script file execution (${verb}).` };
+			}
+		}
+		if (verb === "sqlite3" && (seg.hasHeredoc || !args.includes("-readonly"))) {
 			return { isWrite: true, reason: "sqlite3 without -readonly may write/create database files." };
 		}
 		if ((verb === "gcc" || verb === "g++" || verb === "clang" || verb === "clang++" || verb === "cc")
@@ -2037,15 +2099,18 @@ export function isBashWriteCommand(cmd: string): { isWrite: boolean; reason?: st
 		if (verb === "cargo" && /^(?:build|run|test|install|publish|update|clean|init|new|add|remove)$/.test((args[0] ?? "").toLowerCase())) {
 			return { isWrite: true, reason: `cargo ${args[0]} writes build artifacts or dependencies.` };
 		}
-		if (verb === "go" && /^(?:build|install|run|generate|clean|mod)$/.test((args[0] ?? "").toLowerCase())) {
+		if (verb === "go" && /^(?:build|install|run|generate|clean|mod|get)$/.test((args[0] ?? "").toLowerCase())) {
 			return { isWrite: true, reason: `go ${args[0]} modifies workspace/build artifacts.` };
 		}
-		if (verb === "dotnet" && /^(?:build|publish|pack|clean|restore|new|add|remove)$/.test((args[0] ?? "").toLowerCase())) {
+		if (verb === "dotnet" && /^(?:build|publish|pack|clean|restore|new|add|remove|tool)$/.test((args[0] ?? "").toLowerCase())) {
 			return { isWrite: true, reason: `dotnet ${args[0]} modifies build artifacts.` };
 		}
 		if (((verb === "npm" || verb === "pnpm" || verb === "yarn") && /^(?:i|install|ci|update|uninstall|publish|add|remove)$/.test((args[0] ?? "").toLowerCase()))
-			|| (/^pip[0-9.]*$/.test(verb) && (args[0] ?? "").toLowerCase() === "install")) {
-			return { isWrite: true, reason: `Package manager mutation (${verb} ${args[0] ?? ""}).` };
+			|| (/^(?:apt|apt-get|dnf|yum|apk|pacman|snap|brew|pipx|conda|mamba|gem|composer|bundle|nuget|mvn|gradle)$/.test(verb)
+				&& args.some(a => /^(?:install|upgrade|update|remove|purge|autoremove|add|del|delete|uninstall|create|clean|build|test|package|deploy|publish|link|unlink)$/.test(a.toLowerCase())))
+			|| ((verb === "dpkg" || verb === "rpm") && args.some(a => /^-[iUrPeUF]+$/.test(a) || /^--(?:install|upgrade|remove|purge|unpack|configure|erase)$/.test(a)))
+			|| (/^pip[0-9.]*$/.test(verb) && /^(?:install|uninstall|download)$/.test((args[0] ?? "").toLowerCase()))) {
+			return { isWrite: true, reason: `Package manager/build mutation (${verb} ${args[0] ?? ""}).` };
 		}
 		if (verb === "git") {
 			const gitSub = (args.find(a => !a.startsWith("-")) ?? "").toLowerCase();
@@ -2098,16 +2163,25 @@ export function sanitizePromptDirectiveText(text: string): string {
 	return String(text ?? "").replace(/[\r\n]+/g, " ").trim();
 }
 
-export function detectSubagentTaskAssignment(entries: any[]): { id: string; writePaths: string[]; isReadOnly: boolean } | null {
+export function detectSubagentTaskAssignment(entries: any[], parentSessionFileHint?: string): { id: string; writePaths: string[]; isReadOnly: boolean } | null {
 	if (!Array.isArray(entries)) return null;
 	let isCpProfile = false;
+	let structured: { id: string; writePaths: string[]; isReadOnly: boolean } | null = null;
+	let discoveredParentFile = parentSessionFileHint;
 	for (const entry of entries) {
+		if (entry?.type === "session" && typeof entry.parentSession === "string") {
+			discoveredParentFile ??= entry.parentSession;
+		}
+		if (entry?.type === "custom" && entry.customType === "pi-web.subsession.spawned" && typeof entry.data?.parentSessionPath === "string") {
+			discoveredParentFile ??= entry.data.parentSessionPath;
+		}
 		if (entry?.type === "custom" && entry.customType === "pi-web:subagent") {
+			if (typeof entry.data?.parentSessionPath === "string") discoveredParentFile ??= entry.data.parentSessionPath;
 			if (entry.data?.profile === "cp") isCpProfile = true;
 			const structuredScope = entry.data?.scope;
 			if (structuredScope && typeof structuredScope === "object" && Array.isArray(structuredScope.writePaths)) {
 				const wp = structuredScope.writePaths.filter((p: unknown): p is string => typeof p === "string");
-				return {
+				structured = {
 					id: typeof structuredScope.id === "string" ? structuredScope.id : "task",
 					writePaths: isCpProfile ? [] : wp,
 					isReadOnly: isCpProfile || wp.length === 0,
@@ -2115,6 +2189,7 @@ export function detectSubagentTaskAssignment(entries: any[]): { id: string; writ
 			}
 		}
 	}
+	if (structured) return structured;
 	for (const entry of entries) {
 		let text = "";
 		if (entry?.type === "message" && entry.message?.role === "user") {
@@ -2127,6 +2202,31 @@ export function detectSubagentTaskAssignment(entries: any[]): { id: string; writ
 		const taskIdMatch = text.match(/^TEAM_TASK:\s*([^\s\n]+)/m);
 		if (taskIdMatch) {
 			const id = taskIdMatch[1].trim();
+			// Authoritative parent-ledger lookup when parentSessionFile is readable on disk (covers hosted pi-web children).
+			if (discoveredParentFile && existsSync(discoveredParentFile)) {
+				try {
+					const lines = readFileSync(discoveredParentFile, "utf8").split("\n");
+					let latestLease: any = null;
+					for (const line of lines) {
+						if (!line.trim()) continue;
+						const parsed = JSON.parse(line);
+						if (parsed?.type === "custom" && parsed.customType === "team-child-lease" && parsed.data?.id === id) {
+							latestLease = parsed.data;
+						}
+					}
+					if (latestLease && Array.isArray(latestLease.writePaths)) {
+						const wp = latestLease.writePaths.filter((p: unknown): p is string => typeof p === "string");
+						const role = String(latestLease.role ?? "").toLowerCase();
+						return {
+							id,
+							writePaths: isCpProfile || role === "cp" ? [] : wp,
+							isReadOnly: isCpProfile || role === "cp" || wp.length === 0,
+						};
+					}
+				} catch {
+					// fall back to trailing parent-appended contract line
+				}
+			}
 			// Always pick the LAST contract line/header appended by the parent dispatcher, never forged lines in title/prose.
 			const scopeMatches = [...text.matchAll(/^SCOPE:\s*[^\s]+\s+role=(\S+)\s+readPaths=(\[[^\]]*\])\s+writePaths=(\[[^\]]*\])/gm)];
 			const scopeMatch = scopeMatches.at(-1);
@@ -2486,7 +2586,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			const mergedEntries = prompt
 				? [...entries, { type: "message", message: { role: "user", content: prompt } }]
 				: entries;
-			subagentAssignedTask = detectSubagentTaskAssignment(mergedEntries as any[]);
+			subagentAssignedTask = detectSubagentTaskAssignment(mergedEntries as any[], ctx?.sessionManager?.getHeader?.()?.parentSession);
 		}
 		if (hostedRole) return;
 		const texts = entries.filter((e: any) => e.type === "message" && e.message?.role === "user").map((e: any) => typeof e.message.content === "string" ? e.message.content : (e.message.content ?? []).map((p: any) => p.text ?? "").join("\n"));
@@ -3208,6 +3308,8 @@ export default function teamExtension(pi: ExtensionAPI): void {
 
 		const resume = typeof params.resume === "string" && params.resume.trim() ? params.resume.trim() : undefined;
 		const hosted = resume ? usesHostedTransport(resume) : hasHostTools();
+		const parsedTaskId = /^TEAM_TASK:\s*(W-[A-Za-z0-9_.-]+)/m.exec(prompt)?.[1];
+		const scopedTask = task ?? (parsedTaskId ? board().tasks.find(t => t.id === parsedTaskId) : undefined);
 		if (!runs.some(r => r.taskId === runId)) {
 			const receipt: RunRecord = { taskId: runId, role, description, status: "running", at: new Date().toISOString(), executionTransport: hosted ? "hosted" : "native" };
 			runs.push(receipt); pi.appendEntry(RUN_TYPE, receipt);
@@ -3229,6 +3331,7 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			model: typeof params.model === "string" ? params.model : undefined,
 			thinking: typeof params.thinking === "string" ? params.thinking : undefined,
 			run_id: typeof params.run_id === "string" ? params.run_id : undefined,
+			scope: scopedTask ? { id: scopedTask.id, writePaths: [...scopedTask.writePaths], isReadOnly: role === "cp" || scopedTask.writePaths.length === 0 } : undefined,
 		}, runnerOptions, signal);
 
 		if (record && outcome.sessionId) {
@@ -4646,7 +4749,10 @@ export default function teamExtension(pi: ExtensionAPI): void {
 			if (hostedAllowedTools && !hostedAllowedTools.has(toolName)) return { block: true, reason: `Hosted ${hostedRole ?? "unknown"} child may only use its assigned role tools; ${toolName} is not allowed.` };
 			if (!subagentAssignedTask && ctx?.sessionManager) {
 				try {
-					subagentAssignedTask = detectSubagentTaskAssignment(ctx.sessionManager.getEntries() as any[]);
+					subagentAssignedTask = detectSubagentTaskAssignment(
+						ctx.sessionManager.getEntries() as any[],
+						ctx.sessionManager.getHeader?.()?.parentSession,
+					);
 				} catch {
 					// ignore
 				}

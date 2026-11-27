@@ -123,6 +123,9 @@ try {
 		assert.equal(link.data.cwd, work);
 		const childLines = readFileSync(link.data.spawnedSessionFile, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
 		assert.equal(childLines[0].parentSession, parentFile, "child header points at the parent file");
+		const subMeta = childLines.find((e) => e.customType === "pi-web:subagent");
+		assert.equal(subMeta?.data?.scope?.id, "W-a", "child pi-web:subagent persists structured task scope");
+		assert.deepEqual(subMeta?.data?.scope?.writePaths, [join(work, "src/W-a")], "child pi-web:subagent persists exact normalized writePaths");
 		assert.ok(childLines.some((e) => e.customType === "pi-web.subsession.spawned" && e.data.spawnedBySessionId === "parent" && e.data.spawnedSessionId === sessionId), "child carries pi-web.subsession.spawned");
 		const ids = new Set<string>();
 		for (const e of childLines.slice(1)) { assert.ok(e.parentId === null || ids.has(e.parentId), `broken parentId chain at ${e.id}`); ids.add(e.id); }
