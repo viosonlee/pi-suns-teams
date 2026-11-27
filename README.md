@@ -39,6 +39,16 @@
 - **手动与自动派发协调**：`team_tasks add/update` 的 `autoDispatch:false` 为受影响任务持久保留手动派发权，不影响其他自动任务；用 `Agent` 提供完整任务说明/旧子会话 `resume`，或用 `team_dispatch` 显式释放给自动调度器。同一任务、同一角色的重复派发返回已有运行会话，不新增执行。重新排队的已执行任务默认保留手动恢复权，明确 `autoDispatch:true` 才授权后台重新派发。
 - **内置在线检查与自动更新**：支持一键 `/team check-update` 与 `/team update`。
 
+### v1.2.7：安全防线闭环与调度减耗
+
+- **子代理写范围改为结构化数据源**：`team-runner.ts` 把任务 `scope`（id/writePaths）持久化进子会话 `pi-web:subagent` 元数据；`detectSubagentTaskAssignment` 依次优先读取结构化 scope → 父会话 `team-child-lease` 租约 → prompt 文本，标题/正文里的伪造 `SCOPE:`/`Write Paths:` 行不再能劫持写权限。
+- **bash 只读守护大幅加固**：新增 shell 解析器（引号/子命令/`$(...)`/反引号/heredoc/管道都按真实结构分析），补齐 `bash -c <脚本>`、次要解释器（lua/awk -f/javac/rustc 等）、编辑器 `emacs`、`mount`/`fdisk`/用户与网络管理、以及远程/系统管理 CLI（mysql/psql/aws/gcloud/az/terraform/helm/ansible/systemctl/service/crontab/kill）的拦截，并保留最小只读白名单（`systemctl status`、`service <unit> status`、`terraform plan`、`helm list`、`kill -l` 等）；bwrap 包装改用单引号转义，外层 shell 不再展开 `$(...)`/反引号。
+- **目录写覆盖真正生效**：`taskConflict` 改接 `scopePathsConflict`，`src/` 目录写会正确阻塞对 `src/**` 的嵌套读/写并发（此前测试把该缺口标注为 KNOWN GAP 快照）。
+- **伪串行缓解**：新增 `readMode:"snapshot"`（只读侦察/审计任务可与在途写者并行，`strict` 默认不变）、`provisionAutoWorktree` 任务级 worktree 供给原语（干净主树自动 `git worktree add`，脏树/非 git fail-closed，永不用 `--force`/`-D`），以及 reviewing 态下不同 verified worktree 的任务不再被 hold 阻塞。
+- **报错可一步修正**：`send_session_message`（对 pi-teams 子会话实测 91% 失败）、`yield_to_subsessions`、`team_tasks` 的高频拒绝（缺证据验收、reviewing 冲突、归档任务、活子会话占锁、依赖未完成）现在都附带最小可执行恢复路径。
+- **主会话减耗教练**：`buildPolicy` 明确禁止用 `codemode` 手搓循环/文件排查（8 个会话实测 796 次调用、70 次 JS 报错），要求首次侦察后一次 `team_tasks add` 批建 6~15 个细粒度任务，并把"源码修改 / 重型 QA / 构建发布文档"拆成不同子任务（实测 50 条子会话超 15 分钟、最慢 29~40 分钟）。
+- **验证**：`npm test` 36/36 通过（新增 `tests/test-team-audit-regression.ts` 7 项回归）。
+
 ### v1.2.2：微任务细拆并行提速、防巨无霸工单护栏与契约降税
 
 - **`team_tasks add` 颗粒度硬护栏（[team-ledger.ts](file:///home/lifeng/workspace/pi-teams/team-ledger.ts)）**：拦截普通实施单一次塞入 `> 3` 条 AC、`>= 6` 个写路径、跨多个整目录写锁，或 `booker`/`bridges` 将业务代码与泛目录 `tests/` 混写占锁的行为（特殊不可拆任务需显式填写 `splitWaiverReason`）；明确引导拆成 `1~3` 文件、`1~3` 条 AC 的可并行微任务，测试另拆给 `ayton` 指定具体测试文件名。
