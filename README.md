@@ -39,6 +39,14 @@
 - **手动与自动派发协调**：`team_tasks add/update` 的 `autoDispatch:false` 为受影响任务持久保留手动派发权，不影响其他自动任务；用 `Agent` 提供完整任务说明/旧子会话 `resume`，或用 `team_dispatch` 显式释放给自动调度器。同一任务、同一角色的重复派发返回已有运行会话，不新增执行。重新排队的已执行任务默认保留手动恢复权，明确 `autoDispatch:true` 才授权后台重新派发。
 - **内置在线检查与自动更新**：支持一键 `/team check-update` 与 `/team update`。
 
+### v1.2.8：收口/纠偏原语、结构化证据、审查刹车、Draining 与原子派发
+
+- **Batch 1 收口死锁打通与撤回/纠偏原语**：`team_tasks update` 元数据结算（非 live 目标的 `done/cancelled/superseded`）与无关 write-vs-read 锁解耦，消除「`yield` 催结算、`update` 拒结算」死锁；`W-rev-*` 审查任务默认 `readMode:"snapshot"`，不再阻塞同文件修复单派发（STALE 由 `deliveryVersion`/`fingerprint` 判定）；新增一等公民 `action:"cancel"`（native/hosted 统一停止尝试，fail-closed：停止未确认绝不释放 lease）与 `action:"steer"` 受控父子通信；`WorkTask` 新增可变 `brief`/`briefHistory`，`action:"amend"` 原地修正 brief/acceptance/scope，`retryAsRework` 原地重试避免编号膨胀；统一 `decideReviewPolicy`，`manualDispatch` 继承到自动审查/返工任务，schedulerPump 不再偷跑手动任务。
+- **Batch 2 结构化证据、审查刹车、上下文减负与 Draining**：一等 `structuredEvidence`（commands/artifacts/gitSha）+ artifact 持久化，超长汇报落盘引用而非截断丢尾；`reviewTier:"advisory"` 非门禁审查；连续 2 轮零进展 REWORK 自动止损升级（`classifyReworkProgress` 纯函数），显式 reviewer 审查不受刹车压制；`ledgerPrompt`/`team_goal`/`reconcileBacklog` 输出裁剪封顶并显式列出 `uncoveredRequests`；`draining` 模式禁止派新任务仅收尾在飞；`classifyInputKind` 区分情绪/反馈与指令，杜绝幽灵 `Q-*`，mustAct 指令永不误丢。
+- **Batch 3 派活原子性、扇出提示与生命周期视图**：`rollbackToDraft` 原子失败补偿（自动派发全失败回滚 draft 不留废单）；write-write 冲突报错内置 worktree 扇出+串行集成方案；破坏操作派发前强制本地只读验证证据门禁；`validateSubagentMetadata` 识别 hosted 子会话消除 `foreign-parent` 误报；统一只读生命周期视图（`action:"status"`：`status/terminated/writesCommitted/liveConflictHolder`）。
+- **改造：auto-worktree 调度接线与 reviewing 只读放行**：冲突写者自动供给隔离 worktree（fail-closed）；reviewing 持有者不再阻塞主树严格只读候选，writer 仍受保护。
+- **验证**：`npm test` 40/40 通过（新增 batch1/2/3 专项套件 100+ 断言）；全程未经真实在线部署验证，破坏性操作检测为启发式护栏而非安全边界。
+
 ### v1.2.7：安全防线闭环与调度减耗
 
 - **子代理写范围改为结构化数据源**：`team-runner.ts` 把任务 `scope`（id/writePaths）持久化进子会话 `pi-web:subagent` 元数据；`detectSubagentTaskAssignment` 依次优先读取结构化 scope → 父会话 `team-child-lease` 租约 → prompt 文本，标题/正文里的伪造 `SCOPE:`/`Write Paths:` 行不再能劫持写权限。
